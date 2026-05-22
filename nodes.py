@@ -54,7 +54,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.9"
+SDMLX_VERSION = "0.1.10"
 SDMLX_CACHE_VERSION = "adapter-v6"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -1387,6 +1387,19 @@ def refresh_folder_path_cache(folder_name):
         pass
 
 
+def notify_model_downloaded(folder_name, local_name):
+    try:
+        from server import PromptServer
+        server = getattr(PromptServer, "instance", None)
+        if server is not None:
+            server.send_sync("sdmlx_model_downloaded", {
+                "folder_name": folder_name,
+                "local_name": local_name,
+            })
+    except Exception:
+        pass
+
+
 def download_spec_exists(spec, folder_name, default_subdir):
     local_name = spec.get("local_name") or os.path.basename(spec["filename"])
     if not model_file_exists(folder_name, default_subdir, local_name):
@@ -1414,6 +1427,7 @@ def download_hf_model_file(spec, target_dir, folder_name=None):
     if os.path.exists(final_path):
         if folder_name:
             refresh_folder_path_cache(folder_name)
+            notify_model_downloaded(folder_name, local_name)
         return final_path
 
     print(
@@ -1437,6 +1451,7 @@ def download_hf_model_file(spec, target_dir, folder_name=None):
             parent = os.path.dirname(parent)
     if folder_name:
         refresh_folder_path_cache(folder_name)
+        notify_model_downloaded(folder_name, local_name)
     return final_path
 
 
@@ -6798,6 +6813,10 @@ class SDMLX_ControlNetUnionLoader:
     FUNCTION = "load_controlnet"
     CATEGORY = "SDMLX/ControlNet"
 
+    @classmethod
+    def VALIDATE_INPUTS(s, control_net_name):
+        return True
+
     def load_controlnet(self, control_net_name):
         path, resolved_name = resolve_controlnet_path(control_net_name)
         if path is None or not os.path.exists(path):
@@ -7157,6 +7176,10 @@ class SDMLX_IPAdapterLoader:
     FUNCTION = "load"
     CATEGORY = "SDMLX/IPAdapter"
 
+    @classmethod
+    def VALIDATE_INPUTS(s, ipadapter_name):
+        return True
+
     def load(self, ipadapter_name):
         return (load_sdmlx_ipadapter_model(ipadapter_name),)
 
@@ -7173,6 +7196,10 @@ class SDMLX_CLIPVisionLoader:
     RETURN_NAMES = ("sdmlx_clip_vision",)
     FUNCTION = "load"
     CATEGORY = "SDMLX/IPAdapter"
+
+    @classmethod
+    def VALIDATE_INPUTS(s, clip_vision_name):
+        return True
 
     def load(self, clip_vision_name, compute_dtype="float16"):
         return (load_sdmlx_clip_vision_model(clip_vision_name, compute_dtype),)
@@ -7519,6 +7546,10 @@ class SDMLX_ApplyIPAdapterFaceIDAIO:
     RETURN_NAMES = ("mlx_model", "face_image")
     FUNCTION = "apply"
     CATEGORY = "SDMLX/IPAdapter"
+
+    @classmethod
+    def VALIDATE_INPUTS(s, ipadapter_name, clip_vision_name):
+        return True
 
     def apply(
         self,
