@@ -64,7 +64,7 @@ jobs:
               if result.get("allowed_error"):
                   request(
                       "PUT",
-                      f"https://api.comfy.org/publishers/elef4nt/nodes/sdmlx/versions/{version}",
+                      version_url,
                       {"deprecated": True, "changelog": message},
                   )
                   print(f"{version} could not be deleted by API; deprecated instead.")
