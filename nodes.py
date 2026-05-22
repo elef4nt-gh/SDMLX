@@ -54,7 +54,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.6"
+SDMLX_VERSION = "0.1.7"
 SDMLX_CACHE_VERSION = "adapter-v6"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -1889,6 +1889,8 @@ def ensure_xinsir_promax_controlnet():
 
 def resolve_controlnet_path(control_net_name):
     import folder_paths
+    if not control_net_name:
+        control_net_name = CONTROLNET_PROMAX_AUTO
     if control_net_name == CONTROLNET_PROMAX_AUTO:
         return ensure_xinsir_promax_controlnet()
     path = folder_paths.get_full_path("controlnet", control_net_name)
@@ -2126,6 +2128,8 @@ def lora_model_dirs():
 
 
 def ensure_ipadapter_download(ipadapter_name):
+    if not ipadapter_name:
+        ipadapter_name = IPADAPTER_AUTO_PLUS_SDXL_VITH
     spec = IPADAPTER_DOWNLOAD_SPECS.get(ipadapter_name)
     if spec is None:
         return None, ipadapter_name
@@ -2428,6 +2432,8 @@ def clip_vision_model_dirs():
 
 
 def ensure_clip_vision_download(clip_vision_name):
+    if not clip_vision_name:
+        clip_vision_name = CLIP_VISION_AUTO_VITH
     spec = CLIP_VISION_DOWNLOAD_SPECS.get(clip_vision_name)
     if spec is None:
         return None, clip_vision_name
