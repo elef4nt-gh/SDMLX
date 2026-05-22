@@ -1,0 +1,60 @@
+name: Registry Metadata Cleanup
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/registry_metadata_cleanup.yml"
+
+jobs:
+  cleanup-registry-metadata:
+    name: Cleanup Registry Metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clear stale accelerator metadata and deprecate broken versions
+        env:
+          REGISTRY_ACCESS_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          token = os.environ["REGISTRY_ACCESS_TOKEN"]
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Content-Type": "application/json",
+          }
+
+          def request(method, url, payload=None):
+              data = None if payload is None else json.dumps(payload).encode("utf-8")
+              req = urllib.request.Request(url, data=data, method=method, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      raw = response.read().decode("utf-8")
+                      return json.loads(raw) if raw else {}
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(f"{method} {url} failed: HTTP {exc.code}: {body}") from exc
+
+          node_url = "https://api.comfy.org/publishers/elef4nt/nodes/sdmlx"
+          node = request("GET", node_url)
+          node["supported_accelerators"] = []
+          node["supported_os"] = ["MacOS"]
+          request("PUT", node_url, node)
+
+          for version, message in {
+              "0.1.0": "Deprecated immediately after publishing because dependencies were not captured by the initial registry upload. Please use 0.1.2 or newer.",
+              "0.1.1": "Deprecated because the Apple Metal accelerator classifier caused false conflict warnings in ComfyUI Desktop. Please use 0.1.2 or newer.",
+          }.items():
+              request(
+                  "PUT",
+                  f"https://api.comfy.org/publishers/elef4nt/nodes/sdmlx/versions/{version}",
+                  {"deprecated": True, "changelog": message},
+              )
+
+          print("Registry metadata cleanup complete.")
+          PY
