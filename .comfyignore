@@ -1,0 +1,17 @@
+# Local and generated files
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+
+# Development-only notes and measurements
+SESSION_LOG.md
+perf_wave*.csv
+SDMLX.xcodeproj/
+
+# Acceleration patches are hosted separately on Hugging Face.
+huggingface_sdmlx_acceleration_patches/
+
+# Local editor/project metadata
+.vscode/
+.idea/

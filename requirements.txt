@@ -1,0 +1,10 @@
+mlx>=0.10.0
+safetensors
+huggingface_hub
+numpy
+transformers
+regex
+psutil
+tqdm
+insightface
+onnxruntime

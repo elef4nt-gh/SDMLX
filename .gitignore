@@ -1,0 +1,45 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local environments and editor state
+.env
+.env.*
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Local development notes
+SESSION_LOG.md
+perf_wave*.csv
+
+# ComfyUI/runtime output
+input/
+output/
+temp/
+*.log
+
+# Local reference graphics generated during development
+sdmlx_lora_schedule_curves.*
+
+# Local model/cache artifacts
+models/
+cache/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.mlx
+
+# SDMLX model packages / acceleration patches belong on Hugging Face, not in the code repo.
+*.sdmlx/
+*.sdmlxpatch/
+!huggingface_sdmlx_acceleration_patches/
+!huggingface_sdmlx_acceleration_patches/README.md
+!huggingface_sdmlx_acceleration_patches/.gitattributes
+
+# Old local experiment shell; keep the repo focused on the ComfyUI node package.
+SDMLX.xcodeproj/
