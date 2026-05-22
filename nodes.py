@@ -54,7 +54,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.4"
+SDMLX_VERSION = "0.1.5"
 SDMLX_CACHE_VERSION = "adapter-v6"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -130,6 +130,7 @@ MLX_MEMORY_LIMIT_STATE = {
     "original_cache_limit": None,
 }
 MEMORY_ASSIST_OPTIONS = ["auto", "max_performance", "low_memory", "off"]
+SDMLX_SELECT_CHECKPOINT = "select checkpoint"
 
 SDXL_SIZE_PRESETS = [
     "1024x1024",
@@ -6659,9 +6660,9 @@ class SDMLX_LoaderUniversal:
     def INPUT_TYPES(s):
         try:
             import folder_paths
-            checkpoint_names = folder_paths.get_filename_list("checkpoints")
+            checkpoint_names = [SDMLX_SELECT_CHECKPOINT] + list(folder_paths.get_filename_list("checkpoints"))
         except Exception:
-            checkpoint_names = []
+            checkpoint_names = [SDMLX_SELECT_CHECKPOINT]
         return {"required": {
             "ckpt_name": (checkpoint_names,),
             "memory_assist": (MEMORY_ASSIST_OPTIONS, {"default": "auto"}),
@@ -6672,6 +6673,8 @@ class SDMLX_LoaderUniversal:
     CATEGORY = "SDMLX/Loaders"
 
     def load_ckpt(self, ckpt_name, memory_assist="auto"):
+        if not ckpt_name or ckpt_name == SDMLX_SELECT_CHECKPOINT:
+            raise ValueError("SDMLX: Please select an SDXL checkpoint first.")
         import folder_paths
         from comfy.utils import load_torch_file
 
@@ -6860,9 +6863,9 @@ class SDMLX_LoraLoader:
     def INPUT_TYPES(s):
         try:
             import folder_paths
-            lora_names = folder_paths.get_filename_list("loras")
+            lora_names = [MULTI_LORA_NONE] + list(folder_paths.get_filename_list("loras"))
         except Exception:
-            lora_names = []
+            lora_names = [MULTI_LORA_NONE]
         return {
             "required": {
                 "mlx_model": ("MLX_MODEL",),
@@ -6890,7 +6893,7 @@ class SDMLX_LoraLoader:
     ):
         import folder_paths
 
-        if not enabled:
+        if not enabled or not lora_name or lora_name == MULTI_LORA_NONE:
             log_timing(f"SDMLX: LoRA disabled: {lora_name}")
             return (mlx_model,)
 
