@@ -54,7 +54,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.7"
+SDMLX_VERSION = "0.1.8"
 SDMLX_CACHE_VERSION = "adapter-v6"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -1370,6 +1370,23 @@ def model_file_exists(folder_name, default_subdir, local_name):
         return False
 
 
+def refresh_folder_path_cache(folder_name):
+    try:
+        import folder_paths
+        mapped_name = folder_paths.map_legacy(folder_name) if hasattr(folder_paths, "map_legacy") else folder_name
+        cache_helper = getattr(folder_paths, "cache_helper", None)
+        if cache_helper is not None:
+            if hasattr(cache_helper, "cache"):
+                cache_helper.cache.pop(mapped_name, None)
+            elif hasattr(cache_helper, "clear"):
+                cache_helper.clear()
+        filename_cache = getattr(folder_paths, "filename_list_cache", None)
+        if isinstance(filename_cache, dict):
+            filename_cache.pop(mapped_name, None)
+    except Exception:
+        pass
+
+
 def download_spec_exists(spec, folder_name, default_subdir):
     local_name = spec.get("local_name") or os.path.basename(spec["filename"])
     if not model_file_exists(folder_name, default_subdir, local_name):
@@ -1382,7 +1399,7 @@ def download_spec_exists(spec, folder_name, default_subdir):
     return True
 
 
-def download_hf_model_file(spec, target_dir):
+def download_hf_model_file(spec, target_dir, folder_name=None):
     try:
         from huggingface_hub import hf_hub_download
     except Exception as exc:
@@ -1395,6 +1412,8 @@ def download_hf_model_file(spec, target_dir):
     local_name = spec.get("local_name") or os.path.basename(spec["filename"])
     final_path = os.path.join(target_dir, local_name)
     if os.path.exists(final_path):
+        if folder_name:
+            refresh_folder_path_cache(folder_name)
         return final_path
 
     print(
@@ -1416,6 +1435,8 @@ def download_hf_model_file(spec, target_dir):
             except OSError:
                 break
             parent = os.path.dirname(parent)
+    if folder_name:
+        refresh_folder_path_cache(folder_name)
     return final_path
 
 
@@ -1835,10 +1856,11 @@ def controlnet_file_options():
             for name in folder_paths.get_filename_list("controlnet")
             if is_probable_union_promax_name(name)
         ]
-        options = sorted(models, key=str.lower)
-        if not model_file_exists("controlnet", "controlnet", CONTROLNET_PROMAX_FILENAME):
-            options.insert(0, CONTROLNET_PROMAX_AUTO)
-        return options or [CONTROLNET_PROMAX_AUTO]
+        options = [CONTROLNET_PROMAX_AUTO]
+        for name in sorted(models, key=str.lower):
+            if name not in options:
+                options.append(name)
+        return options
     except Exception:
         return [CONTROLNET_PROMAX_AUTO]
 
@@ -1883,6 +1905,7 @@ def ensure_xinsir_promax_controlnet():
             "local_name": CONTROLNET_PROMAX_FILENAME,
         },
         target_dir,
+        folder_name="controlnet",
     )
     return path, os.path.basename(path)
 
@@ -2092,13 +2115,9 @@ def ensure_ipadapter_folder_paths():
 def ipadapter_model_options():
     folder_paths = ensure_ipadapter_folder_paths()
     if folder_paths is None:
-        return [IPADAPTER_AUTO_PLUS_SDXL_VITH]
+        return list(IPADAPTER_DOWNLOAD_SPECS.keys())
     names = folder_paths.get_filename_list("ipadapter")
-    options = [
-        auto_name
-        for auto_name, spec in IPADAPTER_DOWNLOAD_SPECS.items()
-        if not download_spec_exists(spec, "ipadapter", "ipadapter")
-    ]
+    options = list(IPADAPTER_DOWNLOAD_SPECS.keys())
     for name in names:
         if name not in options:
             options.append(name)
@@ -2134,10 +2153,10 @@ def ensure_ipadapter_download(ipadapter_name):
     if spec is None:
         return None, ipadapter_name
     target_dir = ipadapter_model_dirs()[0]
-    path = download_hf_model_file(spec, target_dir)
+    path = download_hf_model_file(spec, target_dir, folder_name="ipadapter")
     lora_spec = spec.get("lora")
     if lora_spec:
-        download_hf_model_file(lora_spec, lora_model_dirs()[0])
+        download_hf_model_file(lora_spec, lora_model_dirs()[0], folder_name="loras")
     return path, spec.get("local_name") or os.path.basename(path)
 
 
@@ -2386,13 +2405,9 @@ def ensure_clip_vision_folder_paths():
 def clip_vision_model_options():
     folder_paths = ensure_clip_vision_folder_paths()
     if folder_paths is None:
-        return [CLIP_VISION_AUTO_VITH]
+        return list(CLIP_VISION_DOWNLOAD_SPECS.keys())
     names = folder_paths.get_filename_list("clip_vision")
-    options = [
-        auto_name
-        for auto_name, spec in CLIP_VISION_DOWNLOAD_SPECS.items()
-        if not download_spec_exists(spec, "clip_vision", "clip_vision")
-    ]
+    options = list(CLIP_VISION_DOWNLOAD_SPECS.keys())
     for name in names:
         if name not in options:
             options.append(name)
@@ -2438,7 +2453,7 @@ def ensure_clip_vision_download(clip_vision_name):
     if spec is None:
         return None, clip_vision_name
     target_dir = clip_vision_model_dirs()[0]
-    path = download_hf_model_file(spec, target_dir)
+    path = download_hf_model_file(spec, target_dir, folder_name="clip_vision")
     return path, spec.get("local_name") or os.path.basename(path)
 
 
