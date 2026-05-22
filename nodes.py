@@ -54,7 +54,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.8"
+SDMLX_VERSION = "0.1.9"
 SDMLX_CACHE_VERSION = "adapter-v6"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -1856,11 +1856,10 @@ def controlnet_file_options():
             for name in folder_paths.get_filename_list("controlnet")
             if is_probable_union_promax_name(name)
         ]
-        options = [CONTROLNET_PROMAX_AUTO]
-        for name in sorted(models, key=str.lower):
-            if name not in options:
-                options.append(name)
-        return options
+        options = sorted(models, key=str.lower)
+        if not model_file_exists("controlnet", "controlnet", CONTROLNET_PROMAX_FILENAME):
+            options.insert(0, CONTROLNET_PROMAX_AUTO)
+        return options or [CONTROLNET_PROMAX_AUTO]
     except Exception:
         return [CONTROLNET_PROMAX_AUTO]
 
@@ -2117,7 +2116,11 @@ def ipadapter_model_options():
     if folder_paths is None:
         return list(IPADAPTER_DOWNLOAD_SPECS.keys())
     names = folder_paths.get_filename_list("ipadapter")
-    options = list(IPADAPTER_DOWNLOAD_SPECS.keys())
+    options = [
+        auto_name
+        for auto_name, spec in IPADAPTER_DOWNLOAD_SPECS.items()
+        if not download_spec_exists(spec, "ipadapter", "ipadapter")
+    ]
     for name in names:
         if name not in options:
             options.append(name)
@@ -2407,7 +2410,11 @@ def clip_vision_model_options():
     if folder_paths is None:
         return list(CLIP_VISION_DOWNLOAD_SPECS.keys())
     names = folder_paths.get_filename_list("clip_vision")
-    options = list(CLIP_VISION_DOWNLOAD_SPECS.keys())
+    options = [
+        auto_name
+        for auto_name, spec in CLIP_VISION_DOWNLOAD_SPECS.items()
+        if not download_spec_exists(spec, "clip_vision", "clip_vision")
+    ]
     for name in names:
         if name not in options:
             options.append(name)
