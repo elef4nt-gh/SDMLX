@@ -9,32 +9,101 @@ import subprocess
 import sys
 import time
 
-import mlx.core as mx
-import mlx.nn as nn
-from mlx.utils import tree_unflatten
-import numpy as np
-from transformers import CLIPTokenizer
-import torch
-from PIL import Image
+SDMLX_IMPORT_ERROR = None
 
-SDMLX_VERSION = "0.1.3"
+try:
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_unflatten
+    import numpy as np
+    from transformers import CLIPTokenizer
+    import torch
+    from PIL import Image
+except ModuleNotFoundError as exc:
+    SDMLX_IMPORT_ERROR = exc
+
+    class _MissingModule:
+        float16 = "float16"
+        float32 = "float32"
+
+        class Module:
+            pass
+
+        def __getattr__(self, name):
+            raise RuntimeError(
+                "SDMLX runtime dependencies are unavailable. "
+                "Install SDMLX on Apple Silicon with its package requirements."
+            )
+
+    mx = _MissingModule()
+    np = _MissingModule()
+    torch = _MissingModule()
+    Image = _MissingModule()
+
+    class _MissingNN(_MissingModule):
+        Module = _MissingModule.Module
+
+    nn = _MissingNN()
+
+    class CLIPTokenizer:
+        pass
+
+    def tree_unflatten(*args, **kwargs):
+        raise RuntimeError(
+            "SDMLX runtime dependencies are unavailable. "
+            "Install SDMLX on Apple Silicon with its package requirements."
+        )
+
+SDMLX_VERSION = "0.1.4"
 SDMLX_CACHE_VERSION = "adapter-v6"
 
-from .sdxl_adapter import (
-    apply_mapped_weights,
-    ldm_unet_key_to_diffusers,
-    map_clip_g_weights,
-    map_clip_l_weights,
-    map_vae_weights_for_apple,
-    split_sdxl_checkpoint,
-    validate_sdxl_checkpoint_keys,
-)
-from .mlx_sd.model_io import map_unet_weights, map_vae_weights
-from .mlx_sd.controlnet_union import (
-    ControlNetUnionModel,
-    UNION_CONTROL_TYPES,
-    map_controlnet_union_weights,
-)
+if SDMLX_IMPORT_ERROR is None:
+    from .sdxl_adapter import (
+        apply_mapped_weights,
+        ldm_unet_key_to_diffusers,
+        map_clip_g_weights,
+        map_clip_l_weights,
+        map_vae_weights_for_apple,
+        split_sdxl_checkpoint,
+        validate_sdxl_checkpoint_keys,
+    )
+    from .mlx_sd.model_io import map_unet_weights, map_vae_weights
+    from .mlx_sd.controlnet_union import (
+        ControlNetUnionModel,
+        UNION_CONTROL_TYPES,
+        map_controlnet_union_weights,
+    )
+else:
+    UNION_CONTROL_TYPES = {
+        "pose": 0,
+        "depth": 1,
+        "soft edge to scribble": 2,
+        "line to canny": 3,
+        "normal": 4,
+        "segment": 5,
+        "tile": 6,
+        "repaint": 7,
+    }
+
+    def _missing_runtime(*args, **kwargs):
+        raise RuntimeError(
+            "SDMLX runtime dependencies are unavailable. "
+            "Install SDMLX on Apple Silicon with its package requirements."
+        )
+
+    apply_mapped_weights = _missing_runtime
+    ldm_unet_key_to_diffusers = _missing_runtime
+    map_clip_g_weights = _missing_runtime
+    map_clip_l_weights = _missing_runtime
+    map_vae_weights_for_apple = _missing_runtime
+    split_sdxl_checkpoint = _missing_runtime
+    validate_sdxl_checkpoint_keys = _missing_runtime
+    map_unet_weights = _missing_runtime
+    map_vae_weights = _missing_runtime
+    map_controlnet_union_weights = _missing_runtime
+
+    class ControlNetUnionModel:
+        pass
 
 MODEL_CACHE = {}
 MODEL_CACHE_META = {}
@@ -6588,9 +6657,13 @@ class SDMLX_GaussianBlurMask:
 class SDMLX_LoaderUniversal:
     @classmethod
     def INPUT_TYPES(s):
-        import folder_paths
+        try:
+            import folder_paths
+            checkpoint_names = folder_paths.get_filename_list("checkpoints")
+        except Exception:
+            checkpoint_names = []
         return {"required": {
-            "ckpt_name": (folder_paths.get_filename_list("checkpoints"),),
+            "ckpt_name": (checkpoint_names,),
             "memory_assist": (MEMORY_ASSIST_OPTIONS, {"default": "auto"}),
         }}
 
@@ -6785,11 +6858,15 @@ class SDMLX_ApplyControlNet:
 class SDMLX_LoraLoader:
     @classmethod
     def INPUT_TYPES(s):
-        import folder_paths
+        try:
+            import folder_paths
+            lora_names = folder_paths.get_filename_list("loras")
+        except Exception:
+            lora_names = []
         return {
             "required": {
                 "mlx_model": ("MLX_MODEL",),
-                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "lora_name": (lora_names,),
                 "strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05}),
                 "enabled": ("BOOLEAN", {"default": True}),
             },
