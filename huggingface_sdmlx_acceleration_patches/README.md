@@ -1,3 +1,17 @@
+---
+license: other
+library_name: mlx
+pipeline_tag: text-to-image
+tags:
+  - stable-diffusion-xl
+  - comfyui
+  - mlx
+  - apple-silicon
+  - acceleration
+  - lora
+  - sdmlx
+---
+
 # SDMLX Acceleration Patches
 
 Pre-mapped SDXL acceleration patches for SDMLX / ComfyUI on Apple Silicon.
