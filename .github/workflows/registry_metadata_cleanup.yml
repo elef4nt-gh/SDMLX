@@ -29,7 +29,7 @@ jobs:
               "Content-Type": "application/json",
           }
 
-          def request(method, url, payload=None):
+          def request(method, url, payload=None, allow_404=False, allow_405=False):
               data = None if payload is None else json.dumps(payload).encode("utf-8")
               req = urllib.request.Request(url, data=data, method=method, headers=headers)
               try:
@@ -38,10 +38,14 @@ jobs:
                       return json.loads(raw) if raw else {}
               except urllib.error.HTTPError as exc:
                   body = exc.read().decode("utf-8", errors="replace")
+                  if allow_404 and exc.code == 404:
+                      return {"missing": True}
+                  if allow_405 and exc.code == 405:
+                      return {"method_not_allowed": True}
                   raise RuntimeError(f"{method} {url} failed: HTTP {exc.code}: {body}") from exc
 
           node_url = "https://api.comfy.org/publishers/elef4nt/nodes/sdmlx"
-          node = request("GET", node_url)
+          node = request("GET", "https://api.comfy.org/nodes/sdmlx")
           node["supported_accelerators"] = []
           node["supported_os"] = ["MacOS"]
           request("PUT", node_url, node)
@@ -50,11 +54,16 @@ jobs:
               "0.1.0": "Deprecated immediately after publishing because dependencies were not captured by the initial registry upload. Please use 0.1.2 or newer.",
               "0.1.1": "Deprecated because the Apple Metal accelerator classifier caused false conflict warnings in ComfyUI Desktop. Please use 0.1.2 or newer.",
           }.items():
-              request(
-                  "PUT",
-                  f"https://api.comfy.org/publishers/elef4nt/nodes/sdmlx/versions/{version}",
-                  {"deprecated": True, "changelog": message},
-              )
+              version_url = f"https://api.comfy.org/publishers/elef4nt/nodes/sdmlx/versions/{version}"
+              result = request("DELETE", version_url, allow_404=True, allow_405=True)
+              if result.get("missing"):
+                  print(f"{version} already deleted.")
+                  continue
+              if result.get("method_not_allowed"):
+                  request("PUT", version_url, {"deprecated": True, "changelog": message})
+                  print(f"{version} could not be deleted by API; deprecated instead.")
+              else:
+                  print(f"{version} deleted.")
 
           print("Registry metadata cleanup complete.")
           PY
