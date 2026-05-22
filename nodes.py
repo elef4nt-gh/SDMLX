@@ -17,7 +17,7 @@ from transformers import CLIPTokenizer
 import torch
 from PIL import Image
 
-SDMLX_VERSION = "0.1b"
+SDMLX_VERSION = "0.1.3"
 SDMLX_CACHE_VERSION = "adapter-v6"
 
 from .sdxl_adapter import (
