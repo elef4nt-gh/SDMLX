@@ -54,7 +54,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.5"
+SDMLX_VERSION = "0.1.6"
 SDMLX_CACHE_VERSION = "adapter-v6"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -6936,7 +6936,7 @@ class SDMLX_LoraLoader:
 
 
 MULTI_LORA_SLOT_COUNT = 12
-MULTI_LORA_NONE = "none"
+MULTI_LORA_NONE = "select lora"
 
 
 def lora_file_options_with_none():
