@@ -54,7 +54,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.10"
+SDMLX_VERSION = "0.1.11"
 SDMLX_CACHE_VERSION = "adapter-v6"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -324,6 +324,24 @@ SDMLX_LORA_CONTEXT = {
 }
 
 
+def sdmlx_gelu_mode():
+    env_value = os.environ.get("SDMLX_GELU_MODE", "").strip().lower()
+    if env_value in {"exact", "approx", "fast"}:
+        return env_value
+    return "fast"
+
+
+SDMLX_GELU_MODE = sdmlx_gelu_mode()
+
+
+def sdmlx_gelu(x):
+    if SDMLX_GELU_MODE == "fast":
+        return nn.gelu_fast_approx(x)
+    if SDMLX_GELU_MODE == "approx":
+        return nn.gelu_approx(x)
+    return nn.gelu(x)
+
+
 class FusedGEGLUFFN(nn.Module):
     def __init__(self, linear1, linear2, linear3):
         super().__init__()
@@ -338,7 +356,7 @@ class FusedGEGLUFFN(nn.Module):
     def __call__(self, x):
         y = self.linear12(x)
         y_a, y_b = mx.split(y, 2, axis=-1)
-        return self.linear3(y_a * nn.gelu(y_b))
+        return self.linear3(y_a * sdmlx_gelu(y_b))
 
 
 class FastFFNTransformerBlock(nn.Module):
@@ -5063,10 +5081,10 @@ def scheduler_step_plan_for_denoise(sampler, steps, scheduler_name, sampler_name
 
 
 def apply_sampler_step(noise_pred, latents, scale, dt, noise_scale, out_scale):
-    latents = latents * scale + noise_pred * dt
+    latents = latents * (scale * out_scale) + noise_pred * (dt * out_scale)
     if noise_scale is not None:
-        latents = latents + mx.random.normal(latents.shape).astype(latents.dtype) * noise_scale
-    return latents * out_scale
+        latents = latents + mx.random.normal(latents.shape).astype(latents.dtype) * (noise_scale * out_scale)
+    return latents
 
 
 def unscaled_latents(latents, sigma):
@@ -5748,6 +5766,7 @@ def sample_latents(
         f"{int(quant_group_size)}:ft{int(fast_transformer)}:"
         f"ffn{int(effective_fast_ffn)}:"
         f"fattn{int(effective_fast_attention)}:dtype{compute_dtype}:"
+        f"gelu{SDMLX_GELU_MODE}:"
         f"patch{acceleration_patch_name}:pstrength{acceleration_strength_key}:"
         f"loras{lora_key}:"
         f"scheduled_loras{scheduled_lora_key}:"
@@ -5832,6 +5851,7 @@ def sample_latents(
     denoise = max(0.0, min(1.0, float(denoise)))
     step_plan = scheduler_step_plan_for_denoise(sampler, steps, scheduler, sampler_name, denoise)
     progress_steps = len(step_plan)
+    dynamic_step_context = bool(ip_adapters or scheduled_loras)
     control_active_by_step = [
         controlnets_active_at_percent(controlnets, i / max(progress_steps - 1, 1))
         for i in range(progress_steps)
@@ -5892,8 +5912,10 @@ def sample_latents(
         f"fast_transformer={fast_transformer}, "
         f"fast_ffn={effective_fast_ffn}, "
         f"fast_attention={effective_fast_attention}, "
+        f"gelu_mode={SDMLX_GELU_MODE}, "
         f"quantize_unet={quantize_unet}, "
         f"profile_unet={profile_unet}, "
+        f"dynamic_step_context={dynamic_step_context}, "
         f"debug_timing={debug_timing}, "
         f"taesd_preview={taesd_preview}, "
         f"preview_mode={preview_mode}, "
@@ -5979,10 +6001,13 @@ def sample_latents(
     )
 
     def run_denoiser(latents_in, timestep, step_percent, step_has_control):
-        SDMLX_IPADAPTER_CONTEXT["adapters"] = ip_adapters
-        SDMLX_IPADAPTER_CONTEXT["step_percent"] = step_percent
-        SDMLX_IPADAPTER_CONTEXT["use_cfg"] = use_cfg
-        SDMLX_LORA_CONTEXT["step_percent"] = step_percent
+        if dynamic_step_context:
+            if ip_adapters:
+                SDMLX_IPADAPTER_CONTEXT["adapters"] = ip_adapters
+                SDMLX_IPADAPTER_CONTEXT["step_percent"] = step_percent
+                SDMLX_IPADAPTER_CONTEXT["use_cfg"] = use_cfg
+            if scheduled_loras:
+                SDMLX_LORA_CONTEXT["step_percent"] = step_percent
         if step_denoiser is not None and not step_has_control:
             return step_denoiser(latents_in, timestep, context, pooled, t_ids, cfg_value)
 
@@ -6127,10 +6152,13 @@ def sample_latents(
                     "SDMLX: FaceID Attention Delta: no samples recorded "
                     "(IP-Adapter-Wrapper was not reached in this sampler run)."
                 )
-        SDMLX_IPADAPTER_CONTEXT["adapters"] = []
-        SDMLX_IPADAPTER_CONTEXT["step_percent"] = 0.0
-        SDMLX_IPADAPTER_CONTEXT["use_cfg"] = False
-        SDMLX_LORA_CONTEXT["step_percent"] = 0.0
+        if dynamic_step_context:
+            if ip_adapters:
+                SDMLX_IPADAPTER_CONTEXT["adapters"] = []
+                SDMLX_IPADAPTER_CONTEXT["step_percent"] = 0.0
+                SDMLX_IPADAPTER_CONTEXT["use_cfg"] = False
+            if scheduled_loras:
+                SDMLX_LORA_CONTEXT["step_percent"] = 0.0
         if terminal_pbar is not None:
             terminal_pbar.close()
 

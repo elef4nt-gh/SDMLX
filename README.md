@@ -45,7 +45,7 @@ Test system: Mac Studio with Apple M1 Max and 64GB unified memory.
 | Workflow | PyTorch-MPS | SDMLX | Notes |
 | --- | ---: | ---: | --- |
 | SDXL, 20 steps, Euler/Karras, 768x1280 | 57.21s | 42.55s | about 26% faster |
-| SDXL, 8 steps, speed patch, 768x1280 | 13.6-13.7s | 10.5-10.6s | about 22-23% faster |
+| SDXL, 8 steps, speed patch, 768x1280 | 13.6-13.7s | 10.2-10.3s | about 24-25% faster |
 | FaceID PlusV2, 20 steps, 832x1152 | 70.83s | 47.55s | about 33% faster |
 | FaceID PlusV2, 8 steps, DMD2, 832x1152 | 18.55s | 14.02s | about 24% faster |
 | ControlNet, 20 steps, 768x1280 | 82.31s | 60.05s | about 27% faster |

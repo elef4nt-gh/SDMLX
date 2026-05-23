@@ -14,6 +14,7 @@ venv/
 # Local development notes
 SESSION_LOG.md
 perf_wave*.csv
+local_milestones/
 
 # ComfyUI/runtime output
 input/
