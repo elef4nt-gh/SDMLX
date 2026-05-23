@@ -8598,6 +8598,9 @@ class SDMLX_KSampler:
             "taesd_preview": ("BOOLEAN", {"default": False}),
         }, "optional": {
             "speed_patch": ("SDMLX_ACCELERATION_PATCH",),
+        }, "hidden": {
+            "unique_id": "UNIQUE_ID",
+            "prompt": "PROMPT",
         }}
 
     RETURN_TYPES = ("IMAGE", "MLX_LATENT")
@@ -8623,6 +8626,8 @@ class SDMLX_KSampler:
         patch_strength,
         taesd_preview,
         speed_patch=None,
+        unique_id=None,
+        prompt=None,
     ):
         global TIMING_LOGS_ENABLED
         TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
@@ -8677,8 +8682,28 @@ class SDMLX_KSampler:
         for key in ("sdmlx_decode_crop", "sdmlx_original_size", "sdmlx_padded_size"):
             if key in latent_image:
                 out[key] = latent_image[key]
-        image = decode_mlx_latent_to_image(out, mlx_vae)
+        image = decode_mlx_latent_to_image(out, mlx_vae) if output_is_connected(prompt, unique_id, 0) else None
         return (image, out)
+
+
+def output_is_connected(prompt, unique_id, output_index):
+    if prompt is None or unique_id is None:
+        return True
+    source_id = str(unique_id)
+    try:
+        for node in prompt.values():
+            inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+            for value in inputs.values():
+                if (
+                    isinstance(value, (list, tuple))
+                    and len(value) >= 2
+                    and str(value[0]) == source_id
+                    and int(value[1]) == int(output_index)
+                ):
+                    return True
+    except Exception:
+        return True
+    return False
 
 
 def decode_mlx_latent_to_image(mlx_latent, mlx_vae):
