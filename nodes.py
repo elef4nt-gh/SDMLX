@@ -1287,7 +1287,20 @@ def acceleration_patch_label(package_name):
     return ACCELERATION_PATCH_LABELS.get(package_name, package_name.removesuffix(".sdmlxpatch"))
 
 
+ACCELERATION_PATCH_OPTIONS_CACHE = None
+ACCELERATION_PATCH_MARKED_PACKAGES = set()
+
+
+def invalidate_acceleration_patch_options_cache():
+    global ACCELERATION_PATCH_OPTIONS_CACHE
+    ACCELERATION_PATCH_OPTIONS_CACHE = None
+
+
 def acceleration_patch_options():
+    global ACCELERATION_PATCH_OPTIONS_CACHE
+    if ACCELERATION_PATCH_OPTIONS_CACHE is not None:
+        return list(ACCELERATION_PATCH_OPTIONS_CACHE)
+
     names = set(KNOWN_ACCELERATION_PATCHES)
     try:
         root = acceleration_patch_dir()
@@ -1295,14 +1308,17 @@ def acceleration_patch_options():
             if entry.endswith(".sdmlxpatch"):
                 names.add(entry)
                 package_path = os.path.join(root, entry)
-                if os.path.isdir(package_path):
+                if os.path.isdir(package_path) and package_path not in ACCELERATION_PATCH_MARKED_PACKAGES:
                     mark_macos_package(package_path)
+                    ACCELERATION_PATCH_MARKED_PACKAGES.add(package_path)
     except Exception:
         pass
-    return [ACCELERATION_PATCH_NONE] + sorted(
+    options = [ACCELERATION_PATCH_NONE] + sorted(
         (acceleration_patch_label(name) for name in names),
         key=str.lower,
     )
+    ACCELERATION_PATCH_OPTIONS_CACHE = tuple(options)
+    return list(options)
 
 
 def acceleration_patch_package_path(package_name):
@@ -1472,6 +1488,9 @@ def ensure_acceleration_patch_package(acceleration_patch):
     manifest = read_acceleration_patch_manifest(package_path)
     factors_path = os.path.join(package_path, "patch.safetensors")
     if manifest and os.path.exists(factors_path):
+        if os.path.isdir(package_path) and package_path not in ACCELERATION_PATCH_MARKED_PACKAGES:
+            mark_macos_package(package_path)
+            ACCELERATION_PATCH_MARKED_PACKAGES.add(package_path)
         return {
             "name": package_name,
             "path": package_path,
@@ -1505,6 +1524,8 @@ def ensure_acceleration_patch_package(acceleration_patch):
     if not manifest or not os.path.exists(factors_path):
         raise RuntimeError(f"SDMLX: Acceleration Patch {package_name} could not be downloaded completely.")
     mark_macos_package(package_path)
+    ACCELERATION_PATCH_MARKED_PACKAGES.add(package_path)
+    invalidate_acceleration_patch_options_cache()
     return {
         "name": package_name,
         "path": package_path,
@@ -3529,7 +3550,9 @@ def build_acceleration_patch_from_lora(source_path, patch_info, force_rebuild=Fa
         and manifest.get("format") == "sdmlx-acceleration-patch-v1"
         and os.path.exists(factors_path)
     ):
-        mark_macos_package(package_path)
+        if package_path not in ACCELERATION_PATCH_MARKED_PACKAGES:
+            mark_macos_package(package_path)
+            ACCELERATION_PATCH_MARKED_PACKAGES.add(package_path)
         return {
             "name": package_name,
             "path": package_path,
@@ -3616,6 +3639,8 @@ def build_acceleration_patch_from_lora(source_path, patch_info, force_rebuild=Fa
         handle.write("\n")
 
     mark_macos_package(package_path)
+    ACCELERATION_PATCH_MARKED_PACKAGES.add(package_path)
+    invalidate_acceleration_patch_options_cache()
     return {
         "name": package_name,
         "path": package_path,
