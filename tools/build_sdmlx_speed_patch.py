@@ -21,9 +21,7 @@ def add_import_paths():
     try:
         import folder_paths  # noqa: F401
     except Exception:
-        comfy_root = os.path.expanduser(
-            "~/ComfyUI-Easy-Install/ComfyUI-Easy-Install/ComfyUI"
-        )
+        comfy_root = os.path.expanduser(os.environ.get("COMFYUI_PATH", "~/ComfyUI"))
         if os.path.isdir(comfy_root) and comfy_root not in sys.path:
             sys.path.insert(0, comfy_root)
 
@@ -107,7 +105,7 @@ def build_patch(source, output_dir, package_name, source_repo=None, source_file=
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build an SDMLX acceleration patch from an SDXL UNet LoRA.")
+    parser = argparse.ArgumentParser(description="Build an SDMLX Speed Patch from an SDXL UNet LoRA.")
     parser.add_argument("--source", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--package-name", required=True)

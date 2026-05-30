@@ -19,9 +19,49 @@ Example workflows are shipped with the node suite in `resources/workflows`. The 
 
 ## Speed Patches
 
-Speed patches are MLX-converted SDXL speed LoRAs. They live in the sampler as first-class acceleration options because they are usually used like part of the sampling setup, not like a creative style LoRA.
+Speed patches are MLX-converted SDXL speed LoRAs. They live in the sampler as first-class speed options because they are usually used like part of the sampling setup, not like a creative style LoRA.
 
 They can reduce step counts dramatically, for example with DMD2, Lightning, LCM or Hyper-SD style workflows. Use the settings recommended by the patch or the model author as the starting point.
+
+## Spectrum Acceleration
+
+The sampler and Hires Fix node have a simple `spectrum_acceleration` switch:
+
+- `off`: normal SDMLX sampling.
+- `fast`: Spectrum scheduling plus three final real steps. Best when speed matters most.
+- `standard`: balanced Spectrum mode. Below 35 steps it uses a more conservative SDMLX short-run policy; from 35 steps upward it uses five warmup steps and three final real steps.
+
+Spectrum is different from a speed patch: a speed patch changes the model behavior, while Spectrum predicts selected internal UNet features and skips some real UNet evaluations.
+
+The `fast` mode follows the public Spectrum scheduling idea used by ComfyUI Spectrum implementations: run real steps to build a cache, forecast selected internal features, and keep a small real-step safety zone at the end.
+
+The `standard` mode keeps that foundation but adds an SDMLX short-run guard below 35 steps. These shorter runs need more protection because there are fewer real UNet steps to recover from a bad forecast.
+
+Hires Fix uses the same switch and defaults to `fast`. In low-denoise upscale tests this gave the strongest speed win while staying visually indistinguishable from the full run.
+
+`SDMLX Spectrum Advanced` is the advanced override node. Plug it into `spectrum_acceleration_advanced` when you want to set the Spectrum parameters yourself. If this input is connected, it overrides the simple switch.
+
+The simple switch handles:
+
+- no patch, Euler, 20+ steps: uses the selected `fast` or `standard` policy in KSampler or Hires Fix
+- selected Speed Patch: stays off and prints a short reason
+- LCM, non-Euler samplers, ControlNet, or unknown combinations: stays off and prints a short reason
+
+Advanced Spectrum can still be combined manually with Speed Patches. The simple modes avoid that by default because speed-patch behavior is checkpoint-dependent and can turn experimental quickly.
+
+Advanced parameters:
+
+- `weight` and `degree`: the strongest character controls. Change these first.
+- `ridge`: fit stabilization.
+- `window_size` and `flex_window`: the forecast rhythm.
+- `warmup_steps`: real steps before forecasting can begin.
+- `final_real_steps`: the final safety zone; `0` means no forced final zone, `3` means the last three steps are always real.
+
+The advanced node intentionally has no presets or manual step plan. It is for experiments and power users; most workflows should use the sampler's `fast` or `standard` switch.
+
+Spectrum can be excellent on portraits and simpler scenes, but it can expose small artifacts in very dense prompts with hands, tiny objects or lots of overlapping details. If a prompt is already pushing SDXL hard, set `spectrum_acceleration` to `off` or use the advanced node to experiment.
+
+Credits: Spectrum support in SDMLX is an MLX adaptation inspired by the official [hanjq17/Spectrum](https://github.com/hanjq17/Spectrum) project and the paper [Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration](https://arxiv.org/abs/2603.01623) by Jiaqi Han, Juntong Shi, Puheng Li, Haotian Ye, Qiushan Guo and Stefano Ermon. The ComfyUI implementations [judian17/ComfyUI-Spectrum](https://github.com/judian17/ComfyUI-Spectrum) and [ruwwww/ComfyUI-Spectrum-sdxl](https://github.com/ruwwww/ComfyUI-Spectrum-sdxl) were important practical references for ComfyUI-facing behavior and SDXL-specific use. The short-run `standard` policy is our own MLX/SDXL tuning on top of that foundation.
 
 ## Scheduler Curves
 
@@ -137,8 +177,8 @@ Larger scales are possible, but memory use and render time rise quickly.
 
 ## Preview
 
-TAESD preview can help decide early whether a run is going in the right direction. It costs time, so it defaults to off in heavier nodes.
+The sampler `preview` toggle can help decide early whether a run is going in the right direction. It costs time, so it defaults to off in heavier nodes.
 
-TAESD preview needs a TAESDXL decoder model in ComfyUI's `models/vae_approx` folder, usually named like `taesdxl_decoder.*`.
+SDMLX follows ComfyUI's global preview setting instead of forcing a specific preview method. If ComfyUI is set to no previews, the SDMLX toggle will not override that. If ComfyUI is set to TAESD or another preview mode, SDMLX uses that mode.
 
 For crop-based workflows, preview modes can focus on the crop area instead of the whole image.

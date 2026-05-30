@@ -1,14 +1,14 @@
 # Third-Party Notices
 
-SDMLX source code is licensed separately under the GNU General Public License v3.0 or later. This notice file covers third-party model assets, model-derived acceleration patches, and optional companion models that SDMLX can use or download.
+SDMLX source code is licensed separately under the GNU General Public License v3.0 or later. This notice file covers third-party model assets, model-derived Speed Patches, and optional companion models that SDMLX can use or download.
 
 SDMLX does not claim ownership of third-party model weights, LoRAs, ControlNet weights, IP-Adapter weights, CLIP Vision weights, InsightFace models, or any derivatives of those assets. Those assets remain governed by their upstream licenses and terms.
 
 This file is a practical attribution and license summary, not legal advice. Always check the upstream repository or model card before redistributing, modifying, or using these assets in a commercial context.
 
-## SDMLX Acceleration Patches
+## SDMLX Speed Patches
 
-SDMLX acceleration patches are transformed LoRA/model factors mapped for the SDMLX MLX runtime. They are not relicensed by SDMLX. They remain subject to the upstream licenses of the source LoRAs or models.
+SDMLX Speed Patches are transformed LoRA/model factors mapped for the SDMLX MLX runtime. They are not relicensed by SDMLX. They remain subject to the upstream licenses of the source LoRAs or models.
 
 | SDMLX patch | Upstream source | Upstream license / terms | Notes |
 | --- | --- | --- | --- |
@@ -35,7 +35,22 @@ SDMLX can download common companion models into ComfyUI's normal model folders. 
 ## Practical Guidance
 
 - The GPL license for SDMLX code does not override model, LoRA, or dataset licenses.
-- Do not redistribute SDMLX acceleration patches unless the upstream source license permits redistribution of transformed weights.
+- Do not redistribute SDMLX Speed Patches unless the upstream source license permits redistribution of transformed weights.
 - DMD2-derived patches should be treated as non-commercial.
 - OpenRAIL and OpenRAIL++-M assets may allow broad use but include use-based restrictions that downstream users must follow.
 - Keep attribution to upstream model authors when publishing workflows, derivative patches, or packaged releases.
+
+## Spectrum Acceleration
+
+SDMLX includes an MLX adaptation of Spectrum-style feature forecasting for SDXL sampling. Spectrum is described in the paper [Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration](https://arxiv.org/abs/2603.01623) by Jiaqi Han, Juntong Shi, Puheng Li, Haotian Ye, Qiushan Guo and Stefano Ermon.
+
+The implementation in SDMLX is written for MLX and SDXL, but it is inspired by and cross-checked against the official Spectrum project and community ComfyUI implementations. The normal sampler and Hires Fix `fast` mode use public Spectrum scheduling behavior with three final real steps. The `standard` mode uses the same scheduling family from 35 steps upward and an SDMLX-specific guarded short-run policy below 35 steps.
+
+| Component | Upstream source | License | Notes |
+| --- | --- | --- | --- |
+| Spectrum paper | [arXiv:2603.01623](https://arxiv.org/abs/2603.01623) | Paper license as listed by arXiv | Original Spectrum method and terminology. |
+| Official Spectrum code | [hanjq17/Spectrum](https://github.com/hanjq17/Spectrum) | MIT License, copyright (c) 2026 Jiaqi Han | Official implementation and reference for Chebyshev/ridge feature forecasting. |
+| ComfyUI Spectrum reference | [judian17/ComfyUI-Spectrum](https://github.com/judian17/ComfyUI-Spectrum) | MIT License; license file preserves Jiaqi Han copyright notice | Reference for ComfyUI-oriented scheduling behavior and broad model integration. |
+| ComfyUI SDXL Spectrum reference | [ruwwww/ComfyUI-Spectrum-sdxl](https://github.com/ruwwww/ComfyUI-Spectrum-sdxl) | MIT License, copyright (c) 2026 A. Izzuddin Al Faruq | Reference for SDXL-oriented ComfyUI integration, manual parameters and final real-step guard behavior. |
+
+SDMLX's default `fast` and `standard` policies are practical SDXL/MLX presets, not upstream defaults. They should be treated as SDMLX tuning choices layered on top of the Spectrum idea.

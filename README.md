@@ -2,7 +2,7 @@
 
 SDMLX is an alpha-stage ComfyUI custom node suite for running SDXL workflows on Apple Silicon with Apple's MLX framework.
 
-The goal is straightforward: make SDXL on the Mac feel less like a compromise. SDMLX ports the core SDXL workflow from the usual PyTorch-MPS path to an MLX-native runtime, with easy checkpoint conversion, `.sdmlx` package caching, acceleration patches, macOS-aware memory handling, and workflow nodes that try to stay close to familiar ComfyUI patterns.
+The goal is straightforward: make SDXL on the Mac feel less like a compromise. SDMLX ports the core SDXL workflow from the usual PyTorch-MPS path to an MLX-native runtime, with easy checkpoint conversion, `.sdmlx` package caching, Speed Patches, macOS-aware memory handling, and workflow nodes that try to stay close to familiar ComfyUI patterns.
 
 In current local tests, SDMLX is typically about 25-30% faster than comparable PyTorch-MPS SDXL workflows on the same Mac, depending on the checkpoint, sampler, resolution, speed patch, ControlNet/IP-Adapter usage, and preview settings. It is still alpha software; results and APIs can change.
 
@@ -12,14 +12,15 @@ In current local tests, SDMLX is typically about 25-30% faster than comparable P
 - Single-package `.sdmlx` model cache in ComfyUI's `models/SDMLX` folder
 - SDXL sampling with MLX-native UNet, CLIP and VAE paths
 - Fast SDXL sampler with image and latent outputs
-- Built-in acceleration patch support for DMD2, Lightning, LCM and Hyper-SD style SDXL speed LoRAs
+- Built-in Speed Patch support for DMD2, Lightning, LCM and Hyper-SD style SDXL speed LoRAs
+- Optional Spectrum Acceleration for selected Euler-based SDXL workflows
 - LoRA loading, multi-LoRA loading, and scheduled LoRA strength curves
 - IP-Adapter SDXL and FaceID / FaceID PlusV2 support
 - MLX CLIP Vision encode path for IP-Adapter workflows
 - ControlNet Union ProMax support with schedule curves
 - Classic inpaint conditioning and SDMLX Inpaint Detailer
 - Hires Fix and Tiled Upscale nodes
-- TAESD preview options where useful
+- ComfyUI preview toggle where useful
 - macOS-oriented Memory Assist with optional preload / keep-warm behavior
 - Auto-download helpers for common companion models
 
@@ -122,17 +123,17 @@ Converted checkpoints are stored as macOS-style `.sdmlx` packages under:
 ComfyUI/models/SDMLX
 ```
 
-Acceleration patches are stored under:
+Speed Patches are stored under:
 
 ```text
-ComfyUI/models/SDMLX/AccelerationPatches
+ComfyUI/models/SDMLX/SpeedPatches
 ```
 
 The package format is intentionally simple: one visible model package per converted checkpoint, instead of loose UNet/CLIP/VAE files scattered through the custom node folder.
 
-## Acceleration Patches
+## Speed Patches
 
-SDMLX can use MLX-mapped acceleration patches derived from common SDXL speed LoRAs. Supported patch families currently include:
+SDMLX can use MLX-mapped Speed Patches derived from common SDXL speed LoRAs. Supported patch families currently include:
 
 - DMD2
 - SDXL Lightning
@@ -141,7 +142,28 @@ SDMLX can use MLX-mapped acceleration patches derived from common SDXL speed LoR
 
 The sampler can list downloaded patches directly. The Speed Patch Converter node remains available for users who want to convert supported local speed LoRAs themselves.
 
-Important: acceleration patches are model-derived assets. Their licenses are not replaced by the SDMLX code license. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Important: Speed Patches are model-derived assets. Their licenses are not replaced by the SDMLX code license. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Spectrum Acceleration
+
+The sampler and Hires Fix node have a simple `spectrum_acceleration` switch with two user-facing modes. Spectrum is a training-free forecasting technique that skips selected UNet evaluations by predicting internal UNet features and running the final output projection normally.
+
+- `fast`: Spectrum scheduling with three final real steps. This is the speed-first mode.
+- `standard`: balanced Spectrum mode. It uses a guarded short-run policy below 35 steps and a more conservative schedule with five warmup steps and three final real steps from 35 steps upward.
+
+The `fast` mode is based on the public Spectrum scheduling approach and ComfyUI reference implementations. `standard` keeps that foundation but adds SDMLX-specific policy choices for short SDXL runs, where overly aggressive forecasting can create more rejects than saved seconds. Hires Fix defaults to `fast`, because low-denoise upscale tests showed large speedups with no visible image difference.
+
+Use `SDMLX Spectrum Advanced` only when you want to override the sampler or Hires Fix switch. It plugs into `spectrum_acceleration_advanced` and exposes the raw Spectrum parameters without presets. If you connect it, the simple switch is ignored.
+
+Spectrum is not the same thing as a speed patch. Speed patches change model behavior; Spectrum changes which sampling steps run the full UNet. Keeping them separate makes it easier to understand which part of the workflow changed the image.
+
+Current observations:
+
+- Normal Euler SDXL runs from roughly 20 steps upward can become much faster while keeping high image quality.
+- The simple Spectrum modes automatically stay off when a Speed Patch is selected. Power users can still combine Spectrum with Speed Patches through the advanced node.
+- Dense prompts with hands, tiny objects, text or many overlapping details still need visual checking.
+
+Credits: SDMLX's Spectrum support is an MLX adaptation inspired by the official [hanjq17/Spectrum](https://github.com/hanjq17/Spectrum) project and the paper [Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration](https://arxiv.org/abs/2603.01623). The ComfyUI implementations [judian17/ComfyUI-Spectrum](https://github.com/judian17/ComfyUI-Spectrum) and [ruwwww/ComfyUI-Spectrum-sdxl](https://github.com/ruwwww/ComfyUI-Spectrum-sdxl) were important practical references for ComfyUI-facing behavior and SDXL-specific use. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for license notes.
 
 ## Companion Models
 
@@ -190,6 +212,7 @@ Some SDXL finetunes and merges can still behave differently from PyTorch-MPS, es
 - This is alpha software. Node names, defaults and package internals may still change.
 - First conversion and first warm run can be slower than later runs.
 - Scheduled LoRA disables some fast-path module fusions for that run, so it can cost performance.
+- Spectrum Acceleration is experimental. Complex prompts with many small objects, hands or text may show small artifacts; set it to `off` when quality matters more than speed.
 - FaceID Portrait variants can be sensitive to weights, CFG and source images; FaceID PlusV2 is usually the more stable starting point.
 - Very large tiled upscale jobs can be memory-heavy and slow even on high-end Macs.
 - ComfyUI Desktop and Easy Install use different Python environments; dependencies must be installed into the environment that actually runs ComfyUI.
@@ -222,7 +245,7 @@ Later experiments:
 
 ComfyUI on macOS normally runs SDXL through PyTorch with the MPS backend. That path is powerful, but it still carries the shape of a PyTorch/CUDA-oriented ecosystem: model weights, scheduler state, VAE paths, preview paths and custom node integrations often move through several layers that were not designed around Apple Silicon as the primary target.
 
-SDMLX takes a different route for SDXL. Checkpoints are converted into `.sdmlx` packages and loaded into an MLX runtime. The UNet, CLIP text encoders, VAE decode path, IP-Adapter attention integration, ControlNet Union path, acceleration patches and memory behavior are handled as directly as possible in MLX. The fast path uses float16 compute for the diffusion model, keeps VAE decode conservative by default, applies SDXL speed-LoRA derivatives as mapped MLX acceleration patches, and uses a Mac-specific Memory Assist layer to balance cache reuse against system memory pressure.
+SDMLX takes a different route for SDXL. Checkpoints are converted into `.sdmlx` packages and loaded into an MLX runtime. The UNet, CLIP text encoders, VAE decode path, IP-Adapter attention integration, ControlNet Union path, Speed Patches and memory behavior are handled as directly as possible in MLX. The fast path uses float16 compute for the diffusion model, keeps VAE decode conservative by default, applies SDXL speed-LoRA derivatives as mapped MLX Speed Patches, and uses a Mac-specific Memory Assist layer to balance cache reuse against system memory pressure.
 
 That does not make SDMLX a universal replacement for every ComfyUI model family. It is deliberately narrower: SDXL on Apple Silicon, with a strong bias toward practical Mac workflows.
 
@@ -234,4 +257,4 @@ SDMLX is a spare-time project by a non-programmer, built with help from Codex. B
 
 SDMLX source code is licensed under the GNU General Public License v3.0 or later. See [LICENSE](LICENSE).
 
-This code license does not relicense checkpoints, LoRAs, ControlNet models, IP-Adapter models, CLIP Vision models, InsightFace models, or SDMLX acceleration patches. Those assets remain subject to their upstream licenses and model-card terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the current practical summary.
+This code license does not relicense checkpoints, LoRAs, ControlNet models, IP-Adapter models, CLIP Vision models, InsightFace models, or SDMLX Speed Patches. Those assets remain subject to their upstream licenses and model-card terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the current practical summary.

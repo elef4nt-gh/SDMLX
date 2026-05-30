@@ -6,6 +6,7 @@ const CURVES_BY_MODE = {
   "blend out": ["linear", "degressive", "degressive fast", "s-curve"],
   bell: ["positive", "negative"],
 };
+const MIN_NODE_WIDTH = 300;
 
 function widgetByName(node, name) {
   return node.widgets?.find((widget) => widget.name === name);
@@ -41,18 +42,44 @@ function setWidgetVisible(widget, visible) {
   }
 }
 
-function refreshSize(node) {
-  const size = node.computeSize?.();
-  const visibleWidgets = (node.widgets || []).filter((widget) => {
+function compactNodeSize(node, forceMinimumWidth = false) {
+  const size = compactSize(node);
+  node.size = node.size || [size[0], size[1]];
+  node.size[0] = forceMinimumWidth ? MIN_NODE_WIDTH : Math.max(node.size[0] ?? MIN_NODE_WIDTH, MIN_NODE_WIDTH);
+  node.size[1] = size[1];
+  node.setDirtyCanvas?.(true, true);
+}
+
+function visibleWidgetCount(node) {
+  return (node.widgets || []).filter((widget) => {
     return widget.type !== "hidden" && widget.hidden !== true && widget.options?.hidden !== true;
   }).length;
+}
+
+function compactSize(node) {
   const rowHeight = globalThis.LiteGraph?.NODE_WIDGET_HEIGHT || 20;
-  const minHeight = 58 + visibleWidgets * (rowHeight + 4);
-  if (size) {
-    node.size = node.size || [size[0], size[1]];
-    node.size[0] = Math.max(node.size[0], size[0], 300);
-    node.size[1] = Math.max(130, size[1], minHeight);
-  }
+  const height = Math.max(96, 46 + visibleWidgetCount(node) * (rowHeight + 4));
+  return [MIN_NODE_WIDTH, height];
+}
+
+function configuredSize(config) {
+  const size = config?.size;
+  if (!size) return null;
+  const width = Number(size[0]);
+  const height = Number(size[1]);
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+  return [Math.max(MIN_NODE_WIDTH, width), Math.max(1, height)];
+}
+
+function restoreConfiguredSize(node, size) {
+  const contentSize = compactSize(node);
+  const width = Math.max(MIN_NODE_WIDTH, size?.[0] ?? node.size?.[0] ?? contentSize[0]);
+  const configuredHeight = Number(size?.[1]);
+  const maxReasonableHeight = Math.max(contentSize[1] + 40, contentSize[1] * 1.35);
+  const height = Number.isFinite(configuredHeight) && configuredHeight <= maxReasonableHeight
+    ? Math.max(contentSize[1], configuredHeight)
+    : contentSize[1];
+  node.size = [width, height];
   node.setDirtyCanvas?.(true, true);
 }
 
@@ -66,7 +93,7 @@ function setComboValues(widget, values) {
   }
 }
 
-function updateScheduleWidgets(node) {
+function updateScheduleWidgets(node, resize = false, forceMinimumWidth = false) {
   const modeWidget = widgetByName(node, "mode");
   const curveWidget = widgetByName(node, "curve");
   const advancedWidget = widgetByName(node, "advanced");
@@ -77,7 +104,9 @@ function updateScheduleWidgets(node) {
   const advanced = Boolean(advancedWidget?.value);
   setWidgetVisible(widgetByName(node, "start_percent"), advanced);
   setWidgetVisible(widgetByName(node, "end_percent"), advanced);
-  refreshSize(node);
+  if (resize) {
+    compactNodeSize(node, forceMinimumWidth);
+  }
 }
 
 function hookWidget(node, name) {
@@ -86,16 +115,16 @@ function hookWidget(node, name) {
   const originalCallback = widget.callback;
   widget.callback = function (...args) {
     const result = originalCallback?.apply(this, args);
-    setTimeout(() => updateScheduleWidgets(node), 0);
+    setTimeout(() => updateScheduleWidgets(node, true), 0);
     return result;
   };
   widget.sdmlxScheduleHooked = true;
 }
 
-function stabilize(node) {
+function stabilize(node, resize = false, forceMinimumWidth = false) {
   hookWidget(node, "mode");
   hookWidget(node, "advanced");
-  updateScheduleWidgets(node);
+  updateScheduleWidgets(node, resize, forceMinimumWidth);
 }
 
 app.registerExtension({
@@ -103,19 +132,37 @@ app.registerExtension({
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (nodeData.name !== NODE_NAME) return;
 
+    nodeType.prototype.computeSize = function () {
+      return compactSize(this);
+    };
+
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const result = onNodeCreated?.apply(this, arguments);
       this.serialize_widgets = true;
-      setTimeout(() => stabilize(this), 0);
+      this.sdmlxConfiguredFromWorkflow = false;
+      setTimeout(() => {
+        if (!this.sdmlxConfiguredFromWorkflow) stabilize(this, true, true);
+      }, 0);
       return result;
     };
 
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function (config) {
+      const size = configuredSize(config);
       const result = onConfigure?.apply(this, arguments);
       this.serialize_widgets = true;
-      setTimeout(() => stabilize(this), 50);
+      this.sdmlxConfiguredFromWorkflow = true;
+      stabilize(this, false);
+      restoreConfiguredSize(this, size);
+      setTimeout(() => {
+        stabilize(this, false);
+        restoreConfiguredSize(this, size);
+      }, 0);
+      setTimeout(() => {
+        stabilize(this, false);
+        restoreConfiguredSize(this, size);
+      }, 50);
       return result;
     };
   },

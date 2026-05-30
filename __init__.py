@@ -8,6 +8,7 @@ _NODE_DISPLAY_NAMES = {
     "SDMLX_LoraLoader": "🍏 SDMLX LoRA Loader",
     "SDMLX_MultiLoraLoader": "🍏 SDMLX Multi LoRA Loader",
     "SDMLX_SpeedPatchConverter": "🍏 SDMLX Speed Patch Converter",
+    "SDMLX_SpectrumBoost": "🍏 SDMLX Spectrum Advanced",
     "SDMLX_LoraSchedule": "🍏 SDMLX Scheduler",
     "SDMLX_IPAdapterLoader": "🍏 SDMLX IP-Adapter Loader",
     "SDMLX_CLIPVisionLoader": "🍏 SDMLX CLIP Vision Loader",
@@ -26,6 +27,7 @@ _NODE_DISPLAY_NAMES = {
     "SDMLX_InpaintDetailer": "🍏 SDMLX Inpaint Detailer",
     "SDMLX_HiresFix": "🍏 SDMLX Hires Fix",
     "SDMLX_TiledUpscale": "🍏 SDMLX Tiled Upscale",
+    "SDMLX_NumberPicker": "🍏 SDMLX Number Picker",
 }
 
 
@@ -64,7 +66,7 @@ except ModuleNotFoundError as exc:
         "huggingface_hub",
         "safetensors",
     )):
-        SDMLX_VERSION = "0.1.11"
+        SDMLX_VERSION = "0.1.12"
         NODE_CLASS_MAPPINGS = {
             node_name: _make_unavailable_node(node_name) for node_name in _NODE_DISPLAY_NAMES
         }

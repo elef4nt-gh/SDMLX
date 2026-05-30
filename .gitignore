@@ -38,9 +38,7 @@ cache/
 # SDMLX model packages / acceleration patches belong on Hugging Face, not in the code repo.
 *.sdmlx/
 *.sdmlxpatch/
-!huggingface_sdmlx_acceleration_patches/
-!huggingface_sdmlx_acceleration_patches/README.md
-!huggingface_sdmlx_acceleration_patches/.gitattributes
+huggingface_sdmlx_acceleration_patches/
 
 # Old local experiment shell; keep the repo focused on the ComfyUI node package.
 SDMLX.xcodeproj/

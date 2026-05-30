@@ -3,13 +3,27 @@
 __pycache__/
 *.pyc
 *.pyo
+.ruff_cache/
 
 # Development-only notes and measurements
 SESSION_LOG.md
 perf_wave*.csv
+local_milestones/
+sdmlx_lora_schedule_curves.*
 SDMLX.xcodeproj/
+*.log
 
-# Acceleration patches are hosted separately on Hugging Face.
+# Local model/cache artifacts and Speed Patches are hosted separately.
+models/
+cache/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.mlx
+*.sdmlx/
+*.sdmlxpatch/
 huggingface_sdmlx_acceleration_patches/
 
 # Local editor/project metadata

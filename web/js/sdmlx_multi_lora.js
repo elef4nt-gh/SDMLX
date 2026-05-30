@@ -7,9 +7,36 @@ const ROW_PREFIX = "sdmlx_lora_row_";
 const STRENGTH_MIN = -4;
 const STRENGTH_MAX = 4;
 const STRENGTH_STEP = 0.05;
+const MIN_NODE_WIDTH = 300;
+
+function customRowHeight() {
+  return (globalThis.LiteGraph?.NODE_WIDGET_HEIGHT || 20) + 4;
+}
+
+function widgetRadius(height) {
+  return height * 0.5;
+}
 
 function widgetByName(node, name) {
   return node.widgets?.find((widget) => widget.name === name);
+}
+
+function isInternalWidgetInput(name) {
+  return name === "slot_count" || /^(enabled|lora|strength)_\d+$/.test(String(name ?? ""));
+}
+
+function removeWidgetInputSockets(node) {
+  if (!node.inputs?.length) return;
+  for (let index = node.inputs.length - 1; index >= 0; index--) {
+    const input = node.inputs[index];
+    const name = input.widget?.name ?? input.name;
+    if (!isInternalWidgetInput(name)) continue;
+    if (typeof node.removeInput === "function") {
+      node.removeInput(index);
+    } else {
+      node.inputs.splice(index, 1);
+    }
+  }
 }
 
 function isLoraSelected(node, index) {
@@ -35,14 +62,21 @@ function setWidgetVisible(widget, visible) {
     widget.sdmlxOriginal = {
       type: widget.type,
       computeSize: widget.computeSize,
+      hidden: widget.hidden,
+      optionsHidden: widget.options?.hidden,
     };
   }
+  widget.options = widget.options || {};
   if (visible) {
     widget.type = widget.sdmlxOriginal.type;
     widget.computeSize = widget.sdmlxOriginal.computeSize;
+    widget.hidden = widget.sdmlxOriginal.hidden;
+    widget.options.hidden = widget.sdmlxOriginal.optionsHidden;
   } else {
     widget.type = `sdmlx-hidden:${widget.sdmlxOriginal.type}`;
     widget.computeSize = () => [0, -4];
+    widget.hidden = true;
+    widget.options.hidden = true;
   }
 }
 
@@ -101,28 +135,39 @@ function roundedRect(ctx, x, y, width, height, radius) {
   ctx.quadraticCurveTo(x, y, x + r, y);
 }
 
-function drawSlotToggle(ctx, x, y, size, enabled) {
-  roundedRect(ctx, x, y, size, size, 3);
-  ctx.fillStyle = enabled ? "#6ea765" : LiteGraph.WIDGET_BGCOLOR;
+function drawSlotToggle(ctx, x, y, width, height, enabled) {
+  const radius = height / 2;
+  roundedRect(ctx, x, y, width, height, radius);
+  ctx.fillStyle = enabled ? "#22c55e" : LiteGraph.WIDGET_BGCOLOR;
   ctx.fill();
-  ctx.strokeStyle = enabled ? "#9acb91" : LiteGraph.WIDGET_OUTLINE_COLOR;
+  ctx.strokeStyle = enabled ? "#22c55e" : LiteGraph.WIDGET_OUTLINE_COLOR;
   ctx.stroke();
+
+  const knobSize = Math.max(8, height - 4);
+  const knobX = enabled ? x + width - knobSize - 2 : x + 2;
+  const knobY = y + (height - knobSize) / 2;
+  ctx.beginPath();
+  ctx.arc(knobX + knobSize / 2, knobY + knobSize / 2, knobSize / 2, 0, Math.PI * 2);
+  ctx.fillStyle = "#ffffff";
+  ctx.fill();
 }
 
-function drawTriangle(ctx, x, y, size, direction, disabled = false) {
-  const half = size / 2;
+function drawStepperArrow(ctx, tipX, y, height, direction, disabled = false) {
+  const arrowWidth = 10;
+  const top = y + 5;
+  const middle = y + height * 0.5;
+  const bottom = y + height - 5;
   ctx.beginPath();
   if (direction < 0) {
-    ctx.moveTo(x + half * 0.55, y);
-    ctx.lineTo(x - half * 0.55, y + half);
-    ctx.lineTo(x + half * 0.55, y + size);
+    ctx.moveTo(tipX + arrowWidth, top);
+    ctx.lineTo(tipX, middle);
+    ctx.lineTo(tipX + arrowWidth, bottom);
   } else {
-    ctx.moveTo(x - half * 0.55, y);
-    ctx.lineTo(x + half * 0.55, y + half);
-    ctx.lineTo(x - half * 0.55, y + size);
+    ctx.moveTo(tipX - arrowWidth, top);
+    ctx.lineTo(tipX, middle);
+    ctx.lineTo(tipX - arrowWidth, bottom);
   }
-  ctx.closePath();
-  ctx.fillStyle = disabled ? LiteGraph.WIDGET_SECONDARY_TEXT_COLOR : "#ffffff";
+  ctx.fillStyle = disabled ? LiteGraph.WIDGET_SECONDARY_TEXT_COLOR : LiteGraph.WIDGET_TEXT_COLOR || "#ffffff";
   ctx.fill();
 }
 
@@ -131,7 +176,7 @@ function setLoraValue(node, index, value, event) {
   if (!widget) return;
   widget.value = value;
   widget.callback?.(value, app.canvas, node, undefined, event);
-  updateMultiLoraNode(node);
+  updateMultiLoraNode(node, true);
 }
 
 function setEnabledValue(node, index, value, event) {
@@ -186,7 +231,7 @@ function addLoraAndChoose(event, node) {
   if (targetSlot > slotCount(node)) {
     setSlotCount(node, targetSlot);
   }
-  updateMultiLoraNode(node);
+  updateMultiLoraNode(node, true);
   setTimeout(() => showLoraChooser(event, node, targetSlot), 0);
 }
 
@@ -206,28 +251,29 @@ function drawSlotRow(ctx, node, index, width, posY, height, rowWidget) {
   const margin = 15;
   const inner = 6;
   const rowX = margin;
-  const rowY = posY + 1;
-  const rowH = Math.max(18, height - 2);
+  const rowY = posY + 2;
+  const rowH = Math.max(20, height - 4);
   const rowW = Math.max(0, width - margin * 2);
-  const toggleSize = 12;
+  const toggleW = 26;
+  const toggleH = 14;
   const toggleX = rowX + 7;
-  const toggleY = rowY + (rowH - toggleSize) / 2;
+  const toggleY = rowY + (rowH - toggleH) / 2;
   const strengthW = selected ? 72 : 0;
   const strengthX = rowX + rowW - strengthW - inner;
-  const loraX = toggleX + toggleSize + inner + 2;
+  const loraX = toggleX + toggleW + inner + 2;
   const loraW = Math.max(40, (selected ? strengthX - inner : rowX + rowW - inner) - loraX);
   const alpha = app.canvas?.editor_alpha ?? 1;
   const rowAlpha = globalEnabled ? alpha : alpha * 0.45;
 
   ctx.save();
   ctx.globalAlpha = rowAlpha;
-  roundedRect(ctx, rowX, rowY, rowW, rowH, 4);
+  roundedRect(ctx, rowX, rowY, rowW, rowH, widgetRadius(rowH));
   ctx.fillStyle = LiteGraph.WIDGET_BGCOLOR;
   ctx.fill();
   ctx.strokeStyle = LiteGraph.WIDGET_OUTLINE_COLOR;
   ctx.stroke();
 
-  drawSlotToggle(ctx, toggleX, toggleY, toggleSize, selected && enabled);
+  drawSlotToggle(ctx, toggleX, toggleY, toggleW, toggleH, selected && enabled);
 
   if (selected && !enabled) ctx.globalAlpha = alpha * 0.45;
   ctx.fillStyle = selected ? LiteGraph.WIDGET_TEXT_COLOR : LiteGraph.WIDGET_SECONDARY_TEXT_COLOR;
@@ -237,7 +283,7 @@ function drawSlotRow(ctx, node, index, width, posY, height, rowWidget) {
   ctx.fillText(fitText(ctx, label, loraW), loraX, rowY + rowH / 2);
 
   rowWidget.sdmlxBounds = {
-    toggle: [toggleX, rowY, toggleSize, rowH],
+    toggle: [toggleX, rowY, toggleW, rowH],
     lora: [loraX, rowY, loraW, rowH],
     strengthDec: null,
     strengthValue: null,
@@ -246,21 +292,20 @@ function drawSlotRow(ctx, node, index, width, posY, height, rowWidget) {
 
   if (selected) {
     ctx.globalAlpha = enabled ? alpha : alpha * 0.45;
-    const arrowSize = 9;
-    const arrowY = rowY + (rowH - arrowSize) / 2;
-    const valueW = strengthW - arrowSize * 2 - inner * 2;
-    const leftX = strengthX + arrowSize / 2;
-    const valueX = strengthX + arrowSize + inner;
-    const rightX = strengthX + arrowSize + inner + valueW + inner + arrowSize / 2;
+    const arrowButtonW = 20;
+    const valueX = strengthX + arrowButtonW;
+    const valueW = strengthW - arrowButtonW * 2;
+    const leftTipX = strengthX + 6;
+    const rightTipX = strengthX + strengthW - 6;
     ctx.fillStyle = LiteGraph.WIDGET_TEXT_COLOR;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    drawTriangle(ctx, leftX, arrowY, arrowSize, -1, !enabled);
+    drawStepperArrow(ctx, leftTipX, rowY, rowH, -1, !enabled);
     ctx.fillText(formatStrength(strength), valueX + valueW / 2, rowY + rowH / 2);
-    drawTriangle(ctx, rightX, arrowY, arrowSize, 1, !enabled);
-    rowWidget.sdmlxBounds.strengthDec = [strengthX, rowY, arrowSize + inner, rowH];
+    drawStepperArrow(ctx, rightTipX, rowY, rowH, 1, !enabled);
+    rowWidget.sdmlxBounds.strengthDec = [strengthX, rowY, arrowButtonW, rowH];
     rowWidget.sdmlxBounds.strengthValue = [valueX, rowY, valueW, rowH];
-    rowWidget.sdmlxBounds.strengthInc = [valueX + valueW, rowY, arrowSize + inner, rowH];
+    rowWidget.sdmlxBounds.strengthInc = [valueX + valueW, rowY, arrowButtonW, rowH];
   }
   ctx.restore();
 }
@@ -326,7 +371,7 @@ function makeSlotRowWidget(index) {
     options: { serialize: false },
     serialize: false,
     computeSize(width) {
-      return [width, LiteGraph.NODE_WIDGET_HEIGHT ?? 20];
+      return [width, customRowHeight()];
     },
     draw(ctx, node, width, posY, height) {
       drawSlotRow(ctx, node, index, width, posY, height, this);
@@ -354,8 +399,7 @@ function ensureSlotRows(node) {
 
 function orderCustomWidgets(node) {
   const rows = (node.sdmlxSlotRowWidgets ?? []).filter(Boolean);
-  const globalEnabled = widgetByName(node, "enabled");
-  const tail = [...rows, node.sdmlxAddLoraWidget, globalEnabled].filter(Boolean);
+  const tail = [...rows, node.sdmlxAddLoraWidget].filter(Boolean);
   if (!tail.length) return;
   node.widgets = node.widgets.filter((widget) => !tail.includes(widget));
   node.widgets.push(...tail);
@@ -369,13 +413,57 @@ function slotWidgetNames(index) {
   ];
 }
 
-function refreshSize(node) {
-  const size = node.computeSize?.();
-  if (size) {
-    node.size = node.size || [size[0], size[1]];
-    node.size[0] = Math.max(node.size[0], size[0], 360);
-    node.size[1] = Math.max(140, size[1]);
+function rackRowCount(node) {
+  const visibleSlots = slotCount(node);
+  let rows = 0;
+  for (let index = 1; index <= visibleSlots; index++) {
+    if (isLoraSelected(node, index)) rows += 1;
   }
+  if (visibleSlots < LORA_SLOT_COUNT) rows += 1;
+  return Math.max(1, rows);
+}
+
+function compactHeight(node) {
+  const rowHeight = customRowHeight();
+  return Math.max(70, 46 + rackRowCount(node) * (rowHeight + 4));
+}
+
+function minimumSize(node) {
+  return [MIN_NODE_WIDTH, compactHeight(node)];
+}
+
+function maximumUsefulHeight() {
+  const rowHeight = customRowHeight();
+  return Math.max(70, 46 + LORA_SLOT_COUNT * (rowHeight + 4));
+}
+
+function configuredSize(config) {
+  const size = config?.size;
+  if (!size) return null;
+  const width = Number(size[0]);
+  const height = Number(size[1]);
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+  return [Math.max(MIN_NODE_WIDTH, width), Math.max(1, height)];
+}
+
+function restoreConfiguredSize(node, size) {
+  const contentSize = minimumSize(node);
+  const width = Math.max(MIN_NODE_WIDTH, size?.[0] ?? node.size?.[0] ?? contentSize[0]);
+  const configuredHeight = Number(size?.[1]);
+  const maxReasonableHeight = maximumUsefulHeight() + 160;
+  const height = Number.isFinite(configuredHeight) && configuredHeight <= maxReasonableHeight
+    ? Math.max(contentSize[1], configuredHeight)
+    : contentSize[1];
+  node.size = [width, height];
+  node.setDirtyCanvas?.(true, true);
+}
+
+function compactNodeSize(node, forceMinimumWidth = false) {
+  const width = forceMinimumWidth ? MIN_NODE_WIDTH : Math.max(MIN_NODE_WIDTH, node.size?.[0] ?? MIN_NODE_WIDTH);
+  const height = compactHeight(node);
+  node.size = node.size || [width, compactHeight(node)];
+  node.size[0] = width;
+  node.size[1] = forceMinimumWidth ? height : Math.max(node.size[1] ?? height, height);
   node.setDirtyCanvas?.(true, true);
 }
 
@@ -390,20 +478,20 @@ function ensureAddButton(node) {
       options: { serialize: false },
       serialize: false,
       computeSize(width) {
-        return [width, LiteGraph.NODE_WIDGET_HEIGHT ?? 20];
+        return [width, customRowHeight()];
       },
       draw(ctx, node, width, posY, height) {
         const globalEnabled = globalLorasEnabled(node);
         const margin = 15;
         const rowX = margin;
-        const rowY = posY + 1;
+        const rowY = posY + 2;
         const rowW = width - margin * 2;
-        const rowH = Math.max(18, height - 2);
+        const rowH = Math.max(20, height - 4);
         const midY = rowY + rowH / 2;
         const plusX = rowX + 12;
         ctx.save();
         ctx.globalAlpha = globalEnabled ? (app.canvas?.editor_alpha ?? 1) : (app.canvas?.editor_alpha ?? 1) * 0.45;
-        roundedRect(ctx, rowX, rowY, rowW, rowH, 4);
+        roundedRect(ctx, rowX, rowY, rowW, rowH, widgetRadius(rowH));
         ctx.fillStyle = LiteGraph.WIDGET_BGCOLOR;
         ctx.fill();
         ctx.strokeStyle = LiteGraph.WIDGET_OUTLINE_COLOR;
@@ -452,7 +540,7 @@ function updateLoraWidgets(node) {
       for (const name of slotWidgetNames(index)) {
         setWidgetVisible(widgetByName(node, name), false);
       }
-      setWidgetVisible(node.sdmlxSlotRowWidgets[index], index <= visibleSlots);
+      setWidgetVisible(node.sdmlxSlotRowWidgets[index], index <= visibleSlots && isLoraSelected(node, index));
     } else {
       const showSelector = index <= visibleSlots;
       const showControls = showSelector && isLoraSelected(node, index);
@@ -476,7 +564,7 @@ function hookLoraWidgetCallbacks(node) {
     const originalCallback = widget.callback;
     widget.callback = function (...args) {
       const result = originalCallback?.apply(this, args);
-      setTimeout(() => updateMultiLoraNode(node), 0);
+      setTimeout(() => updateMultiLoraNode(node, true), 0);
       return result;
     };
     widget.sdmlxHooked = true;
@@ -486,21 +574,24 @@ function hookLoraWidgetCallbacks(node) {
     const originalCallback = globalEnabled.callback;
     globalEnabled.callback = function (...args) {
       const result = originalCallback?.apply(this, args);
-      setTimeout(() => updateMultiLoraNode(node), 0);
+      setTimeout(() => updateMultiLoraNode(node, true), 0);
       return result;
     };
     globalEnabled.sdmlxHooked = true;
   }
 }
 
-function updateMultiLoraNode(node) {
+function updateMultiLoraNode(node, resize = false, forceMinimumWidth = false) {
+  removeWidgetInputSockets(node);
   updateLoraWidgets(node);
-  refreshSize(node);
+  if (resize) {
+    compactNodeSize(node, forceMinimumWidth);
+  }
 }
 
-function stabilize(node) {
+function stabilize(node, resize = false, forceMinimumWidth = false) {
   hookLoraWidgetCallbacks(node);
-  updateMultiLoraNode(node);
+  updateMultiLoraNode(node, resize, forceMinimumWidth);
 }
 
 app.registerExtension({
@@ -508,26 +599,44 @@ app.registerExtension({
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (nodeData.name !== NODE_NAME) return;
 
+    nodeType.prototype.computeSize = function () {
+      return minimumSize(this);
+    };
+
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const result = onNodeCreated?.apply(this, arguments);
       this.serialize_widgets = true;
-      setTimeout(() => stabilize(this), 0);
+      this.sdmlxConfiguredFromWorkflow = false;
+      setTimeout(() => {
+        if (!this.sdmlxConfiguredFromWorkflow) stabilize(this, true, true);
+      }, 0);
       return result;
     };
 
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function (config) {
+      const size = configuredSize(config);
       const result = onConfigure?.apply(this, arguments);
       this.serialize_widgets = true;
-      setTimeout(() => stabilize(this), 50);
+      this.sdmlxConfiguredFromWorkflow = true;
+      stabilize(this, false);
+      restoreConfiguredSize(this, size);
+      setTimeout(() => {
+        stabilize(this, false);
+        restoreConfiguredSize(this, size);
+      }, 0);
+      setTimeout(() => {
+        stabilize(this, false);
+        restoreConfiguredSize(this, size);
+      }, 50);
       return result;
     };
 
     const onConnectionsChange = nodeType.prototype.onConnectionsChange;
     nodeType.prototype.onConnectionsChange = function () {
       const result = onConnectionsChange?.apply(this, arguments);
-      setTimeout(() => updateMultiLoraNode(this), 0);
+      setTimeout(() => updateMultiLoraNode(this, false), 0);
       return result;
     };
   },

@@ -54,7 +54,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.11"
+SDMLX_VERSION = "0.1.12"
 SDMLX_CACHE_VERSION = "adapter-v6"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -112,7 +112,7 @@ CONDITIONING_CACHE = {}
 COMPILED_STEP_DENOISERS = {}
 COMPILED_VAE_DECODERS = {}
 TAESD_PREVIEWER_CACHE = {}
-ACCELERATION_PATCH_FACTORS_CACHE = {}
+SPEED_PATCH_FACTORS_CACHE = {}
 LORA_MODULES_CACHE = {}
 CONTROLNET_MODEL_CACHE = {}
 IPADAPTER_MODEL_CACHE = {}
@@ -130,7 +130,7 @@ MLX_MEMORY_LIMIT_STATE = {
     "original_cache_limit": None,
 }
 MEMORY_ASSIST_OPTIONS = ["auto", "max_performance", "low_memory", "off"]
-SDMLX_SELECT_CHECKPOINT = "select checkpoint"
+SDMLX_SELECT_CHECKPOINT = ""
 
 SDXL_SIZE_PRESETS = [
     "1024x1024",
@@ -153,9 +153,9 @@ HIRES_MAX_PIXELS = 4_500_000
 TILED_UPSCALE_MAX_PIXELS = 32_000_000
 VAE_DECODE_MODES = ["auto", "full", "tiled"]
 MASK_FEATHER_MODES = ["gaussian", "box"]
-ACCELERATION_PATCH_NONE = "None"
-ACCELERATION_PATCH_REPO_ID = "elef4nt/sdmlx-acceleration-patches"
-KNOWN_ACCELERATION_PATCHES = [
+SPEED_PATCH_NONE = "None"
+SPEED_PATCH_REPO_ID = "elef4nt/sdmlx-acceleration-patches"
+KNOWN_SPEED_PATCHES = [
     "dmd2_sdxl_4step_lora_fp16.sdmlxpatch",
     "dmd2-lighting8step_cfg1.5.sdmlxpatch",
     "sdxl_lightning_4step_lora.sdmlxpatch",
@@ -164,7 +164,7 @@ KNOWN_ACCELERATION_PATCHES = [
     "Hyper-SDXL-8steps-CFG-lora.sdmlxpatch",
     "Hyper-SDXL-12steps-CFG-lora.sdmlxpatch",
 ]
-ACCELERATION_PATCH_LABELS = {
+SPEED_PATCH_LABELS = {
     "dmd2_sdxl_4step_lora_fp16.sdmlxpatch": "DMD2 / 4-step fp16",
     "dmd2-lighting8step_cfg1.5.sdmlxpatch": "DMD2 / Lightning 8-step CFG 1.5",
     "sdxl_lightning_4step_lora.sdmlxpatch": "Lightning / 4-step",
@@ -173,7 +173,7 @@ ACCELERATION_PATCH_LABELS = {
     "Hyper-SDXL-8steps-CFG-lora.sdmlxpatch": "Hyper-SD / 8-step CFG",
     "Hyper-SDXL-12steps-CFG-lora.sdmlxpatch": "Hyper-SD / 12-step CFG",
 }
-ACCELERATION_PATCH_BY_LABEL = {label: name for name, label in ACCELERATION_PATCH_LABELS.items()}
+SPEED_PATCH_BY_LABEL = {label: name for name, label in SPEED_PATCH_LABELS.items()}
 SUPPORTED_SPEED_LORA_PLACEHOLDER = "Put a supported speed LoRA in models/loras"
 SUPPORTED_SPEED_LORA_PATCHES = {
     "dmd2_sdxl_4step_lora_fp16.safetensors": {
@@ -1278,69 +1278,69 @@ def cache_dir():
     return path
 
 
-def acceleration_patch_dir():
-    path = os.path.join(cache_dir(), "AccelerationPatches")
+def speed_patch_dir():
+    path = os.path.join(cache_dir(), "SpeedPatches")
     os.makedirs(path, exist_ok=True)
     return path
 
 
-def normalized_acceleration_patch_name(acceleration_patch):
-    if not acceleration_patch or acceleration_patch == ACCELERATION_PATCH_NONE:
+def normalized_speed_patch_name(speed_patch):
+    if not speed_patch or speed_patch == SPEED_PATCH_NONE:
         return None
-    value = str(acceleration_patch)
-    name = ACCELERATION_PATCH_BY_LABEL.get(value, value)
+    value = str(speed_patch)
+    name = SPEED_PATCH_BY_LABEL.get(value, value)
     name = os.path.basename(name)
     if not name.endswith(".sdmlxpatch"):
         name += ".sdmlxpatch"
     return name
 
 
-def acceleration_patch_override(widget_value, speed_patch=None):
-    if speed_patch and speed_patch != ACCELERATION_PATCH_NONE:
-        return speed_patch
+def speed_patch_override(widget_value, speed_patch_input=None):
+    if speed_patch_input and speed_patch_input != SPEED_PATCH_NONE:
+        return speed_patch_input
     return widget_value
 
 
-def acceleration_patch_label(package_name):
-    return ACCELERATION_PATCH_LABELS.get(package_name, package_name.removesuffix(".sdmlxpatch"))
+def speed_patch_label(package_name):
+    return SPEED_PATCH_LABELS.get(package_name, package_name.removesuffix(".sdmlxpatch"))
 
 
-ACCELERATION_PATCH_OPTIONS_CACHE = None
-ACCELERATION_PATCH_MARKED_PACKAGES = set()
+SPEED_PATCH_OPTIONS_CACHE = None
+SPEED_PATCH_MARKED_PACKAGES = set()
 
 
-def invalidate_acceleration_patch_options_cache():
-    global ACCELERATION_PATCH_OPTIONS_CACHE
-    ACCELERATION_PATCH_OPTIONS_CACHE = None
+def invalidate_speed_patch_options_cache():
+    global SPEED_PATCH_OPTIONS_CACHE
+    SPEED_PATCH_OPTIONS_CACHE = None
 
 
-def acceleration_patch_options():
-    global ACCELERATION_PATCH_OPTIONS_CACHE
-    if ACCELERATION_PATCH_OPTIONS_CACHE is not None:
-        return list(ACCELERATION_PATCH_OPTIONS_CACHE)
+def speed_patch_options():
+    global SPEED_PATCH_OPTIONS_CACHE
+    if SPEED_PATCH_OPTIONS_CACHE is not None:
+        return list(SPEED_PATCH_OPTIONS_CACHE)
 
-    names = set(KNOWN_ACCELERATION_PATCHES)
+    names = set(KNOWN_SPEED_PATCHES)
     try:
-        root = acceleration_patch_dir()
+        root = speed_patch_dir()
         for entry in os.listdir(root):
             if entry.endswith(".sdmlxpatch"):
                 names.add(entry)
                 package_path = os.path.join(root, entry)
-                if os.path.isdir(package_path) and package_path not in ACCELERATION_PATCH_MARKED_PACKAGES:
+                if os.path.isdir(package_path) and package_path not in SPEED_PATCH_MARKED_PACKAGES:
                     mark_macos_package(package_path)
-                    ACCELERATION_PATCH_MARKED_PACKAGES.add(package_path)
+                    SPEED_PATCH_MARKED_PACKAGES.add(package_path)
     except Exception:
         pass
-    options = [ACCELERATION_PATCH_NONE] + sorted(
-        (acceleration_patch_label(name) for name in names),
+    options = [SPEED_PATCH_NONE] + sorted(
+        (speed_patch_label(name) for name in names),
         key=str.lower,
     )
-    ACCELERATION_PATCH_OPTIONS_CACHE = tuple(options)
+    SPEED_PATCH_OPTIONS_CACHE = tuple(options)
     return list(options)
 
 
-def acceleration_patch_package_path(package_name):
-    return os.path.join(acceleration_patch_dir(), package_name)
+def speed_patch_package_path(package_name):
+    return os.path.join(speed_patch_dir(), package_name)
 
 
 def speed_lora_lookup_key(lora_name):
@@ -1489,7 +1489,7 @@ def download_hf_model_file(spec, target_dir, folder_name=None):
     return final_path
 
 
-def read_acceleration_patch_manifest(package_path):
+def read_speed_patch_manifest(package_path):
     try:
         with open(os.path.join(package_path, "manifest.json"), "r", encoding="utf-8") as handle:
             return json.load(handle)
@@ -1497,18 +1497,18 @@ def read_acceleration_patch_manifest(package_path):
         return None
 
 
-def ensure_acceleration_patch_package(acceleration_patch):
-    package_name = normalized_acceleration_patch_name(acceleration_patch)
+def ensure_speed_patch_package(speed_patch):
+    package_name = normalized_speed_patch_name(speed_patch)
     if package_name is None:
         return None
 
-    package_path = acceleration_patch_package_path(package_name)
-    manifest = read_acceleration_patch_manifest(package_path)
+    package_path = speed_patch_package_path(package_name)
+    manifest = read_speed_patch_manifest(package_path)
     factors_path = os.path.join(package_path, "patch.safetensors")
     if manifest and os.path.exists(factors_path):
-        if os.path.isdir(package_path) and package_path not in ACCELERATION_PATCH_MARKED_PACKAGES:
+        if os.path.isdir(package_path) and package_path not in SPEED_PATCH_MARKED_PACKAGES:
             mark_macos_package(package_path)
-            ACCELERATION_PATCH_MARKED_PACKAGES.add(package_path)
+            SPEED_PATCH_MARKED_PACKAGES.add(package_path)
         return {
             "name": package_name,
             "path": package_path,
@@ -1521,29 +1521,29 @@ def ensure_acceleration_patch_package(acceleration_patch):
     except Exception as exc:
         raise RuntimeError(
             "SDMLX: huggingface_hub is not available; "
-            f"Acceleration Patch {package_name} cannot be downloaded."
+            f"Speed Patch {package_name} cannot be downloaded."
         ) from exc
 
     os.makedirs(package_path, exist_ok=True)
-    print(f"SDMLX: Downloading Acceleration Patch {package_name} from Hugging Face...")
+    print(f"SDMLX: Downloading Speed Patch {package_name} from Hugging Face...")
     for filename in ("manifest.json", "patch.safetensors", "source_metadata.json"):
         try:
             hf_hub_download(
-                repo_id=ACCELERATION_PATCH_REPO_ID,
+                repo_id=SPEED_PATCH_REPO_ID,
                 repo_type="model",
                 filename=f"{package_name}/{filename}",
-                local_dir=acceleration_patch_dir(),
+                local_dir=speed_patch_dir(),
             )
         except Exception:
             if filename != "source_metadata.json":
                 raise
 
-    manifest = read_acceleration_patch_manifest(package_path)
+    manifest = read_speed_patch_manifest(package_path)
     if not manifest or not os.path.exists(factors_path):
-        raise RuntimeError(f"SDMLX: Acceleration Patch {package_name} could not be downloaded completely.")
+        raise RuntimeError(f"SDMLX: Speed Patch {package_name} could not be downloaded completely.")
     mark_macos_package(package_path)
-    ACCELERATION_PATCH_MARKED_PACKAGES.add(package_path)
-    invalidate_acceleration_patch_options_cache()
+    SPEED_PATCH_MARKED_PACKAGES.add(package_path)
+    invalidate_speed_patch_options_cache()
     return {
         "name": package_name,
         "path": package_path,
@@ -1552,21 +1552,21 @@ def ensure_acceleration_patch_package(acceleration_patch):
     }
 
 
-def load_acceleration_patch_factors(patch_info):
+def load_speed_patch_factors(patch_info):
     factors_path = patch_info["factors_path"]
     try:
         stat = os.stat(factors_path)
     except OSError as exc:
-        raise RuntimeError(f"SDMLX: Acceleration Patch missing: {factors_path}") from exc
+        raise RuntimeError(f"SDMLX: Speed Patch missing: {factors_path}") from exc
 
     cache_key = (factors_path, stat.st_size, stat.st_mtime_ns)
-    if cache_key not in ACCELERATION_PATCH_FACTORS_CACHE:
+    if cache_key not in SPEED_PATCH_FACTORS_CACHE:
         from safetensors.numpy import load_file
-        ACCELERATION_PATCH_FACTORS_CACHE[cache_key] = load_file(factors_path)
-    return ACCELERATION_PATCH_FACTORS_CACHE[cache_key]
+        SPEED_PATCH_FACTORS_CACHE[cache_key] = load_file(factors_path)
+    return SPEED_PATCH_FACTORS_CACHE[cache_key]
 
 
-def acceleration_patch_modules(manifest, factors):
+def speed_patch_modules(manifest, factors):
     modules = manifest.get("modules") or []
     if modules:
         return modules
@@ -1578,7 +1578,7 @@ def acceleration_patch_modules(manifest, factors):
     return result
 
 
-def normalize_acceleration_patch_target_base(target_base):
+def normalize_speed_patch_target_base(target_base):
     replacements = {
         ".to.k": ".key_proj",
         ".to.q": ".query_proj",
@@ -1615,29 +1615,29 @@ def cast_mapped_weights(mapped_weights, dtype):
     return casted
 
 
-def apply_acceleration_patch_to_mapped_weights(mapped_weights, acceleration_patch, strength):
-    package_name = normalized_acceleration_patch_name(acceleration_patch)
+def apply_speed_patch_to_mapped_weights(mapped_weights, speed_patch, strength):
+    package_name = normalized_speed_patch_name(speed_patch)
     strength = float(strength)
     if package_name is None or strength == 0.0:
         return mapped_weights, None
 
-    patch_info = ensure_acceleration_patch_package(package_name)
+    patch_info = ensure_speed_patch_package(package_name)
     manifest = patch_info["manifest"]
     if manifest.get("format") != "sdmlx-acceleration-patch-v1":
-        raise RuntimeError(f"SDMLX: Unbekanntes Acceleration-Patch-Format in {package_name}.")
+        raise RuntimeError(f"SDMLX: Unknown Speed Patch format in {package_name}.")
 
-    factors = load_acceleration_patch_factors(patch_info)
+    factors = load_speed_patch_factors(patch_info)
     weight_map = dict(mapped_weights)
     applied = 0
     skipped = []
     pending_eval = []
 
-    for module in acceleration_patch_modules(manifest, factors):
+    for module in speed_patch_modules(manifest, factors):
         target_key = module.get("target")
         if not target_key:
             continue
         factor_base = target_key[: -len(".weight")] if target_key.endswith(".weight") else target_key
-        weight_base = normalize_acceleration_patch_target_base(factor_base)
+        weight_base = normalize_speed_patch_target_base(factor_base)
         weight_key = f"{weight_base}.weight"
         up_key = f"{factor_base}.lora_up"
         down_key = f"{factor_base}.lora_down"
@@ -1673,11 +1673,11 @@ def apply_acceleration_patch_to_mapped_weights(mapped_weights, acceleration_patc
         mx.eval(*pending_eval)
 
     log_timing(
-        f"SDMLX: Acceleration Patch {package_name} applied "
+        f"SDMLX: Speed Patch {package_name} applied "
         f"({applied} Module, strength={strength:g})."
     )
     if skipped:
-        log_timing(f"SDMLX: Acceleration Patch: {len(skipped)} target weights skipped.")
+        log_timing(f"SDMLX: Speed Patch: {len(skipped)} target weights skipped.")
     return list(weight_map.items()), {
         "name": package_name,
         "path": patch_info["path"],
@@ -3532,7 +3532,7 @@ def load_lora_modules(path):
         diffusers_key = lora_prefix_to_diffusers_key(prefix)
         for target_key, split_index in diffusers_unet_key_to_sdmlx_targets(diffusers_key):
             factor_base = target_key[: -len(".weight")] if target_key.endswith(".weight") else target_key
-            target_base = normalize_acceleration_patch_target_base(factor_base)
+            target_base = normalize_speed_patch_target_base(factor_base)
             up_np, down_np = mapped_lora_factor_arrays(up, down, split_index)
             modules.append(
                 {
@@ -3555,26 +3555,26 @@ def load_lora_modules(path):
     return result
 
 
-def build_acceleration_patch_from_lora(source_path, patch_info, force_rebuild=False):
+def build_speed_patch_from_lora(source_path, patch_info, force_rebuild=False):
     from safetensors.numpy import save_file
 
     package_name = patch_info["package"]
-    package_path = acceleration_patch_package_path(package_name)
+    package_path = speed_patch_package_path(package_name)
     factors_path = os.path.join(package_path, "patch.safetensors")
-    manifest = read_acceleration_patch_manifest(package_path)
+    manifest = read_speed_patch_manifest(package_path)
     if (
         not force_rebuild
         and manifest
         and manifest.get("format") == "sdmlx-acceleration-patch-v1"
         and os.path.exists(factors_path)
     ):
-        if package_path not in ACCELERATION_PATCH_MARKED_PACKAGES:
+        if package_path not in SPEED_PATCH_MARKED_PACKAGES:
             mark_macos_package(package_path)
-            ACCELERATION_PATCH_MARKED_PACKAGES.add(package_path)
+            SPEED_PATCH_MARKED_PACKAGES.add(package_path)
         return {
             "name": package_name,
             "path": package_path,
-            "label": acceleration_patch_label(package_name),
+            "label": speed_patch_label(package_name),
             "built": False,
             "modules": int(manifest.get("module_count", 0)),
         }
@@ -3584,7 +3584,7 @@ def build_acceleration_patch_from_lora(source_path, patch_info, force_rebuild=Fa
     if not modules:
         raise ValueError(
             "SDMLX: This speed LoRA contains no supported SDXL UNet LoRA modules "
-            f"and cannot be converted into an Acceleration Patch: {source_path}"
+            f"and cannot be converted into a Speed Patch: {source_path}"
         )
 
     if os.path.exists(package_path) and force_rebuild:
@@ -3657,12 +3657,12 @@ def build_acceleration_patch_from_lora(source_path, patch_info, force_rebuild=Fa
         handle.write("\n")
 
     mark_macos_package(package_path)
-    ACCELERATION_PATCH_MARKED_PACKAGES.add(package_path)
-    invalidate_acceleration_patch_options_cache()
+    SPEED_PATCH_MARKED_PACKAGES.add(package_path)
+    invalidate_speed_patch_options_cache()
     return {
         "name": package_name,
         "path": package_path,
-        "label": acceleration_patch_label(package_name),
+        "label": speed_patch_label(package_name),
         "built": True,
         "modules": len(manifest_modules),
     }
@@ -4730,16 +4730,16 @@ def get_unet_model(
     fast_ffn=False,
     fast_attention=False,
     compute_dtype="float32",
-    acceleration_patch=ACCELERATION_PATCH_NONE,
-    acceleration_strength=1.0,
+    speed_patch=SPEED_PATCH_NONE,
+    speed_patch_strength=1.0,
     loras=None,
 ):
     from .mlx_sd.config import UNetConfig
     from .mlx_sd.unet import UNetModel
 
     quant_bits = max(2, int(quant_bits)) if quantize_unet else int(quant_bits)
-    acceleration_patch_name = normalized_acceleration_patch_name(acceleration_patch)
-    acceleration_strength_key = round(float(acceleration_strength), 6) if acceleration_patch_name else 0.0
+    speed_patch_name = normalized_speed_patch_name(speed_patch)
+    speed_patch_strength_key = round(float(speed_patch_strength), 6) if speed_patch_name else 0.0
     lora_key = lora_stack_key(loras)
     key = (
         cache_key,
@@ -4751,8 +4751,8 @@ def get_unet_model(
         bool(fast_ffn),
         bool(fast_attention),
         compute_dtype,
-        acceleration_patch_name,
-        acceleration_strength_key,
+        speed_patch_name,
+        speed_patch_strength_key,
         lora_key,
     )
     if key in MODEL_CACHE:
@@ -4788,10 +4788,10 @@ def get_unet_model(
     if compute_dtype == "float16":
         mapped_weights = cast_mapped_weights(mapped_weights, mx.float16)
         log_timing("SDMLX: UNet base weights prepared as float16 before patch/LoRA.")
-    mapped_weights, patch_result = apply_acceleration_patch_to_mapped_weights(
+    mapped_weights, patch_result = apply_speed_patch_to_mapped_weights(
         mapped_weights,
-        acceleration_patch_name,
-        acceleration_strength_key,
+        speed_patch_name,
+        speed_patch_strength_key,
     )
     mapped_weights, lora_results = apply_loras_to_mapped_weights(mapped_weights, loras)
     unet.update(tree_unflatten(mapped_weights))
@@ -4831,7 +4831,7 @@ def get_unet_model(
     if patch_result and patch_result.get("recommendations"):
         rec = patch_result["recommendations"]
         log_timing(
-            "SDMLX: Acceleration Patch recommendation: "
+            "SDMLX: Speed Patch recommendation: "
             f"steps={rec.get('steps', '-')}, "
             f"cfg={rec.get('cfg', '-')}, "
             f"sampler={rec.get('sampler_name', '-')}, "
@@ -4892,7 +4892,7 @@ def preload_mlx_model(mlx_model, mlx_clip, mlx_vae, fast_mode=True, compute_dtyp
         fast_mode,
         fast_mode,
         compute_dtype,
-        ACCELERATION_PATCH_NONE,
+        SPEED_PATCH_NONE,
         1.0,
         static_loras,
     )
@@ -5458,111 +5458,6 @@ def make_terminal_progress_bar(total_steps, description="SDMLX Sampling", unit="
         return None
 
 
-def find_taesdxl_decoder_path():
-    try:
-        import folder_paths
-
-        candidates = sorted(
-            name for name in folder_paths.get_filename_list("vae_approx")
-            if name.startswith("taesdxl_decoder")
-        )
-        if not candidates:
-            return None
-        return folder_paths.get_full_path("vae_approx", candidates[0])
-    except Exception as exc:
-        log_timing(f"SDMLX: TAESDXL decoder lookup not available: {exc}")
-        return None
-
-
-def map_taesd_decoder_weight(value):
-    value = get_numpy_array(value).astype(np.float32)
-    if value.ndim == 4:
-        value = value.transpose(0, 2, 3, 1)
-    return mx.array(value)
-
-
-def get_mlx_sdxl_taesd_decoder():
-    cache_key = "mlx_sdxl_decoder"
-    if cache_key in TAESD_PREVIEWER_CACHE:
-        return TAESD_PREVIEWER_CACHE[cache_key]
-
-    decoder_path = find_taesdxl_decoder_path()
-    if decoder_path is None:
-        TAESD_PREVIEWER_CACHE[cache_key] = None
-        return None
-
-    try:
-        from comfy.utils import load_torch_file
-
-        torch_weights = load_torch_file(decoder_path, safe_load=True)
-        weights = {key: map_taesd_decoder_weight(value) for key, value in torch_weights.items()}
-        mx.eval(*weights.values())
-        TAESD_PREVIEWER_CACHE[cache_key] = weights
-        print(f"SDMLX: MLX TAESD preview decoder loaded: {os.path.basename(decoder_path)}")
-        return weights
-    except Exception as exc:
-        print(f"SDMLX: MLX TAESD preview not available: {exc}")
-        TAESD_PREVIEWER_CACHE[cache_key] = None
-        return None
-
-
-def taesd_conv2d(x, weights, prefix, stride=1, padding=1):
-    y = mx.conv2d(x, weights[f"{prefix}.weight"], stride, padding, 1, 1)
-    bias_key = f"{prefix}.bias"
-    if bias_key in weights:
-        y = y + weights[bias_key]
-    return y
-
-
-def taesd_upsample_nearest(x, scale=2):
-    batch, height, width, channels = x.shape
-    x = mx.broadcast_to(x[:, :, None, :, None, :], (batch, height, scale, width, scale, channels))
-    return x.reshape(batch, height * scale, width * scale, channels)
-
-
-def taesd_block(x, weights, index):
-    prefix = str(index)
-    residual = x
-    y = nn.relu(taesd_conv2d(x, weights, f"{prefix}.conv.0"))
-    y = nn.relu(taesd_conv2d(y, weights, f"{prefix}.conv.2"))
-    y = taesd_conv2d(y, weights, f"{prefix}.conv.4")
-
-    skip_key = f"{prefix}.skip.weight"
-    if skip_key in weights:
-        residual = mx.conv2d(x, weights[skip_key], 1, 0, 1, 1)
-
-    return nn.relu(y + residual)
-
-
-def decode_mlx_taesd_preview_image(latents, weights):
-    if weights is None:
-        return None
-
-    try:
-        x = mx.tanh(latents[:1] / 3.0) * 3.0
-        x = nn.relu(taesd_conv2d(x, weights, "1"))
-        for block_index in (3, 4, 5):
-            x = taesd_block(x, weights, block_index)
-        x = taesd_conv2d(taesd_upsample_nearest(x), weights, "7")
-        for block_index in (8, 9, 10):
-            x = taesd_block(x, weights, block_index)
-        x = taesd_conv2d(taesd_upsample_nearest(x), weights, "12")
-        for block_index in (13, 14, 15):
-            x = taesd_block(x, weights, block_index)
-        x = taesd_conv2d(taesd_upsample_nearest(x), weights, "17")
-        x = taesd_block(x, weights, 18)
-        x = taesd_conv2d(x, weights, "19")
-
-        pixels = mx.clip(x[0], 0.0, 1.0) * 255.0
-        pixels_np = np.array(pixels).astype(np.uint8)
-        return Image.fromarray(pixels_np)
-    except Exception as exc:
-        if not TAESD_PREVIEWER_CACHE.get("mlx_decode_error_logged"):
-            print(f"SDMLX: MLX TAESD preview could not be decoded: {exc}")
-            TAESD_PREVIEWER_CACHE["mlx_decode_error_logged"] = True
-        return None
-
-
 def preview_tuple_from_image(preview_image):
     try:
         import latent_preview
@@ -5584,7 +5479,19 @@ def compose_preview_image(preview_image, preview_mode, crop_info):
     if preview_mode == "crop" and crop_info and "preview_crop" in crop_info:
         try:
             left, top, width, height = [int(value) for value in crop_info["preview_crop"]]
-            return preview_image.crop((left, top, left + width, top + height))
+            source_w, source_h = crop_info.get("target_size", preview_image.size)
+            if source_w > 0 and source_h > 0 and (source_w, source_h) != preview_image.size:
+                scale_x = float(preview_image.size[0]) / float(source_w)
+                scale_y = float(preview_image.size[1]) / float(source_h)
+                left = int(round(left * scale_x))
+                top = int(round(top * scale_y))
+                width = int(round(width * scale_x))
+                height = int(round(height * scale_y))
+            right = min(preview_image.size[0], left + max(1, width))
+            bottom = min(preview_image.size[1], top + max(1, height))
+            left = max(0, min(left, right - 1))
+            top = max(0, min(top, bottom - 1))
+            return preview_image.crop((left, top, right, bottom))
         except Exception as exc:
             if not TAESD_PREVIEWER_CACHE.get("crop_compose_error_logged"):
                 print(f"SDMLX: Crop inpaint preview could not be cropped: {exc}")
@@ -5625,40 +5532,43 @@ def compose_preview_image(preview_image, preview_mode, crop_info):
         return preview_image
 
 
-def get_sdxl_taesd_previewer():
-    cache_key = "sdxl"
-    if cache_key in TAESD_PREVIEWER_CACHE:
-        return TAESD_PREVIEWER_CACHE[cache_key]
-
+def get_sdxl_system_previewer():
     try:
         import comfy.latent_formats
         import comfy.model_management
         import latent_preview
+        from comfy.cli_args import LatentPreviewMethod
 
         device = comfy.model_management.get_torch_device()
-        previous_method = latent_preview.args.preview_method
-        try:
-            latent_preview.set_preview_method("taesd")
-            previewer = latent_preview.get_previewer(device, comfy.latent_formats.SDXL())
-        finally:
-            latent_preview.args.preview_method = previous_method
+        preview_method = latent_preview.args.preview_method
+        preview_method_name = str(preview_method)
+        cache_key = f"sdxl_system:{preview_method}:{device}"
+        if cache_key in TAESD_PREVIEWER_CACHE:
+            return TAESD_PREVIEWER_CACHE[cache_key]
 
+        latent_format = comfy.latent_formats.SDXL()
+        if preview_method == LatentPreviewMethod.NoPreviews:
+            preview_method_name = "default_latent2rgb"
+            cache_key = f"sdxl_system:{preview_method_name}:{device}"
+            if cache_key in TAESD_PREVIEWER_CACHE:
+                return TAESD_PREVIEWER_CACHE[cache_key]
+            previewer = latent_preview.Latent2RGBPreviewer(
+                latent_format.latent_rgb_factors,
+                latent_format.latent_rgb_factors_bias,
+                latent_format.latent_rgb_factors_reshape,
+            )
+        else:
+            previewer = latent_preview.get_previewer(device, latent_format)
         TAESD_PREVIEWER_CACHE[cache_key] = (previewer, device)
         return TAESD_PREVIEWER_CACHE[cache_key]
     except Exception as exc:
         if not TAESD_PREVIEWER_CACHE.get("previewer_error_logged"):
-            print(f"SDMLX: TAESD preview not available: {exc}")
+            print(f"SDMLX: Comfy preview not available: {exc}")
             TAESD_PREVIEWER_CACHE["previewer_error_logged"] = True
-        TAESD_PREVIEWER_CACHE[cache_key] = (None, None)
-        return TAESD_PREVIEWER_CACHE[cache_key]
+        return (None, None)
 
 
-def decode_taesd_preview_bytes(latents, mlx_taesd_weights, previewer, device, preview_mode="crop", crop_info=None):
-    preview_image = decode_mlx_taesd_preview_image(latents, mlx_taesd_weights)
-    if preview_image is not None:
-        preview_image = compose_preview_image(preview_image, preview_mode, crop_info)
-        return preview_tuple_from_image(preview_image)
-
+def decode_system_preview_bytes(latents, previewer, device, preview_mode="crop", crop_info=None):
     if previewer is None or device is None:
         return None
 
@@ -5666,10 +5576,19 @@ def decode_taesd_preview_bytes(latents, mlx_taesd_weights, previewer, device, pr
         mx.eval(latents)
         preview_latents = np.array(latents.transpose(0, 3, 1, 2)).astype(np.float32)
         preview_latents = torch.from_numpy(preview_latents).to(device=device)
-        return previewer.decode_latent_to_preview_image("JPEG", preview_latents)
+        preview_bytes = previewer.decode_latent_to_preview_image("JPEG", preview_latents)
+        if (
+            crop_info
+            and isinstance(preview_bytes, tuple)
+            and len(preview_bytes) >= 2
+            and hasattr(preview_bytes[1], "crop")
+        ):
+            preview_image = compose_preview_image(preview_bytes[1], preview_mode, crop_info)
+            return preview_tuple_from_image(preview_image)
+        return preview_bytes
     except Exception as exc:
         if not TAESD_PREVIEWER_CACHE.get("decode_error_logged"):
-            print(f"SDMLX: TAESD preview could not be decoded: {exc}")
+            print(f"SDMLX: Comfy preview could not be decoded: {exc}")
             TAESD_PREVIEWER_CACHE["decode_error_logged"] = True
         return None
 
@@ -5689,7 +5608,7 @@ def sample_latents(
     compile_step,
     sync_each_step,
     debug_timing,
-    taesd_preview=False,
+    preview=False,
     quantize_unet=False,
     quant_bits=8,
     quant_group_size=64,
@@ -5698,8 +5617,8 @@ def sample_latents(
     fast_ffn=False,
     fast_attention=False,
     compute_dtype="float32",
-    acceleration_patch=ACCELERATION_PATCH_NONE,
-    acceleration_strength=1.0,
+    speed_patch=SPEED_PATCH_NONE,
+    speed_patch_strength=1.0,
     initial_latents=None,
     noise_mask=None,
     denoise=1.0,
@@ -5729,7 +5648,7 @@ def sample_latents(
     controlnets = collect_conditioning_controlnets(mlx_model, positive, negative)
     if controlnets and profile_unet:
         raise ValueError("SDMLX: profile_unet is not currently combined with ControlNet.")
-    acceleration_patch_name = normalized_acceleration_patch_name(acceleration_patch)
+    speed_patch_name = normalized_speed_patch_name(speed_patch)
     effective_fast_ffn = bool(fast_ffn)
     effective_fast_attention = bool(fast_attention)
     if scheduled_loras and (effective_fast_ffn or effective_fast_attention):
@@ -5749,8 +5668,8 @@ def sample_latents(
         effective_fast_ffn,
         effective_fast_attention,
         compute_dtype,
-        acceleration_patch,
-        acceleration_strength,
+        speed_patch,
+        speed_patch_strength,
         static_loras,
     )
     scheduled_lora_stats = prepare_scheduled_loras_for_unet(
@@ -5758,7 +5677,7 @@ def sample_latents(
         scheduled_loras,
         precision_dtype(compute_dtype),
     )
-    acceleration_strength_key = round(float(acceleration_strength), 6) if acceleration_patch_name else 0.0
+    speed_patch_strength_key = round(float(speed_patch_strength), 6) if speed_patch_name else 0.0
     lora_key = lora_stack_key(static_loras)
     scheduled_lora_key = lora_schedule_key(scheduled_loras)
     denoiser_key = (
@@ -5767,7 +5686,7 @@ def sample_latents(
         f"ffn{int(effective_fast_ffn)}:"
         f"fattn{int(effective_fast_attention)}:dtype{compute_dtype}:"
         f"gelu{SDMLX_GELU_MODE}:"
-        f"patch{acceleration_patch_name}:pstrength{acceleration_strength_key}:"
+        f"patch{speed_patch_name}:pstrength{speed_patch_strength_key}:"
         f"loras{lora_key}:"
         f"scheduled_loras{scheduled_lora_key}:"
         f"sched{scheduler}"
@@ -5824,10 +5743,10 @@ def sample_latents(
                 f"({portrait_names}). These adapters are very dominant style-transfer models; "
                 "for cropping, blur, or color casts, first test CFG 3-4 with force_no_cfg=False."
             )
-        if acceleration_patch_name:
+        if speed_patch_name:
             print(
-                "SDMLX: Note: FaceID Portrait is used with an Acceleration Patch "
-                f"({acceleration_patch_name}). If Portrait/Unnorm looks unstable, "
+                "SDMLX: Note: FaceID Portrait is used with a Speed Patch "
+                f"({speed_patch_name}). If Portrait/Unnorm looks unstable, "
                 "first check a reference run without a patch."
             )
         if non_linear_weight_types:
@@ -5886,12 +5805,12 @@ def sample_latents(
             use_cfg,
         )
     progress_sync_interval = 0
-    if terminal_progress and not sync_each_step and not taesd_preview:
+    if terminal_progress and not sync_each_step and not preview:
         if terminal_progress_interval is not None:
             progress_sync_interval = max(1, int(terminal_progress_interval))
         else:
             progress_sync_interval = 2 if progress_steps <= 12 else 4
-    comfy_progress = bool(taesd_preview or terminal_progress or debug_timing)
+    comfy_progress = bool(preview or terminal_progress or debug_timing)
     if controlnets:
         for control in controlnets:
             get_controlnet_union_model(
@@ -5917,10 +5836,10 @@ def sample_latents(
         f"profile_unet={profile_unet}, "
         f"dynamic_step_context={dynamic_step_context}, "
         f"debug_timing={debug_timing}, "
-        f"taesd_preview={taesd_preview}, "
+        f"preview={preview}, "
         f"preview_mode={preview_mode}, "
-        f"acceleration_patch={acceleration_patch_name or ACCELERATION_PATCH_NONE}, "
-        f"patch_strength={acceleration_strength_key:g}, "
+        f"speed_patch={speed_patch_name or SPEED_PATCH_NONE}, "
+        f"patch_strength={speed_patch_strength_key:g}, "
         f"loras={len(static_loras)}, "
         f"scheduled_loras={len(scheduled_loras)}, "
         f"scheduled_lora_modules={scheduled_lora_stats.get('modules', 0)}, "
@@ -5993,12 +5912,7 @@ def sample_latents(
 
     pbar = make_comfy_progress_bar(progress_steps) if comfy_progress else None
     terminal_pbar = make_terminal_progress_bar(progress_steps) if terminal_progress else None
-    mlx_taesd_weights = get_mlx_sdxl_taesd_decoder() if taesd_preview else None
-    previewer, preview_device = (
-        get_sdxl_taesd_previewer()
-        if taesd_preview and mlx_taesd_weights is None
-        else (None, None)
-    )
+    previewer, preview_device = get_sdxl_system_previewer() if preview else (None, None)
 
     def run_denoiser(latents_in, timestep, step_percent, step_has_control):
         if dynamic_step_context:
@@ -6064,14 +5978,14 @@ def sample_latents(
             noise_pred = run_denoiser(latents, t, step_percent, step_has_control)
 
             denoised_latents = None
-            if mask is not None or taesd_preview or sampler_name == "dpmpp_2m":
+            if mask is not None or preview or sampler_name == "dpmpp_2m":
                 denoised_latents = denoised_latents_estimate(latents, noise_pred, step_scale, step_sigma)
             if mask is not None:
                 denoised_latents = denoised_latents * step_mask + initial_latents * (1.0 - step_mask)
                 noise_pred = noise_pred_from_denoised(latents, denoised_latents, step_scale, step_sigma)
 
             preview_latents = None
-            if taesd_preview:
+            if preview:
                 preview_latents = denoised_latents
 
             if sampler_name == "heun":
@@ -6109,15 +6023,14 @@ def sample_latents(
             if sync_each_step or should_sync_for_progress:
                 mx.eval(latents)
             preview_bytes = (
-                decode_taesd_preview_bytes(
+                decode_system_preview_bytes(
                     preview_latents,
-                    mlx_taesd_weights,
                     previewer,
                     preview_device,
                     preview_mode,
                     preview_crop_info,
                 )
-                if taesd_preview
+                if preview
                 else None
             )
             should_publish_progress = bool(
@@ -7036,7 +6949,7 @@ class SDMLX_LoraLoader:
 
 
 MULTI_LORA_SLOT_COUNT = 12
-MULTI_LORA_NONE = "select lora"
+MULTI_LORA_NONE = ""
 
 
 def lora_file_options_with_none():
@@ -7064,12 +6977,11 @@ class SDMLX_MultiLoraLoader:
             "mlx_model": ("MLX_MODEL",),
         }
         loras = lora_file_options_with_none()
-        required["slot_count"] = ("INT", {"default": 1, "min": 1, "max": MULTI_LORA_SLOT_COUNT})
+        required["slot_count"] = ("INT", {"default": 1, "min": 1, "max": MULTI_LORA_SLOT_COUNT, "socketless": True})
         for index in range(1, MULTI_LORA_SLOT_COUNT + 1):
-            required[f"enabled_{index}"] = ("BOOLEAN", {"default": True})
-            required[f"lora_{index}"] = (loras,)
-            required[f"strength_{index}"] = ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05})
-        required["enabled"] = ("BOOLEAN", {"default": True})
+            required[f"enabled_{index}"] = ("BOOLEAN", {"default": True, "socketless": True})
+            required[f"lora_{index}"] = (loras, {"socketless": True})
+            required[f"strength_{index}"] = ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05, "socketless": True})
         return {"required": required}
 
     RETURN_TYPES = ("MLX_MODEL",)
@@ -7082,10 +6994,6 @@ class SDMLX_MultiLoraLoader:
         added = []
         slot_count = int(kwargs.get("slot_count", 1))
         slot_count = max(1, min(MULTI_LORA_SLOT_COUNT, slot_count))
-
-        if not bool(kwargs.get("enabled", True)):
-            log_timing("SDMLX: Multi LoRA Loader disabled.")
-            return (mlx_model,)
 
         for index in range(1, slot_count + 1):
             if not bool(kwargs.get(f"enabled_{index}", True)):
@@ -7138,7 +7046,7 @@ class SDMLX_SpeedPatchConverter:
             "force_rebuild": ("BOOLEAN", {"default": False}),
         }}
 
-    RETURN_TYPES = ("SDMLX_ACCELERATION_PATCH", "STRING")
+    RETURN_TYPES = ("SDMLX_SPEED_PATCH", "STRING")
     RETURN_NAMES = ("speed_patch", "message")
     FUNCTION = "convert"
     CATEGORY = "SDMLX/Loaders"
@@ -7160,7 +7068,7 @@ class SDMLX_SpeedPatchConverter:
             )
 
         path = resolve_lora_path_or_raise(speed_lora)
-        result = build_acceleration_patch_from_lora(path, patch_info, bool(force_rebuild))
+        result = build_speed_patch_from_lora(path, patch_info, bool(force_rebuild))
         action = "built" if result["built"] else "already exists"
         message = (
             f"{result['label']} {action}: {result['modules']} Module, "
@@ -7168,6 +7076,47 @@ class SDMLX_SpeedPatchConverter:
         )
         print(f"SDMLX: Speed Patch Converter: {message}")
         return (result["label"], message)
+
+
+class SDMLX_SpectrumBoost:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+            "degree": ("INT", {"default": 3, "min": 1, "max": 8, "step": 1}),
+            "ridge": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.05}),
+            "window_size": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1}),
+            "flex_window": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005}),
+            "warmup_steps": ("INT", {"default": 5, "min": 0, "max": 20, "step": 1}),
+            "final_real_steps": ("INT", {"default": 0, "min": 0, "max": 10, "step": 1}),
+        }}
+
+    RETURN_TYPES = ("SDMLX_SPECTRUM_ACCELERATION",)
+    RETURN_NAMES = ("spectrum_acceleration",)
+    FUNCTION = "build"
+    CATEGORY = "SDMLX/Sampling"
+
+    def build(
+        self,
+        weight,
+        degree,
+        ridge,
+        window_size,
+        flex_window,
+        warmup_steps,
+        final_real_steps,
+    ):
+        return ({
+            "profile": "advanced",
+            "advanced": True,
+            "final_real_steps": int(final_real_steps),
+            "weight": float(weight),
+            "degree": int(degree),
+            "ridge": float(ridge),
+            "window_size": float(window_size),
+            "flex_window": float(flex_window),
+            "warmup_steps": int(warmup_steps),
+        },)
 
 
 class SDMLX_LoraSchedule:
@@ -7936,16 +7885,18 @@ class SDMLX_InpaintDetailer:
             "denoise": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
             "seed": ("INT", {"default": 0, "min": 0, "max": SEED_MAX}),
             "steps": ("INT", {"default": 12, "min": 1, "max": 100}),
-            "cfg": ("FLOAT", {"default": 7.5}),
-            "sampler_name": (SAMPLERS, {"default": "euler_ancestral"}),
-            "scheduler": (SCHEDULERS, {"default": "normal"}),
+            "cfg": ("FLOAT", {"default": 7.0}),
+            "sampler_name": (SAMPLERS, {"default": "euler"}),
+            "scheduler": (SCHEDULERS, {"default": "simple"}),
             "force_no_cfg": ("BOOLEAN", {"default": False}),
-            "acceleration_patch": (acceleration_patch_options(), {"default": ACCELERATION_PATCH_NONE}),
+            "speed_patch": (speed_patch_options(), {"default": SPEED_PATCH_NONE}),
             "patch_strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05}),
+            "spectrum_acceleration": (["off", "fast", "standard"], {"default": "off"}),
             "max_megapixels": ("FLOAT", {"default": 4.5, "min": 1.0, "max": 16.0, "step": 0.5}),
-            "taesd_preview": ("BOOLEAN", {"default": False}),
+            "preview": ("BOOLEAN", {"default": False}),
         }, "optional": {
-            "speed_patch": ("SDMLX_ACCELERATION_PATCH",),
+            "speed_patch_input": ("SDMLX_SPEED_PATCH",),
+            "spectrum_acceleration_advanced": ("SDMLX_SPECTRUM_ACCELERATION",),
         }}
 
     RETURN_TYPES = ("IMAGE",)
@@ -7976,11 +7927,13 @@ class SDMLX_InpaintDetailer:
         sampler_name,
         scheduler,
         force_no_cfg,
-        acceleration_patch,
+        speed_patch,
         patch_strength,
+        spectrum_acceleration,
         max_megapixels,
-        taesd_preview,
-        speed_patch=None,
+        preview,
+        speed_patch_input=None,
+        spectrum_acceleration_advanced=None,
     ):
         global TIMING_LOGS_ENABLED
         TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
@@ -7988,6 +7941,7 @@ class SDMLX_InpaintDetailer:
         start_time = time.perf_counter()
         fast_mode = True
         compute_dtype = "float16"
+        effective_patch = speed_patch_override(speed_patch, speed_patch_input)
 
         image_t = image.detach().cpu().float() if hasattr(image, "detach") else torch.from_numpy(get_numpy_array(image).astype(np.float32))
         if image_t.ndim != 4 or image_t.shape[-1] != 3:
@@ -8095,43 +8049,110 @@ class SDMLX_InpaintDetailer:
         sdxl_time_ids = None
         time_id_mode = "default"
 
+        spectrum_preset = None
+        spectrum_label = "off"
+        spectrum_reason = "disabled"
+        spectrum_choice = str(spectrum_acceleration or "off")
+        if isinstance(spectrum_acceleration, bool):
+            spectrum_choice = "standard" if spectrum_acceleration else "off"
+        use_spectrum = spectrum_choice != "off" or isinstance(spectrum_acceleration_advanced, dict)
+        if use_spectrum:
+            conditioning_controlnets = collect_conditioning_controlnets(mlx_model, positive, negative)
+            if any(controlnets_active_at_percent(conditioning_controlnets, i / 20.0) for i in range(21)):
+                spectrum_reason = "ControlNet active"
+            else:
+                from . import spectrum as spectrum_engine
+
+                if isinstance(spectrum_acceleration_advanced, dict):
+                    spectrum_preset, spectrum_label, spectrum_reason = spectrum_engine.resolve_spectrum_config(
+                        spectrum_acceleration_advanced,
+                        effective_patch,
+                        steps,
+                        sampler_name,
+                    )
+                else:
+                    spectrum_preset, spectrum_label, spectrum_reason = spectrum_engine.resolve_spectrum_auto(
+                        effective_patch,
+                        steps,
+                        sampler_name,
+                        mode=spectrum_choice,
+                    )
+
         sample_start = time.perf_counter()
-        latents = sample_latents(
-            mlx_model=mlx_model,
-            positive=positive,
-            negative=negative,
-            width=work_w,
-            height=work_h,
-            seed=seed,
-            steps=steps,
-            cfg=cfg,
-            scheduler=scheduler,
-            sampler_name=sampler_name,
-            force_no_cfg=force_no_cfg,
-            compile_step=fast_mode,
-            sync_each_step=False,
-            debug_timing=False,
-            taesd_preview=taesd_preview,
-            quantize_unet=False,
-            quant_bits=8,
-            quant_group_size=64,
-            profile_unet=False,
-            fast_transformer=fast_mode,
-            fast_ffn=fast_mode,
-            fast_attention=fast_mode,
-            compute_dtype=compute_dtype,
-            acceleration_patch=acceleration_patch_override(acceleration_patch, speed_patch),
-            acceleration_strength=patch_strength,
-            initial_latents=initial_latents,
-            noise_mask=noise_mask,
-            denoise=denoise,
-            preview_mode="crop",
-            preview_crop_info=crop_info,
-            terminal_progress=True,
-            sdxl_time_ids=sdxl_time_ids,
-            differential_mask=soft_mask_amount > 0,
-            differential_mask_strength=soft_mask_strength,
-        )
+        if spectrum_preset is None:
+            if use_spectrum:
+                print(f"SDMLX: Spectrum mode: off ({spectrum_reason}).")
+            latents = sample_latents(
+                mlx_model=mlx_model,
+                positive=positive,
+                negative=negative,
+                width=work_w,
+                height=work_h,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                scheduler=scheduler,
+                sampler_name=sampler_name,
+                force_no_cfg=force_no_cfg,
+                compile_step=fast_mode,
+                sync_each_step=False,
+                debug_timing=False,
+                preview=preview,
+                quantize_unet=False,
+                quant_bits=8,
+                quant_group_size=64,
+                profile_unet=False,
+                fast_transformer=fast_mode,
+                fast_ffn=fast_mode,
+                fast_attention=fast_mode,
+                compute_dtype=compute_dtype,
+                speed_patch=effective_patch,
+                speed_patch_strength=patch_strength,
+                initial_latents=initial_latents,
+                noise_mask=noise_mask,
+                denoise=denoise,
+                preview_mode="crop",
+                preview_crop_info=crop_info,
+                terminal_progress=True,
+                sdxl_time_ids=sdxl_time_ids,
+                differential_mask=soft_mask_amount > 0,
+                differential_mask_strength=soft_mask_strength,
+            )
+        else:
+            from . import spectrum as spectrum_engine
+
+            if isinstance(spectrum_acceleration_advanced, dict):
+                print("SDMLX: Spectrum mode: advanced.")
+            else:
+                terminal_label = spectrum_engine.terminal_profile_label(spectrum_label, spectrum_choice)
+                print(f"SDMLX: Spectrum mode: {terminal_label}.")
+            latents = spectrum_engine.sample_latents_spectrum(
+                mlx_model,
+                positive,
+                negative,
+                work_w,
+                work_h,
+                seed,
+                steps,
+                float(cfg),
+                scheduler,
+                sampler_name,
+                force_no_cfg,
+                preview=preview,
+                compute_dtype=compute_dtype,
+                speed_patch=effective_patch,
+                speed_patch_strength=patch_strength,
+                initial_latents=initial_latents,
+                noise_mask=noise_mask,
+                denoise=denoise,
+                sdxl_time_ids=sdxl_time_ids,
+                differential_mask=soft_mask_amount > 0,
+                differential_mask_strength=soft_mask_strength,
+                preview_mode="crop",
+                preview_crop_info=crop_info,
+                spectrum_verbose=False,
+                **spectrum_preset,
+            )
         sample_elapsed = time.perf_counter() - sample_start
 
         decode_start = time.perf_counter()
@@ -8223,7 +8244,7 @@ class SDMLX_InpaintDetailer:
             f"sampler_mask={sampler_mask_mode}, differential_mask={differential_mode}, "
             f"soft_mask_strength={float(soft_mask_strength):g}, "
             f"composite_mask=full_crop_plus_crop_blend, crop_blend={crop_blend}, "
-            f"taesd_preview={bool(taesd_preview)}, time_ids={time_id_mode}, "
+            f"preview={bool(preview)}, time_ids={time_id_mode}, "
             f"mask={mask_elapsed:.2f}s, resize={resize_elapsed:.2f}s, pad={pad_elapsed:.2f}s, encode={encode_elapsed:.2f}s, "
             f"sample={sample_elapsed:.2f}s, decode={decode_elapsed:.2f}s/{decode_mode}, "
             f"composite={composite_elapsed:.2f}s, total={total_elapsed:.2f}s)."
@@ -8248,18 +8269,20 @@ class SDMLX_HiresFix:
             "denoise": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
             "seed": ("INT", {"default": 0, "min": 0, "max": SEED_MAX}),
             "steps": ("INT", {"default": 20, "min": 1, "max": 100}),
-            "cfg": ("FLOAT", {"default": 7.5}),
+            "cfg": ("FLOAT", {"default": 7.0}),
             "sampler_name": (SAMPLERS, {"default": "euler"}),
-            "scheduler": (SCHEDULERS, {"default": "karras"}),
+            "scheduler": (SCHEDULERS, {"default": "simple"}),
             "force_no_cfg": ("BOOLEAN", {"default": False}),
-            "acceleration_patch": (acceleration_patch_options(), {"default": ACCELERATION_PATCH_NONE}),
+            "speed_patch": (speed_patch_options(), {"default": SPEED_PATCH_NONE}),
             "patch_strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05}),
+            "spectrum_acceleration": (["off", "fast", "standard"], {"default": "fast"}),
             "decode_mode": (VAE_DECODE_MODES, {"default": "auto"}),
             "decode_tile_size": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 64}),
             "decode_overlap": ("INT", {"default": 128, "min": 0, "max": 512, "step": 64}),
-            "taesd_preview": ("BOOLEAN", {"default": False}),
+            "preview": ("BOOLEAN", {"default": False}),
         }, "optional": {
-            "speed_patch": ("SDMLX_ACCELERATION_PATCH",),
+            "speed_patch_input": ("SDMLX_SPEED_PATCH",),
+            "spectrum_acceleration_advanced": ("SDMLX_SPECTRUM_ACCELERATION",),
         }}
 
     RETURN_TYPES = ("IMAGE", "MLX_LATENT")
@@ -8286,13 +8309,15 @@ class SDMLX_HiresFix:
         sampler_name,
         scheduler,
         force_no_cfg,
-        acceleration_patch,
+        speed_patch,
         patch_strength,
+        spectrum_acceleration,
         decode_mode,
         decode_tile_size,
         decode_overlap,
-        taesd_preview,
-        speed_patch=None,
+        preview,
+        speed_patch_input=None,
+        spectrum_acceleration_advanced=None,
     ):
         global TIMING_LOGS_ENABLED
         TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
@@ -8300,6 +8325,7 @@ class SDMLX_HiresFix:
         start_time = time.perf_counter()
         fast_mode = True
         compute_dtype = "float16"
+        effective_patch = speed_patch_override(speed_patch, speed_patch_input)
 
         target_width, target_height = resolve_hires_target_size_from_factor(
             image,
@@ -8325,41 +8351,103 @@ class SDMLX_HiresFix:
         initial_latents = encode_pixels_to_latents(mlx_vae, upscaled_image, "float32")
         encode_elapsed = time.perf_counter() - encode_start
 
+        spectrum_preset = None
+        spectrum_label = "off"
+        spectrum_reason = "disabled"
+        spectrum_choice = str(spectrum_acceleration or "off")
+        if isinstance(spectrum_acceleration, bool):
+            spectrum_choice = "standard" if spectrum_acceleration else "off"
+        use_spectrum = spectrum_choice != "off" or isinstance(spectrum_acceleration_advanced, dict)
+        if use_spectrum:
+            conditioning_controlnets = collect_conditioning_controlnets(mlx_model, positive, negative)
+            if any(controlnets_active_at_percent(conditioning_controlnets, i / 20.0) for i in range(21)):
+                spectrum_reason = "ControlNet active"
+            else:
+                from . import spectrum as spectrum_engine
+
+                if isinstance(spectrum_acceleration_advanced, dict):
+                    spectrum_preset, spectrum_label, spectrum_reason = spectrum_engine.resolve_spectrum_config(
+                        spectrum_acceleration_advanced,
+                        effective_patch,
+                        steps,
+                        sampler_name,
+                    )
+                else:
+                    spectrum_preset, spectrum_label, spectrum_reason = spectrum_engine.resolve_spectrum_auto(
+                        effective_patch,
+                        steps,
+                        sampler_name,
+                        mode=spectrum_choice,
+                    )
+
         sample_start = time.perf_counter()
-        latents = sample_latents(
-            mlx_model=mlx_model,
-            positive=positive,
-            negative=negative,
-            width=target_width,
-            height=target_height,
-            seed=seed,
-            steps=steps,
-            cfg=cfg,
-            scheduler=scheduler,
-            sampler_name=sampler_name,
-            force_no_cfg=force_no_cfg,
-            compile_step=fast_mode,
-            sync_each_step=False,
-            debug_timing=False,
-            taesd_preview=taesd_preview,
-            quantize_unet=False,
-            quant_bits=8,
-            quant_group_size=64,
-            profile_unet=False,
-            fast_transformer=fast_mode,
-            fast_ffn=fast_mode,
-            fast_attention=fast_mode,
-            compute_dtype=compute_dtype,
-            acceleration_patch=acceleration_patch_override(acceleration_patch, speed_patch),
-            acceleration_strength=patch_strength,
-            initial_latents=initial_latents,
-            noise_mask=None,
-            denoise=denoise,
-            preview_mode="crop",
-            preview_crop_info=None,
-            terminal_progress=True,
-            terminal_progress_interval=2,
-        )
+        if spectrum_preset is None:
+            if use_spectrum:
+                print(f"SDMLX: Spectrum mode: off ({spectrum_reason}).")
+            latents = sample_latents(
+                mlx_model=mlx_model,
+                positive=positive,
+                negative=negative,
+                width=target_width,
+                height=target_height,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                scheduler=scheduler,
+                sampler_name=sampler_name,
+                force_no_cfg=force_no_cfg,
+                compile_step=fast_mode,
+                sync_each_step=False,
+                debug_timing=False,
+                preview=preview,
+                quantize_unet=False,
+                quant_bits=8,
+                quant_group_size=64,
+                profile_unet=False,
+                fast_transformer=fast_mode,
+                fast_ffn=fast_mode,
+                fast_attention=fast_mode,
+                compute_dtype=compute_dtype,
+                speed_patch=effective_patch,
+                speed_patch_strength=patch_strength,
+                initial_latents=initial_latents,
+                noise_mask=None,
+                denoise=denoise,
+                preview_mode="crop",
+                preview_crop_info=None,
+                terminal_progress=True,
+                terminal_progress_interval=2,
+            )
+        else:
+            from . import spectrum as spectrum_engine
+
+            if isinstance(spectrum_acceleration_advanced, dict):
+                print("SDMLX: Spectrum mode: advanced.")
+            else:
+                terminal_label = spectrum_engine.terminal_profile_label(spectrum_label, spectrum_choice)
+                print(f"SDMLX: Spectrum mode: {terminal_label}.")
+            latents = spectrum_engine.sample_latents_spectrum(
+                mlx_model,
+                positive,
+                negative,
+                target_width,
+                target_height,
+                seed,
+                steps,
+                float(cfg),
+                scheduler,
+                sampler_name,
+                force_no_cfg,
+                preview=preview,
+                compute_dtype=compute_dtype,
+                speed_patch=effective_patch,
+                speed_patch_strength=patch_strength,
+                initial_latents=initial_latents,
+                noise_mask=None,
+                denoise=denoise,
+                spectrum_verbose=False,
+                **spectrum_preset,
+            )
         sample_elapsed = time.perf_counter() - sample_start
 
         decode_start = time.perf_counter()
@@ -8406,18 +8494,18 @@ class SDMLX_TiledUpscale:
                 "denoise": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": SEED_MAX}),
                 "steps": ("INT", {"default": 8, "min": 1, "max": 100}),
-                "cfg": ("FLOAT", {"default": 1.0}),
-                "sampler_name": (SAMPLERS, {"default": "lcm"}),
-                "scheduler": (SCHEDULERS, {"default": "normal"}),
-                "force_no_cfg": ("BOOLEAN", {"default": True}),
-                "acceleration_patch": (acceleration_patch_options(), {"default": ACCELERATION_PATCH_NONE}),
+                "cfg": ("FLOAT", {"default": 7.0}),
+                "sampler_name": (SAMPLERS, {"default": "euler"}),
+                "scheduler": (SCHEDULERS, {"default": "simple"}),
+                "force_no_cfg": ("BOOLEAN", {"default": False}),
+                "speed_patch": (speed_patch_options(), {"default": SPEED_PATCH_NONE}),
                 "patch_strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05}),
                 "max_megapixels": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 32.0, "step": 0.5}),
-                "taesd_preview": ("BOOLEAN", {"default": False}),
+                "preview": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "mlx_controlnet": ("MLX_CONTROLNET",),
-                "speed_patch": ("SDMLX_ACCELERATION_PATCH",),
+                "speed_patch_input": ("SDMLX_SPEED_PATCH",),
             },
         }
 
@@ -8447,12 +8535,12 @@ class SDMLX_TiledUpscale:
         sampler_name,
         scheduler,
         force_no_cfg,
-        acceleration_patch,
+        speed_patch,
         patch_strength,
         max_megapixels,
-        taesd_preview,
+        preview,
         mlx_controlnet=None,
-        speed_patch=None,
+        speed_patch_input=None,
     ):
         global TIMING_LOGS_ENABLED
         TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
@@ -8549,7 +8637,7 @@ class SDMLX_TiledUpscale:
                         compile_step=fast_mode,
                         sync_each_step=False,
                         debug_timing=False,
-                        taesd_preview=taesd_preview,
+                        preview=preview,
                         quantize_unet=False,
                         quant_bits=8,
                         quant_group_size=64,
@@ -8558,8 +8646,8 @@ class SDMLX_TiledUpscale:
                         fast_ffn=fast_mode,
                         fast_attention=fast_mode,
                         compute_dtype=compute_dtype,
-                        acceleration_patch=acceleration_patch_override(acceleration_patch, speed_patch),
-                        acceleration_strength=patch_strength,
+                        speed_patch=speed_patch_override(speed_patch, speed_patch_input),
+                        speed_patch_strength=patch_strength,
                         initial_latents=initial_latents,
                         noise_mask=None,
                         denoise=denoise,
@@ -8616,16 +8704,18 @@ class SDMLX_KSampler:
             "latent_image": ("LATENT",),
             "seed": ("INT", {"default": 0, "min": 0, "max": SEED_MAX}),
             "steps": ("INT", {"default": 25, "min": 1, "max": 100}),
-            "cfg": ("FLOAT", {"default": 7.5}),
-            "sampler_name": (SAMPLERS, {"default": "euler_ancestral"}),
-            "scheduler": (SCHEDULERS, {"default": "normal"}),
+            "cfg": ("FLOAT", {"default": 7.0}),
+            "sampler_name": (SAMPLERS, {"default": "euler"}),
+            "scheduler": (SCHEDULERS, {"default": "simple"}),
             "force_no_cfg": ("BOOLEAN", {"default": False}),
             "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-            "acceleration_patch": (acceleration_patch_options(), {"default": ACCELERATION_PATCH_NONE}),
+            "speed_patch": (speed_patch_options(), {"default": SPEED_PATCH_NONE}),
             "patch_strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05}),
-            "taesd_preview": ("BOOLEAN", {"default": False}),
+            "spectrum_acceleration": (["off", "fast", "standard"], {"default": "off"}),
+            "preview": ("BOOLEAN", {"default": False}),
         }, "optional": {
-            "speed_patch": ("SDMLX_ACCELERATION_PATCH",),
+            "speed_patch_input": ("SDMLX_SPEED_PATCH",),
+            "spectrum_acceleration_advanced": ("SDMLX_SPECTRUM_ACCELERATION",),
         }, "hidden": {
             "unique_id": "UNIQUE_ID",
             "prompt": "PROMPT",
@@ -8650,10 +8740,12 @@ class SDMLX_KSampler:
         scheduler,
         force_no_cfg,
         denoise,
-        acceleration_patch,
+        speed_patch,
         patch_strength,
-        taesd_preview,
-        speed_patch=None,
+        spectrum_acceleration,
+        preview,
+        speed_patch_input=None,
+        spectrum_acceleration_advanced=None,
         unique_id=None,
         prompt=None,
     ):
@@ -8671,41 +8763,107 @@ class SDMLX_KSampler:
         differential_mask = bool(mlx_model.get("differential_mask", False)) and noise_mask is not None
         differential_mask_strength = float(mlx_model.get("differential_mask_strength", 1.0))
         sdxl_time_ids = latent_image.get("sdxl_time_ids")
-        samples = sample_latents(
-            mlx_model,
-            positive,
-            negative,
-            width,
-            height,
-            seed,
-            steps,
-            cfg,
-            scheduler,
-            sampler_name,
-            force_no_cfg,
-            fast_mode,
-            False,
-            False,
-            taesd_preview,
-            False,
-            8,
-            64,
-            False,
-            fast_mode,
-            fast_mode,
-            fast_mode,
-            compute_dtype,
-            acceleration_patch_override(acceleration_patch, speed_patch),
-            patch_strength,
-            initial_latents,
-            noise_mask,
-            denoise,
-            "crop",
-            None,
-            sdxl_time_ids=sdxl_time_ids,
-            differential_mask=differential_mask,
-            differential_mask_strength=differential_mask_strength,
-        )
+        effective_patch = speed_patch_override(speed_patch, speed_patch_input)
+        spectrum_preset = None
+        spectrum_label = "off"
+        spectrum_reason = "disabled"
+        spectrum_choice = str(spectrum_acceleration or "off")
+        if isinstance(spectrum_acceleration, bool):
+            spectrum_choice = "standard" if spectrum_acceleration else "off"
+        use_spectrum = spectrum_choice != "off" or isinstance(spectrum_acceleration_advanced, dict)
+        if use_spectrum:
+            conditioning_controlnets = collect_conditioning_controlnets(mlx_model, positive, negative)
+            if any(controlnets_active_at_percent(conditioning_controlnets, i / 20.0) for i in range(21)):
+                spectrum_reason = "ControlNet active"
+            else:
+                from . import spectrum as spectrum_engine
+
+                if isinstance(spectrum_acceleration_advanced, dict):
+                    spectrum_preset, spectrum_label, spectrum_reason = spectrum_engine.resolve_spectrum_config(
+                        spectrum_acceleration_advanced,
+                        effective_patch,
+                        steps,
+                        sampler_name,
+                    )
+                else:
+                    spectrum_preset, spectrum_label, spectrum_reason = spectrum_engine.resolve_spectrum_auto(
+                        effective_patch,
+                        steps,
+                        sampler_name,
+                        mode=spectrum_choice,
+                    )
+        if spectrum_preset is None:
+            if use_spectrum:
+                print(f"SDMLX: Spectrum mode: off ({spectrum_reason}).")
+            samples = sample_latents(
+                mlx_model,
+                positive,
+                negative,
+                width,
+                height,
+                seed,
+                steps,
+                cfg,
+                scheduler,
+                sampler_name,
+                force_no_cfg,
+                fast_mode,
+                False,
+                False,
+                preview,
+                False,
+                8,
+                64,
+                False,
+                fast_mode,
+                fast_mode,
+                fast_mode,
+                compute_dtype,
+                effective_patch,
+                patch_strength,
+                initial_latents,
+                noise_mask,
+                denoise,
+                "crop",
+                None,
+                sdxl_time_ids=sdxl_time_ids,
+                differential_mask=differential_mask,
+                differential_mask_strength=differential_mask_strength,
+            )
+        else:
+            from . import spectrum as spectrum_engine
+
+            if isinstance(spectrum_acceleration_advanced, dict):
+                print("SDMLX: Spectrum mode: advanced.")
+            else:
+                terminal_label = spectrum_engine.terminal_profile_label(spectrum_label, spectrum_choice)
+                print(f"SDMLX: Spectrum mode: {terminal_label}.")
+            effective_cfg = float(cfg)
+            samples = spectrum_engine.sample_latents_spectrum(
+                mlx_model,
+                positive,
+                negative,
+                width,
+                height,
+                seed,
+                steps,
+                effective_cfg,
+                scheduler,
+                sampler_name,
+                force_no_cfg,
+                preview=preview,
+                compute_dtype=compute_dtype,
+                speed_patch=effective_patch,
+                speed_patch_strength=patch_strength,
+                initial_latents=initial_latents,
+                noise_mask=noise_mask,
+                denoise=denoise,
+                sdxl_time_ids=sdxl_time_ids,
+                differential_mask=differential_mask,
+                differential_mask_strength=differential_mask_strength,
+                spectrum_verbose=False,
+                **spectrum_preset,
+            )
         out = {"samples": samples}
         for key in ("sdmlx_decode_crop", "sdmlx_original_size", "sdmlx_padded_size"):
             if key in latent_image:
@@ -8762,6 +8920,60 @@ class SDMLX_VAEDecode:
     def decode(self, mlx_latent, mlx_vae):
         return (decode_mlx_latent_to_image(mlx_latent, mlx_vae),)
 
+
+class SDMLX_NumberPicker:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "selected": (["20", "25", "30"], {"default": "20"}),
+            "edit_values": ("BOOLEAN", {"default": False}),
+            "values": ("STRING", {"default": "20, 25, 30", "multiline": False}),
+        }}
+
+    RETURN_TYPES = ("INT", "FLOAT")
+    RETURN_NAMES = ("int", "float")
+    FUNCTION = "select"
+    CATEGORY = "SDMLX/Utilities"
+
+    @classmethod
+    def VALIDATE_INPUTS(s, **kwargs):
+        return True
+
+    @staticmethod
+    def _parse_values(values):
+        parsed = []
+        seen = set()
+        for token in re.split(r"[\s,;]+", str(values or "")):
+            label = token.strip()
+            if not label:
+                continue
+            try:
+                value = float(label)
+            except ValueError:
+                continue
+            if not math.isfinite(value) or label in seen:
+                continue
+            parsed.append((label, value))
+            seen.add(label)
+        return parsed or [("0", 0.0)]
+
+    def select(self, selected, edit_values=False, values="20, 25, 30"):
+        parsed = self._parse_values(values)
+        selected_label = str(selected)
+        value = None
+        for label, candidate in parsed:
+            if label == selected_label:
+                value = candidate
+                break
+        if value is None:
+            try:
+                selected_value = float(selected_label)
+            except ValueError:
+                selected_value = None
+            value = selected_value if selected_value is not None and math.isfinite(selected_value) else parsed[0][1]
+        return (int(round(value)), value)
+
+
 NODE_CLASS_MAPPINGS = {
     "SDMLX_GaussianBlurMask": SDMLX_GaussianBlurMask,
     "SDMLX_CheckpointLoader": SDMLX_LoaderUniversal,
@@ -8770,6 +8982,7 @@ NODE_CLASS_MAPPINGS = {
     "SDMLX_LoraLoader": SDMLX_LoraLoader,
     "SDMLX_MultiLoraLoader": SDMLX_MultiLoraLoader,
     "SDMLX_SpeedPatchConverter": SDMLX_SpeedPatchConverter,
+    "SDMLX_SpectrumBoost": SDMLX_SpectrumBoost,
     "SDMLX_LoraSchedule": SDMLX_LoraSchedule,
     "SDMLX_IPAdapterLoader": SDMLX_IPAdapterLoader,
     "SDMLX_CLIPVisionLoader": SDMLX_CLIPVisionLoader,
@@ -8788,6 +9001,7 @@ NODE_CLASS_MAPPINGS = {
     "SDMLX_InpaintDetailer": SDMLX_InpaintDetailer,
     "SDMLX_HiresFix": SDMLX_HiresFix,
     "SDMLX_TiledUpscale": SDMLX_TiledUpscale,
+    "SDMLX_NumberPicker": SDMLX_NumberPicker,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     **{k: "🍏 " + k.replace("_", " ") for k in NODE_CLASS_MAPPINGS.keys()},
@@ -8798,6 +9012,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SDMLX_LoraLoader": "🍏 SDMLX LoRA Loader",
     "SDMLX_MultiLoraLoader": "🍏 SDMLX Multi LoRA Loader",
     "SDMLX_SpeedPatchConverter": "🍏 SDMLX Speed Patch Converter",
+    "SDMLX_SpectrumBoost": "🍏 SDMLX Spectrum Advanced",
     "SDMLX_LoraSchedule": "🍏 SDMLX Scheduler",
     "SDMLX_IPAdapterLoader": "🍏 SDMLX IP-Adapter Loader",
     "SDMLX_CLIPVisionLoader": "🍏 SDMLX CLIP Vision Loader",
@@ -8816,4 +9031,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SDMLX_InpaintDetailer": "🍏 SDMLX Inpaint Detailer",
     "SDMLX_HiresFix": "🍏 SDMLX Hires Fix",
     "SDMLX_TiledUpscale": "🍏 SDMLX Tiled Upscale",
+    "SDMLX_NumberPicker": "🍏 SDMLX Number Picker",
 }
