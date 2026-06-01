@@ -54,8 +54,8 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.12"
-SDMLX_CACHE_VERSION = "adapter-v6"
+SDMLX_VERSION = "0.1.13"
+SDMLX_CACHE_VERSION = "adapter-v7"
 
 if SDMLX_IMPORT_ERROR is None:
     from .sdxl_adapter import (
@@ -4202,6 +4202,36 @@ def load_cached_weight_group(package_path, component):
     return load_weight_file(path) if path else None
 
 
+def validate_text_encoder_weight_groups(groups, source_label, error_cls=ValueError):
+    required = {
+        "clip_l": (
+            "text_model.embeddings.token_embedding.weight",
+            "text_model.final_layer_norm.weight",
+        ),
+        "clip_g": (
+            "text_model.embeddings.token_embedding.weight",
+            "text_model.final_layer_norm.weight",
+            "text_projection.weight",
+        ),
+    }
+    missing = []
+    for group_name, keys in required.items():
+        weights = groups.get(group_name)
+        if weights is None:
+            missing.append(group_name)
+            continue
+        for key in keys:
+            if key not in weights:
+                missing.append(f"{group_name}.{key}")
+    if missing:
+        raise error_cls(
+            "SDMLX: The text encoder weights are incomplete "
+            f"({source_label}). Missing: {', '.join(missing[:6])}. "
+            "Delete the affected .sdmlx package or reload the original checkpoint with SDMLX Loader Universal "
+            "to rebuild it."
+        )
+
+
 def sdmlx_package_options():
     root = cache_dir()
     if not os.path.isdir(root):
@@ -4217,6 +4247,13 @@ def sdmlx_package_options():
 
 
 def load_sdmlx_package(package_path, preload=False):
+    manifest = read_cache_manifest(package_path)
+    if manifest and manifest.get("cache_version") != SDMLX_CACHE_VERSION:
+        package_name = os.path.basename(package_path)
+        raise FileNotFoundError(
+            f"SDMLX: Package {package_name} was created with an older converter "
+            f"({manifest.get('cache_version', 'unknown')} != {SDMLX_CACHE_VERSION}) and must be rebuilt."
+        )
     cached_unet = load_cached_weight_group(package_path, "unet")
     cached_clip_l = load_cached_weight_group(package_path, "clip_l")
     cached_clip_g = load_cached_weight_group(package_path, "clip_g")
@@ -4233,6 +4270,7 @@ def load_sdmlx_package(package_path, preload=False):
         raise FileNotFoundError(
             f"SDMLX: Package {package_name} is incomplete: {', '.join(missing)} missing."
         )
+    validate_text_encoder_weight_groups(groups, os.path.basename(package_path), error_cls=FileNotFoundError)
 
     mark_macos_package(package_path)
     log_timing(f"SDMLX: Loading MLX package from {os.path.basename(package_path)}...")
@@ -6705,6 +6743,7 @@ class SDMLX_LoaderUniversal:
         split_start = time.perf_counter()
         validate_sdxl_checkpoint_keys(torch_sd)
         groups = split_sdxl_checkpoint(torch_sd)
+        validate_text_encoder_weight_groups(groups, ckpt_name)
         split_time = time.perf_counter() - split_start
 
         os.makedirs(package_path, exist_ok=True)
@@ -7691,9 +7730,8 @@ class SDMLX_CLIPTextEncode:
                 output.last_hidden_state = output.hidden_states[-2]
             return output
 
-        # Im encode-Aufruf:
-        res_l = run_clip(mlx_clip["clip_l"], is_g=False) # Erzwingt 768 Logik
-        res_g = run_clip(mlx_clip["clip_g"], is_g=True)  # Erzwingt 1280 Logik
+        res_l = run_clip(mlx_clip["clip_l"], is_g=False)
+        res_g = run_clip(mlx_clip["clip_g"], is_g=True)
         
         cond = mx.concatenate([res_l.last_hidden_state, res_g.last_hidden_state], axis=2)
         pooled = res_g.pooled_output if hasattr(res_g, "pooled_output") else mx.zeros((1, 1280))

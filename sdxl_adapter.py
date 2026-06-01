@@ -35,6 +35,11 @@ def checkpoint_has_any_prefix(keys, prefixes):
     return any(any(key.startswith(prefix) for prefix in prefixes) for key in keys)
 
 
+def checkpoint_has_any_key(keys, candidates):
+    key_set = set(keys)
+    return any(key in key_set for key in candidates)
+
+
 def validate_sdxl_checkpoint_keys(torch_state_dict):
     keys = tuple(torch_state_dict.keys())
 
@@ -84,6 +89,11 @@ def validate_sdxl_checkpoint_keys(torch_state_dict):
         "CLIP-G": "conditioner.embedders.1.model.token_embedding.weight",
     }
     missing = [label for label, key in required.items() if key not in torch_state_dict]
+    if not checkpoint_has_any_key(keys, (
+        "conditioner.embedders.1.model.text_projection",
+        "conditioner.embedders.1.model.text_projection.weight",
+    )):
+        missing.append("CLIP-G text projection")
     if missing:
         raise ValueError(
             "SDMLX: This checkpoint is not a complete SDXL checkpoint "
@@ -143,6 +153,9 @@ def split_sdxl_checkpoint(torch_state_dict, dtype=mx.float16):
 
         if key.startswith("conditioner.embedders.1.model."):
             open_clip_key = key[len("conditioner.embedders.1.model."):]
+            if open_clip_key == "text_projection.weight":
+                groups["clip_g"]["text_projection.weight"] = mlx_value
+                continue
             if ".attn.in_proj_weight" in open_clip_key:
                 base = open_clip_key_to_diffusers(open_clip_key.replace(".attn.in_proj_weight", ".attn.q_proj.weight"))
                 if base is not None:
