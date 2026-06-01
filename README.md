@@ -29,6 +29,18 @@ If ComfyUI Desktop crashes or hangs with the full diagnostics mode, use the ligh
 SDMLX_CONDITIONING_DIAGNOSTICS=1 /Applications/ComfyUI.app/Contents/MacOS/ComfyUI
 ```
 
+If you run ComfyUI from a normal terminal/shell installation instead of ComfyUI Desktop, prepend the diagnostics flag to your usual launch command:
+
+```bash
+SDMLX_CONDITIONING_DIAGNOSTICS=full python main.py
+```
+
+or, if you normally use a start script:
+
+```bash
+SDMLX_CONDITIONING_DIAGNOSTICS=full ./your-usual-start-script.sh
+```
+
 Diagnostics are opt-in for that terminal launch only. They do not change your normal ComfyUI environment.
 
 ## What Works Today
