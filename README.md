@@ -6,6 +6,31 @@ The goal is straightforward: make SDXL on the Mac feel less like a compromise. S
 
 In current local tests, SDMLX is typically about 25-30% faster than comparable PyTorch-MPS SDXL workflows on the same Mac, depending on the checkpoint, sampler, resolution, speed patch, ControlNet/IP-Adapter usage, and preview settings. It is still alpha software; results and APIs can change.
 
+## Alpha Compatibility Notice
+
+SDMLX is currently confirmed on the development test system: Mac Studio with Apple M1 Max and 64GB unified memory. Reports for other Apple Silicon chips and memory sizes are still needed.
+
+If SDMLX generates images that ignore the prompt, look effectively unconditional, or produce obvious garbage output, please run the diagnostics mode and share the relevant terminal log in a GitHub issue or community thread:
+
+```bash
+SDMLX_CONDITIONING_DIAGNOSTICS=full /Applications/ComfyUI.app/Contents/MacOS/ComfyUI
+```
+
+Then run the included `sdmlx_txt2img.json` workflow once. The useful log lines start with:
+
+```text
+SDMLX Conditioning Diagnostics: mlx=...
+SDMLX Conditioning Diagnostics: status=...
+```
+
+If ComfyUI Desktop crashes or hangs with the full diagnostics mode, use the lighter diagnostics path:
+
+```bash
+SDMLX_CONDITIONING_DIAGNOSTICS=1 /Applications/ComfyUI.app/Contents/MacOS/ComfyUI
+```
+
+Diagnostics are opt-in for that terminal launch only. They do not change your normal ComfyUI environment.
+
 ## What Works Today
 
 - SDXL checkpoint loading, conversion and `.sdmlx` package caching
@@ -216,6 +241,7 @@ Some SDXL finetunes and merges can still behave differently from PyTorch-MPS, es
 - FaceID Portrait variants can be sensitive to weights, CFG and source images; FaceID PlusV2 is usually the more stable starting point.
 - Very large tiled upscale jobs can be memory-heavy and slow even on high-end Macs.
 - ComfyUI Desktop and Easy Install use different Python environments; dependencies must be installed into the environment that actually runs ComfyUI.
+- Apple Silicon coverage is still being mapped. M1 Max is confirmed; other chips may expose MLX/Metal fast-path differences. Please use the diagnostics mode above if prompt adherence fails.
 
 ## Roadmap
 
