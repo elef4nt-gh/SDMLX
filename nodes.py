@@ -54,7 +54,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.13"
+SDMLX_VERSION = "0.1.14"
 SDMLX_CACHE_VERSION = "adapter-v7"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -118,7 +118,29 @@ CONTROLNET_MODEL_CACHE = {}
 IPADAPTER_MODEL_CACHE = {}
 CLIP_VISION_MODEL_CACHE = {}
 INSIGHTFACE_MODEL_CACHE = {}
-SDMLX_VERBOSE_LOGS = os.environ.get("SDMLX_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
+def sdmlx_env_flag(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def sdmlx_env_value(name):
+    return os.environ.get(name, "").strip().lower()
+
+
+SDMLX_VERBOSE_LOGS = sdmlx_env_flag("SDMLX_VERBOSE")
+SDMLX_CONDITIONING_DIAGNOSTICS_MODE = sdmlx_env_value("SDMLX_CONDITIONING_DIAGNOSTICS")
+SDMLX_CONDITIONING_DIAGNOSTICS = SDMLX_CONDITIONING_DIAGNOSTICS_MODE in {
+    "1",
+    "true",
+    "yes",
+    "on",
+    "basic",
+    "full",
+    "all",
+}
+SDMLX_SAFE_MODE = sdmlx_env_flag("SDMLX_SAFE_MODE")
+SDMLX_DISABLE_STEP_COMPILE = SDMLX_SAFE_MODE or sdmlx_env_flag("SDMLX_DISABLE_STEP_COMPILE")
+SDMLX_DISABLE_FAST_ATTENTION = SDMLX_SAFE_MODE or sdmlx_env_flag("SDMLX_DISABLE_FAST_ATTENTION")
+SDMLX_CONDITIONING_DIAGNOSTICS_HEADER_PRINTED = False
 TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
 CONDITIONING_CACHE_VERSION = "shared-tokenizer-v2"
 MEMORY_CACHE_POLICY = {
@@ -5265,6 +5287,251 @@ def get_step_denoiser(cache_key, unet, compute_dtype, use_cfg, use_compiled):
     return COMPILED_STEP_DENOISERS[key]
 
 
+def mlx_scalar_float(value):
+    mx.eval(value)
+    return float(np.asarray(value).item())
+
+
+def mlx_rms(value):
+    value = value.astype(mx.float32)
+    return mx.sqrt(mx.mean(mx.square(value)))
+
+
+def sdmlx_conditioning_diagnostics_full():
+    return SDMLX_CONDITIONING_DIAGNOSTICS_MODE in {"full", "all"}
+
+
+def sdmlx_diagnostic_device_report():
+    try:
+        info = mx.device_info() if hasattr(mx, "device_info") else {}
+    except Exception:
+        try:
+            info = mx.metal.device_info()
+        except Exception:
+            info = {}
+    device = str(info.get("device_name", "unknown"))
+    architecture = str(info.get("architecture", "unknown"))
+    memory = int(info.get("memory_size") or 0)
+    working_set = int(info.get("max_recommended_working_set_size") or 0)
+    return (
+        f"mlx={getattr(mx, '__version__', 'unknown')}, "
+        f"device={device}, architecture={architecture}, "
+        f"memory={bytes_to_gb(memory):.1f}GB, recommended_working_set={bytes_to_gb(working_set):.1f}GB, "
+        f"diagnostics={SDMLX_CONDITIONING_DIAGNOSTICS_MODE or 'off'}, "
+        f"safe_mode={SDMLX_SAFE_MODE}, disable_compile={SDMLX_DISABLE_STEP_COMPILE}, "
+        f"disable_fast_attention={SDMLX_DISABLE_FAST_ATTENTION}"
+    )
+
+
+def unet_cfg_probe(unet, latents, timestep, context, pooled, time_ids, cfg_value, compute_dtype):
+    dtype = precision_dtype(compute_dtype)
+    x_in = mx.concatenate([latents] * 2)
+    x_model = x_in.astype(dtype) if compute_dtype == "float16" else x_in
+    t_in = mx.broadcast_to(timestep, [len(x_in)])
+    raw = unet(
+        x_model,
+        timestep=t_in,
+        encoder_x=context,
+        text_time=(pooled, time_ids),
+    ).astype(mx.float32)
+    eps_pos, eps_neg = mx.split(raw, 2)
+    cfg_output = eps_neg + cfg_value * (eps_pos - eps_neg)
+    cfg_delta = mlx_rms(eps_pos - eps_neg)
+    return cfg_output, cfg_delta
+
+
+def run_conditioning_diagnostics(
+    mlx_model,
+    unet,
+    step_denoiser,
+    latents,
+    timestep,
+    context,
+    pooled,
+    time_ids,
+    cfg_value,
+    compute_dtype,
+    quantize_unet,
+    quant_bits,
+    quant_group_size,
+    fast_transformer,
+    effective_fast_ffn,
+    effective_fast_attention,
+    speed_patch,
+    speed_patch_strength,
+    static_loras,
+):
+    global SDMLX_CONDITIONING_DIAGNOSTICS_HEADER_PRINTED
+    if not SDMLX_CONDITIONING_DIAGNOSTICS:
+        return
+    try:
+        if not SDMLX_CONDITIONING_DIAGNOSTICS_HEADER_PRINTED:
+            print(f"SDMLX Conditioning Diagnostics: {sdmlx_diagnostic_device_report()}")
+            SDMLX_CONDITIONING_DIAGNOSTICS_HEADER_PRINTED = True
+
+        cond_pos, cond_neg = mx.split(context, 2)
+        pooled_pos, pooled_neg = mx.split(pooled, 2)
+        cond_delta = mlx_rms(cond_pos - cond_neg)
+        pooled_delta = mlx_rms(pooled_pos - pooled_neg)
+        uncompiled_cfg, uncompiled_cfg_delta = unet_cfg_probe(
+            unet,
+            latents,
+            timestep,
+            context,
+            pooled,
+            time_ids,
+            cfg_value,
+            compute_dtype,
+        )
+
+        compiled_cfg_delta = None
+        compiled_vs_uncompiled = None
+        diagnostic_cache_keys = []
+        if step_denoiser is not None:
+            compiled_cfg = step_denoiser(latents, timestep, context, pooled, time_ids, cfg_value)
+            compiled_pos = step_denoiser(
+                latents,
+                timestep,
+                context,
+                pooled,
+                time_ids,
+                mx.array(1.0, dtype=mx.float32),
+            )
+            compiled_neg = step_denoiser(
+                latents,
+                timestep,
+                context,
+                pooled,
+                time_ids,
+                mx.array(0.0, dtype=mx.float32),
+            )
+            compiled_cfg_delta = mlx_rms(compiled_pos - compiled_neg)
+            compiled_vs_uncompiled = mlx_rms(compiled_cfg - uncompiled_cfg) / mx.maximum(
+                mlx_rms(uncompiled_cfg),
+                mx.array(1e-8, dtype=mx.float32),
+            )
+
+        fast_attention_off_delta = None
+        fast_attention_off_vs_current = None
+        if sdmlx_conditioning_diagnostics_full() and effective_fast_attention:
+            cache_before = set(MODEL_CACHE)
+            safe_unet = get_unet_model(
+                mlx_model["cache_key"],
+                mlx_model["weights"],
+                quantize_unet,
+                quant_bits,
+                quant_group_size,
+                fast_transformer,
+                effective_fast_ffn,
+                False,
+                compute_dtype,
+                speed_patch,
+                speed_patch_strength,
+                static_loras,
+            )
+            safe_cfg, fast_attention_off_delta = unet_cfg_probe(
+                safe_unet,
+                latents,
+                timestep,
+                context,
+                pooled,
+                time_ids,
+                cfg_value,
+                compute_dtype,
+            )
+            fast_attention_off_vs_current = mlx_rms(safe_cfg - uncompiled_cfg) / mx.maximum(
+                mlx_rms(uncompiled_cfg),
+                mx.array(1e-8, dtype=mx.float32),
+            )
+            diagnostic_cache_keys = [
+                key
+                for key in set(MODEL_CACHE) - cache_before
+                if MODEL_CACHE_META.get(key, {}).get("kind") == "unet"
+            ]
+
+        eval_values = [cond_delta, pooled_delta, uncompiled_cfg_delta]
+        if compiled_cfg_delta is not None:
+            eval_values.extend([compiled_cfg_delta, compiled_vs_uncompiled])
+        if fast_attention_off_delta is not None:
+            eval_values.extend([fast_attention_off_delta, fast_attention_off_vs_current])
+        mx.eval(*eval_values)
+        for key in diagnostic_cache_keys:
+            evict_model_cache_key(key)
+
+        cond_delta_f = mlx_scalar_float(cond_delta)
+        pooled_delta_f = mlx_scalar_float(pooled_delta)
+        uncompiled_delta_f = mlx_scalar_float(uncompiled_cfg_delta)
+        compiled_delta_f = mlx_scalar_float(compiled_cfg_delta) if compiled_cfg_delta is not None else None
+        compiled_diff_f = mlx_scalar_float(compiled_vs_uncompiled) if compiled_vs_uncompiled is not None else None
+        compiled_ratio_f = (
+            compiled_delta_f / uncompiled_delta_f
+            if compiled_delta_f is not None and uncompiled_delta_f > 1e-8
+            else None
+        )
+        fast_attention_off_delta_f = (
+            mlx_scalar_float(fast_attention_off_delta)
+            if fast_attention_off_delta is not None
+            else None
+        )
+        fast_attention_off_diff_f = (
+            mlx_scalar_float(fast_attention_off_vs_current)
+            if fast_attention_off_vs_current is not None
+            else None
+        )
+
+        status = "ok"
+        if cond_delta_f < 1e-5 and pooled_delta_f < 1e-5:
+            status = "text-conditioning-identical"
+        elif compiled_ratio_f is not None and uncompiled_delta_f > 1e-5 and compiled_ratio_f < 0.05:
+            status = "compiled-conditioning-collapse"
+        elif uncompiled_delta_f < 1e-5:
+            if fast_attention_off_delta_f is not None and fast_attention_off_delta_f > 1e-5:
+                status = "fast-attention-conditioning-collapse"
+            else:
+                status = "unet-conditioning-weak"
+        elif compiled_diff_f is not None and compiled_diff_f > 0.05:
+            status = "compiled-output-drift"
+
+        parts = [
+            "SDMLX Conditioning Diagnostics: "
+            f"status={status}, "
+            f"cond_delta={cond_delta_f:.6g}, "
+            f"pooled_delta={pooled_delta_f:.6g}, "
+            f"uncompiled_cfg_delta={uncompiled_delta_f:.6g}"
+        ]
+        if compiled_delta_f is None:
+            parts.append(", compiled=inactive")
+        else:
+            parts.append(
+                f", compiled_cfg_delta={compiled_delta_f:.6g}, "
+                f"compiled_delta_ratio={compiled_ratio_f:.4f}, "
+                f"compiled_vs_uncompiled={compiled_diff_f:.6g}"
+            )
+        if fast_attention_off_delta_f is not None:
+            parts.append(
+                f", fast_attention_off_cfg_delta={fast_attention_off_delta_f:.6g}, "
+                f"fast_attention_off_vs_current={fast_attention_off_diff_f:.6g}"
+            )
+        print("".join(parts))
+        if status == "compiled-conditioning-collapse":
+            print(
+                "SDMLX Conditioning Diagnostics: compiled denoiser appears to ignore text conditioning. "
+                "Retest with SDMLX_DISABLE_STEP_COMPILE=1."
+            )
+        elif status == "fast-attention-conditioning-collapse":
+            print(
+                "SDMLX Conditioning Diagnostics: Fast Attention appears to ignore text conditioning. "
+                "Retest with SDMLX_DISABLE_FAST_ATTENTION=1."
+            )
+        elif status == "unet-conditioning-weak":
+            print(
+                "SDMLX Conditioning Diagnostics: uncompiled UNet output barely changes between positive "
+                "and negative conditioning. Retest with SDMLX_DISABLE_FAST_ATTENTION=1."
+            )
+    except Exception as exc:
+        print(f"SDMLX Conditioning Diagnostics: failed ({exc}).")
+
+
 def profiled_unet_block(block, x, profile, label, encoder_x=None, temb=None, residual_hidden_states=None):
     from .mlx_sd.unet import upsample_nearest
 
@@ -5688,7 +5955,9 @@ def sample_latents(
         raise ValueError("SDMLX: profile_unet is not currently combined with ControlNet.")
     speed_patch_name = normalized_speed_patch_name(speed_patch)
     effective_fast_ffn = bool(fast_ffn)
-    effective_fast_attention = bool(fast_attention)
+    effective_fast_attention = bool(fast_attention) and not SDMLX_DISABLE_FAST_ATTENTION
+    if fast_attention and not effective_fast_attention:
+        print("SDMLX: Fast Attention disabled by environment.")
     if scheduled_loras and (effective_fast_ffn or effective_fast_attention):
         print(
             "SDMLX: Scheduled LoRA active: Fast FFN/Fast Attention are disabled for this run "
@@ -5814,7 +6083,16 @@ def sample_latents(
         for i in range(progress_steps)
     ] if controlnets else []
     control_free_steps = control_active_by_step.count(False) if controlnets else 0
-    effective_compile_step = compile_step and not scheduled_loras and not ip_adapters and not profile_unet and (not controlnets or control_free_steps > 0)
+    effective_compile_step = (
+        compile_step
+        and not SDMLX_DISABLE_STEP_COMPILE
+        and not scheduled_loras
+        and not ip_adapters
+        and not profile_unet
+        and (not controlnets or control_free_steps > 0)
+    )
+    if compile_step and SDMLX_DISABLE_STEP_COMPILE:
+        print("SDMLX: Step denoiser compile disabled by environment.")
     if controlnets:
         controlnets = prepare_controlnets_for_sampling(
             controlnets,
@@ -5855,7 +6133,7 @@ def sample_latents(
                 control["controlnet"],
                 fast_transformer=fast_transformer,
                 fast_ffn=fast_ffn,
-                fast_attention=fast_attention,
+                fast_attention=effective_fast_attention,
             )
     log_timing(
         "SDMLX: Runtime Config: "
@@ -5951,6 +6229,42 @@ def sample_latents(
     pbar = make_comfy_progress_bar(progress_steps) if comfy_progress else None
     terminal_pbar = make_terminal_progress_bar(progress_steps) if terminal_progress else None
     previewer, preview_device = get_sdxl_system_previewer() if preview else (None, None)
+    if SDMLX_CONDITIONING_DIAGNOSTICS:
+        if use_cfg and not dynamic_step_context and not profile_unet and not controlnets and mask is None:
+            run_conditioning_diagnostics(
+                mlx_model,
+                unet,
+                step_denoiser,
+                latents,
+                step_plan[0][0],
+                context,
+                pooled,
+                t_ids,
+                cfg_value,
+                compute_dtype,
+                quantize_unet,
+                quant_bits,
+                quant_group_size,
+                fast_transformer,
+                effective_fast_ffn,
+                effective_fast_attention,
+                speed_patch,
+                speed_patch_strength,
+                static_loras,
+            )
+        else:
+            reasons = []
+            if not use_cfg:
+                reasons.append("CFG is off")
+            if dynamic_step_context:
+                reasons.append("dynamic step context")
+            if profile_unet:
+                reasons.append("UNet profiling")
+            if controlnets:
+                reasons.append("ControlNet")
+            if mask is not None:
+                reasons.append("inpaint mask")
+            print(f"SDMLX Conditioning Diagnostics: skipped ({', '.join(reasons) or 'unsupported path'}).")
 
     def run_denoiser(latents_in, timestep, step_percent, step_has_control):
         if dynamic_step_context:
@@ -5979,8 +6293,8 @@ def sample_latents(
                 step_percent,
                 dtype,
                 fast_transformer,
-                fast_ffn,
-                fast_attention,
+                effective_fast_ffn,
+                effective_fast_attention,
             )
             if step_has_control
             else (None, None)
