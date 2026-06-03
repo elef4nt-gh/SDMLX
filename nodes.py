@@ -54,7 +54,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.15"
+SDMLX_VERSION = "0.1.16"
 SDMLX_CACHE_VERSION = "adapter-v7"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -4731,20 +4731,39 @@ def model_cache_summary():
     return "\n".join(lines)
 
 
+def tokenizer_is_usable(tokenizer):
+    try:
+        vocab_size = int(getattr(tokenizer, "vocab_size", 0) or len(tokenizer.get_vocab()))
+    except Exception:
+        vocab_size = 0
+    vocab_file = tokenizer.init_kwargs.get("vocab_file") if hasattr(tokenizer, "init_kwargs") else None
+    merges_file = tokenizer.init_kwargs.get("merges_file") if hasattr(tokenizer, "init_kwargs") else None
+    return vocab_size > 1000 and bool(vocab_file) and bool(merges_file)
+
+
 def get_tokenizer(model_id="openai/clip-vit-large-patch14", subfolder=None):
     cache_key = (model_id, subfolder)
     if cache_key not in TOKENIZER_CACHE:
         try:
-            TOKENIZER_CACHE[cache_key] = CLIPTokenizer.from_pretrained(
+            tokenizer = CLIPTokenizer.from_pretrained(
                 model_id,
                 subfolder=subfolder,
                 local_files_only=True,
             )
+            if not tokenizer_is_usable(tokenizer):
+                raise RuntimeError(
+                    f"Tokenizer cache for {model_id} is incomplete; downloading tokenizer files."
+                )
         except Exception:
-            TOKENIZER_CACHE[cache_key] = CLIPTokenizer.from_pretrained(
+            tokenizer = CLIPTokenizer.from_pretrained(
                 model_id,
                 subfolder=subfolder,
             )
+        if not tokenizer_is_usable(tokenizer):
+            raise RuntimeError(
+                f"SDMLX: CLIP tokenizer for {model_id} is incomplete or invalid."
+            )
+        TOKENIZER_CACHE[cache_key] = tokenizer
     return TOKENIZER_CACHE[cache_key]
 
 
@@ -5614,6 +5633,7 @@ def run_conditioning_diagnostics(
 
 def conditioning_guard_should_fail(metrics):
     return metrics.get("status") in {
+        "conditioning-identical",
         "fast-path-conditioning-collapse",
         "compiled-conditioning-collapse",
         "fast-attention-conditioning-collapse",
@@ -5696,9 +5716,6 @@ def maybe_run_conditioning_guard(
             include_compiled=True,
             return_compiled_cfg=True,
         )
-
-    if metrics.get("status") == "conditioning-identical":
-        return
 
     cached = conditioning_guard_cache_result(guard_key, metrics)
     if conditioning_guard_should_fail(cached):

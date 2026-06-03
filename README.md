@@ -209,9 +209,9 @@ Some SDXL finetunes and merges can still behave differently from PyTorch-MPS, es
 
 ## Alpha Note
 
-SDMLX is early alpha software, but it is designed to be usable rather than experimental-only. The current reference system is a Mac Studio with Apple M1 Max and 64GB unified memory; more real-world reports from other Apple Silicon Macs are welcome.
+SDMLX is early alpha software, but it is designed to be usable rather than experimental-only. The current reference system is a Mac Studio with Apple M1 Max and 64GB unified memory; reports from other Apple Silicon Macs are welcome.
 
-The main sampler includes an automatic Conditioning Guard. On the first eligible fast-path run for a model/session, SDMLX checks whether text conditioning actually changes the UNet response. If everything is healthy, the workflow just continues. If the check looks suspicious, SDMLX stops with a visible error instead of silently producing prompt-blind output or switching to a slower mode.
+The main sampler includes an automatic Conditioning Guard. On the first eligible fast-path run for a model/session, SDMLX checks whether text conditioning actually changes the UNet response. SDMLX also validates the CLIP tokenizer files it uses for prompt encoding and downloads a complete tokenizer if the local cache is incomplete. If everything is healthy, the workflow just continues. If the check looks suspicious, SDMLX stops with a visible error instead of silently producing prompt-blind output or switching to a slower mode.
 
 If the Guard stops a run, or if SDMLX still generates images that ignore the prompt, look effectively unconditional, or produce obvious garbage output, please share the Guard message or run diagnostics:
 
@@ -263,7 +263,7 @@ Diagnostics are opt-in for that terminal launch only. They do not change your no
 - FaceID Portrait variants can be sensitive to weights, CFG and source images; FaceID PlusV2 is usually the more stable starting point.
 - Very large tiled upscale jobs can be memory-heavy and slow even on high-end Macs.
 - ComfyUI Desktop and Easy Install use different Python environments; dependencies must be installed into the environment that actually runs ComfyUI.
-- Real-world reports from more Apple Silicon Macs are welcome. If the Conditioning Guard triggers, please share the guard/diagnostic lines so chip-specific MLX/Metal behavior can be mapped.
+- If the Conditioning Guard triggers, please share the guard/diagnostic lines. They are the fastest way to separate tokenizer/cache problems from possible MLX/Metal runtime issues.
 
 ## Roadmap
 
