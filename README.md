@@ -4,7 +4,7 @@ SDMLX is an alpha-stage ComfyUI custom node suite for running SDXL workflows on 
 
 The goal is straightforward: make SDXL on the Mac feel less like a compromise. SDMLX ports the core SDXL workflow from the usual PyTorch-MPS path to an MLX-native runtime, with easy checkpoint conversion, `.sdmlx` package caching, Speed Patches, macOS-aware memory handling, and workflow nodes that try to stay close to familiar ComfyUI patterns.
 
-In current local tests, SDMLX is typically about 25-30% faster than comparable PyTorch-MPS SDXL workflows on the same Mac, depending on the checkpoint, sampler, resolution, speed patch, ControlNet/IP-Adapter usage, and preview settings. It is still alpha software; results and APIs can change (see Alpha Note below).
+In current local tests, SDMLX is typically about 25-30% faster than comparable PyTorch-MPS SDXL workflows on the same Mac, depending on the checkpoint, sampler, resolution, speed patch, ControlNet/IP-Adapter usage, and preview settings. It is still alpha software; results and APIs can change.
 
 ## What Works Today
 
@@ -207,53 +207,6 @@ Currently out of scope or not supported:
 
 Some SDXL finetunes and merges can still behave differently from PyTorch-MPS, especially if they depend on unusual sampler/scheduler assumptions.
 
-## Alpha Note
-
-SDMLX is early alpha software, but it is designed to be usable rather than experimental-only. The current reference system is a Mac Studio with Apple M1 Max and 64GB unified memory; reports from other Apple Silicon Macs are welcome.
-
-The main sampler includes an automatic Conditioning Guard. On the first eligible fast-path run for a model/session, SDMLX checks whether text conditioning actually changes the UNet response. SDMLX also validates the CLIP tokenizer files it uses for prompt encoding and downloads a complete tokenizer if the local cache is incomplete. If everything is healthy, the workflow just continues. If the check looks suspicious, SDMLX stops with a visible error instead of silently producing prompt-blind output or switching to a slower mode.
-
-If the Guard stops a run, or if SDMLX still generates images that ignore the prompt, look effectively unconditional, or produce obvious garbage output, please share the Guard message or run diagnostics:
-
-```bash
-SDMLX_CONDITIONING_DIAGNOSTICS=full /Applications/ComfyUI.app/Contents/MacOS/ComfyUI
-```
-
-Then run the included `sdmlx_txt2img.json` workflow once. The useful log lines start with:
-
-```text
-SDMLX Conditioning Diagnostics: mlx=...
-SDMLX Conditioning Diagnostics: status=...
-```
-
-If ComfyUI Desktop crashes or hangs with the full diagnostics mode, use the lighter diagnostics path:
-
-```bash
-SDMLX_CONDITIONING_DIAGNOSTICS=1 /Applications/ComfyUI.app/Contents/MacOS/ComfyUI
-```
-
-Please copy the `SDMLX Conditioning Guard` metrics and the device line from the error/log. You can also test the slower compatibility path explicitly:
-
-```bash
-SDMLX_SAFE_MODE=1 /Applications/ComfyUI.app/Contents/MacOS/ComfyUI
-```
-
-Safe Mode is only a visible troubleshooting path. SDMLX does not silently fall back to it.
-
-If you run ComfyUI from a normal terminal/shell installation instead of ComfyUI Desktop, prepend the diagnostics flag to your usual launch command:
-
-```bash
-SDMLX_CONDITIONING_DIAGNOSTICS=full python main.py
-```
-
-or, if you normally use a start script:
-
-```bash
-SDMLX_CONDITIONING_DIAGNOSTICS=full ./your-usual-start-script.sh
-```
-
-Diagnostics are opt-in for that terminal launch only. They do not change your normal ComfyUI environment.
-
 ## Known Issues
 
 - This is alpha software. Node names, defaults and package internals may still change.
@@ -263,7 +216,6 @@ Diagnostics are opt-in for that terminal launch only. They do not change your no
 - FaceID Portrait variants can be sensitive to weights, CFG and source images; FaceID PlusV2 is usually the more stable starting point.
 - Very large tiled upscale jobs can be memory-heavy and slow even on high-end Macs.
 - ComfyUI Desktop and Easy Install use different Python environments; dependencies must be installed into the environment that actually runs ComfyUI.
-- If the Conditioning Guard triggers, please share the guard/diagnostic lines. They are the fastest way to separate tokenizer/cache problems from possible MLX/Metal runtime issues.
 
 ## Roadmap
 
