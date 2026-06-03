@@ -10,6 +10,8 @@ In current local tests, SDMLX is typically about 25-30% faster than comparable P
 
 SDMLX is currently confirmed on the development test system: Mac Studio with Apple M1 Max and 64GB unified memory. Reports for other Apple Silicon chips and memory sizes are still needed.
 
+The main sampler includes an automatic Conditioning Guard. On the first eligible fast-path run for a model/session, SDMLX checks whether text conditioning actually changes the UNet response. If that check looks suspicious, SDMLX stops the run with a visible error instead of silently producing prompt-blind output or switching to a slower mode.
+
 If SDMLX generates images that ignore the prompt, look effectively unconditional, or produce obvious garbage output, please run the diagnostics mode and share the relevant terminal log in a GitHub issue or community thread:
 
 ```bash
@@ -28,6 +30,14 @@ If ComfyUI Desktop crashes or hangs with the full diagnostics mode, use the ligh
 ```bash
 SDMLX_CONDITIONING_DIAGNOSTICS=1 /Applications/ComfyUI.app/Contents/MacOS/ComfyUI
 ```
+
+If the Guard stops a run, copy the `SDMLX Conditioning Guard` metrics and the device line from the error/log. You can also test the slower compatibility path explicitly:
+
+```bash
+SDMLX_SAFE_MODE=1 /Applications/ComfyUI.app/Contents/MacOS/ComfyUI
+```
+
+Safe Mode is only a visible troubleshooting path. SDMLX does not silently fall back to it.
 
 If you run ComfyUI from a normal terminal/shell installation instead of ComfyUI Desktop, prepend the diagnostics flag to your usual launch command:
 
@@ -253,7 +263,7 @@ Some SDXL finetunes and merges can still behave differently from PyTorch-MPS, es
 - FaceID Portrait variants can be sensitive to weights, CFG and source images; FaceID PlusV2 is usually the more stable starting point.
 - Very large tiled upscale jobs can be memory-heavy and slow even on high-end Macs.
 - ComfyUI Desktop and Easy Install use different Python environments; dependencies must be installed into the environment that actually runs ComfyUI.
-- Apple Silicon coverage is still being mapped. M1 Max is confirmed; other chips may expose MLX/Metal fast-path differences. Please use the diagnostics mode above if prompt adherence fails.
+- Apple Silicon coverage is still being mapped. M1 Max is confirmed; other chips may expose MLX/Metal fast-path differences. The Conditioning Guard should stop suspicious fast-path runs before prompt-blind output is generated; please share the guard/diagnostic lines if it triggers.
 
 ## Roadmap
 

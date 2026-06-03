@@ -54,7 +54,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.14"
+SDMLX_VERSION = "0.1.15"
 SDMLX_CACHE_VERSION = "adapter-v7"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -109,6 +109,7 @@ MODEL_CACHE = {}
 MODEL_CACHE_META = {}
 TOKENIZER_CACHE = {}
 CONDITIONING_CACHE = {}
+CONDITIONING_GUARD_CACHE = {}
 COMPILED_STEP_DENOISERS = {}
 COMPILED_VAE_DECODERS = {}
 TAESD_PREVIEWER_CACHE = {}
@@ -140,6 +141,7 @@ SDMLX_CONDITIONING_DIAGNOSTICS = SDMLX_CONDITIONING_DIAGNOSTICS_MODE in {
 SDMLX_SAFE_MODE = sdmlx_env_flag("SDMLX_SAFE_MODE")
 SDMLX_DISABLE_STEP_COMPILE = SDMLX_SAFE_MODE or sdmlx_env_flag("SDMLX_DISABLE_STEP_COMPILE")
 SDMLX_DISABLE_FAST_ATTENTION = SDMLX_SAFE_MODE or sdmlx_env_flag("SDMLX_DISABLE_FAST_ATTENTION")
+SDMLX_CONDITIONING_GUARD = not sdmlx_env_flag("SDMLX_DISABLE_CONDITIONING_GUARD")
 SDMLX_CONDITIONING_DIAGNOSTICS_HEADER_PRINTED = False
 TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
 CONDITIONING_CACHE_VERSION = "shared-tokenizer-v2"
@@ -5340,6 +5342,166 @@ def unet_cfg_probe(unet, latents, timestep, context, pooled, time_ids, cfg_value
     return cfg_output, cfg_delta
 
 
+def conditioning_probe_status(metrics):
+    cond_delta = metrics.get("cond_delta", 0.0)
+    pooled_delta = metrics.get("pooled_delta", 0.0)
+    uncompiled_delta = metrics.get("uncompiled_cfg_delta")
+    compiled_delta = metrics.get("compiled_cfg_delta")
+    compiled_ratio = metrics.get("compiled_delta_ratio")
+    compiled_diff = metrics.get("compiled_vs_uncompiled")
+    fast_attention_off_delta = metrics.get("fast_attention_off_cfg_delta")
+
+    conditioning_identical = cond_delta < 1e-5 and pooled_delta < 1e-5
+    if conditioning_identical:
+        return "conditioning-identical"
+    if uncompiled_delta is not None and uncompiled_delta < 1e-5:
+        if fast_attention_off_delta is not None and fast_attention_off_delta > 1e-5:
+            return "fast-attention-conditioning-collapse"
+        return "unet-conditioning-weak"
+    if (
+        compiled_ratio is not None
+        and uncompiled_delta is not None
+        and uncompiled_delta > 1e-5
+        and compiled_ratio < 0.05
+    ):
+        return "compiled-conditioning-collapse"
+    if compiled_delta is not None and compiled_delta < 1e-5:
+        return "fast-path-conditioning-collapse"
+    if compiled_diff is not None and compiled_diff > 0.05:
+        return "compiled-output-drift"
+    return "ok"
+
+
+def evaluate_conditioning_probe(
+    unet,
+    step_denoiser,
+    latents,
+    timestep,
+    context,
+    pooled,
+    time_ids,
+    cfg_value,
+    compute_dtype,
+    include_uncompiled=True,
+    include_compiled=True,
+    return_uncompiled_cfg=False,
+    return_compiled_cfg=False,
+):
+    cond_pos, cond_neg = mx.split(context, 2)
+    pooled_pos, pooled_neg = mx.split(pooled, 2)
+    cond_delta = mlx_rms(cond_pos - cond_neg)
+    pooled_delta = mlx_rms(pooled_pos - pooled_neg)
+
+    uncompiled_cfg = None
+    uncompiled_cfg_delta = None
+    if include_uncompiled:
+        uncompiled_cfg, uncompiled_cfg_delta = unet_cfg_probe(
+            unet,
+            latents,
+            timestep,
+            context,
+            pooled,
+            time_ids,
+            cfg_value,
+            compute_dtype,
+        )
+
+    compiled_cfg_delta = None
+    compiled_vs_uncompiled = None
+    compiled_cfg = None
+    if include_compiled and step_denoiser is not None:
+        compiled_cfg = step_denoiser(latents, timestep, context, pooled, time_ids, cfg_value)
+        compiled_neg = step_denoiser(
+            latents,
+            timestep,
+            context,
+            pooled,
+            time_ids,
+            mx.array(0.0, dtype=mx.float32),
+        )
+        cfg_scale = mx.maximum(mx.abs(cfg_value), mx.array(1e-6, dtype=mx.float32))
+        compiled_cfg_delta = mlx_rms((compiled_cfg - compiled_neg) / cfg_scale)
+        if uncompiled_cfg is not None:
+            compiled_vs_uncompiled = mlx_rms(compiled_cfg - uncompiled_cfg) / mx.maximum(
+                mlx_rms(uncompiled_cfg),
+                mx.array(1e-8, dtype=mx.float32),
+            )
+
+    eval_values = [cond_delta, pooled_delta]
+    if uncompiled_cfg_delta is not None:
+        eval_values.append(uncompiled_cfg_delta)
+    if compiled_cfg_delta is not None:
+        eval_values.append(compiled_cfg_delta)
+    if compiled_vs_uncompiled is not None:
+        eval_values.append(compiled_vs_uncompiled)
+    mx.eval(*eval_values)
+
+    cond_delta_f = mlx_scalar_float(cond_delta)
+    pooled_delta_f = mlx_scalar_float(pooled_delta)
+    uncompiled_delta_f = (
+        mlx_scalar_float(uncompiled_cfg_delta)
+        if uncompiled_cfg_delta is not None
+        else None
+    )
+    compiled_delta_f = (
+        mlx_scalar_float(compiled_cfg_delta)
+        if compiled_cfg_delta is not None
+        else None
+    )
+    compiled_diff_f = (
+        mlx_scalar_float(compiled_vs_uncompiled)
+        if compiled_vs_uncompiled is not None
+        else None
+    )
+    compiled_ratio_f = (
+        compiled_delta_f / uncompiled_delta_f
+        if compiled_delta_f is not None and uncompiled_delta_f is not None and uncompiled_delta_f > 1e-8
+        else None
+    )
+
+    metrics = {
+        "cond_delta": cond_delta_f,
+        "pooled_delta": pooled_delta_f,
+        "uncompiled_cfg_delta": uncompiled_delta_f,
+        "compiled_cfg_delta": compiled_delta_f,
+        "compiled_delta_ratio": compiled_ratio_f,
+        "compiled_vs_uncompiled": compiled_diff_f,
+    }
+    if return_uncompiled_cfg:
+        metrics["uncompiled_cfg"] = uncompiled_cfg
+    if return_compiled_cfg:
+        metrics["compiled_cfg"] = compiled_cfg
+    metrics["status"] = conditioning_probe_status(metrics)
+    return metrics
+
+
+def conditioning_probe_summary(metrics):
+    parts = [
+        f"status={metrics.get('status', 'unknown')}",
+        f"cond_delta={metrics.get('cond_delta', 0.0):.6g}",
+        f"pooled_delta={metrics.get('pooled_delta', 0.0):.6g}",
+    ]
+    uncompiled_delta = metrics.get("uncompiled_cfg_delta")
+    if uncompiled_delta is not None:
+        parts.append(f"uncompiled_cfg_delta={uncompiled_delta:.6g}")
+    compiled_delta = metrics.get("compiled_cfg_delta")
+    if compiled_delta is None:
+        parts.append("compiled=inactive")
+    else:
+        parts.append(f"compiled_cfg_delta={compiled_delta:.6g}")
+        ratio = metrics.get("compiled_delta_ratio")
+        if ratio is not None:
+            parts.append(f"compiled_delta_ratio={ratio:.4f}")
+        diff = metrics.get("compiled_vs_uncompiled")
+        if diff is not None:
+            parts.append(f"compiled_vs_uncompiled={diff:.6g}")
+    fast_attention_off_delta = metrics.get("fast_attention_off_cfg_delta")
+    if fast_attention_off_delta is not None:
+        parts.append(f"fast_attention_off_cfg_delta={fast_attention_off_delta:.6g}")
+        parts.append(f"fast_attention_off_vs_current={metrics.get('fast_attention_off_vs_current', 0.0):.6g}")
+    return ", ".join(parts)
+
+
 def run_conditioning_diagnostics(
     mlx_model,
     unet,
@@ -5363,18 +5525,15 @@ def run_conditioning_diagnostics(
 ):
     global SDMLX_CONDITIONING_DIAGNOSTICS_HEADER_PRINTED
     if not SDMLX_CONDITIONING_DIAGNOSTICS:
-        return
+        return None
     try:
         if not SDMLX_CONDITIONING_DIAGNOSTICS_HEADER_PRINTED:
             print(f"SDMLX Conditioning Diagnostics: {sdmlx_diagnostic_device_report()}")
             SDMLX_CONDITIONING_DIAGNOSTICS_HEADER_PRINTED = True
 
-        cond_pos, cond_neg = mx.split(context, 2)
-        pooled_pos, pooled_neg = mx.split(pooled, 2)
-        cond_delta = mlx_rms(cond_pos - cond_neg)
-        pooled_delta = mlx_rms(pooled_pos - pooled_neg)
-        uncompiled_cfg, uncompiled_cfg_delta = unet_cfg_probe(
+        metrics = evaluate_conditioning_probe(
             unet,
+            step_denoiser,
             latents,
             timestep,
             context,
@@ -5382,37 +5541,12 @@ def run_conditioning_diagnostics(
             time_ids,
             cfg_value,
             compute_dtype,
+            include_uncompiled=True,
+            include_compiled=True,
+            return_uncompiled_cfg=True,
         )
-
-        compiled_cfg_delta = None
-        compiled_vs_uncompiled = None
         diagnostic_cache_keys = []
-        if step_denoiser is not None:
-            compiled_cfg = step_denoiser(latents, timestep, context, pooled, time_ids, cfg_value)
-            compiled_pos = step_denoiser(
-                latents,
-                timestep,
-                context,
-                pooled,
-                time_ids,
-                mx.array(1.0, dtype=mx.float32),
-            )
-            compiled_neg = step_denoiser(
-                latents,
-                timestep,
-                context,
-                pooled,
-                time_ids,
-                mx.array(0.0, dtype=mx.float32),
-            )
-            compiled_cfg_delta = mlx_rms(compiled_pos - compiled_neg)
-            compiled_vs_uncompiled = mlx_rms(compiled_cfg - uncompiled_cfg) / mx.maximum(
-                mlx_rms(uncompiled_cfg),
-                mx.array(1e-8, dtype=mx.float32),
-            )
-
-        fast_attention_off_delta = None
-        fast_attention_off_vs_current = None
+        uncompiled_cfg = metrics.get("uncompiled_cfg")
         if sdmlx_conditioning_diagnostics_full() and effective_fast_attention:
             cache_before = set(MODEL_CACHE)
             safe_unet = get_unet_model(
@@ -5448,72 +5582,16 @@ def run_conditioning_diagnostics(
                 for key in set(MODEL_CACHE) - cache_before
                 if MODEL_CACHE_META.get(key, {}).get("kind") == "unet"
             ]
-
-        eval_values = [cond_delta, pooled_delta, uncompiled_cfg_delta]
-        if compiled_cfg_delta is not None:
-            eval_values.extend([compiled_cfg_delta, compiled_vs_uncompiled])
-        if fast_attention_off_delta is not None:
-            eval_values.extend([fast_attention_off_delta, fast_attention_off_vs_current])
-        mx.eval(*eval_values)
+            mx.eval(fast_attention_off_delta, fast_attention_off_vs_current)
+            metrics["fast_attention_off_cfg_delta"] = mlx_scalar_float(fast_attention_off_delta)
+            metrics["fast_attention_off_vs_current"] = mlx_scalar_float(fast_attention_off_vs_current)
+            metrics["status"] = conditioning_probe_status(metrics)
         for key in diagnostic_cache_keys:
             evict_model_cache_key(key)
 
-        cond_delta_f = mlx_scalar_float(cond_delta)
-        pooled_delta_f = mlx_scalar_float(pooled_delta)
-        uncompiled_delta_f = mlx_scalar_float(uncompiled_cfg_delta)
-        compiled_delta_f = mlx_scalar_float(compiled_cfg_delta) if compiled_cfg_delta is not None else None
-        compiled_diff_f = mlx_scalar_float(compiled_vs_uncompiled) if compiled_vs_uncompiled is not None else None
-        compiled_ratio_f = (
-            compiled_delta_f / uncompiled_delta_f
-            if compiled_delta_f is not None and uncompiled_delta_f > 1e-8
-            else None
-        )
-        fast_attention_off_delta_f = (
-            mlx_scalar_float(fast_attention_off_delta)
-            if fast_attention_off_delta is not None
-            else None
-        )
-        fast_attention_off_diff_f = (
-            mlx_scalar_float(fast_attention_off_vs_current)
-            if fast_attention_off_vs_current is not None
-            else None
-        )
-
-        status = "ok"
-        if cond_delta_f < 1e-5 and pooled_delta_f < 1e-5:
-            status = "text-conditioning-identical"
-        elif compiled_ratio_f is not None and uncompiled_delta_f > 1e-5 and compiled_ratio_f < 0.05:
-            status = "compiled-conditioning-collapse"
-        elif uncompiled_delta_f < 1e-5:
-            if fast_attention_off_delta_f is not None and fast_attention_off_delta_f > 1e-5:
-                status = "fast-attention-conditioning-collapse"
-            else:
-                status = "unet-conditioning-weak"
-        elif compiled_diff_f is not None and compiled_diff_f > 0.05:
-            status = "compiled-output-drift"
-
-        parts = [
-            "SDMLX Conditioning Diagnostics: "
-            f"status={status}, "
-            f"cond_delta={cond_delta_f:.6g}, "
-            f"pooled_delta={pooled_delta_f:.6g}, "
-            f"uncompiled_cfg_delta={uncompiled_delta_f:.6g}"
-        ]
-        if compiled_delta_f is None:
-            parts.append(", compiled=inactive")
-        else:
-            parts.append(
-                f", compiled_cfg_delta={compiled_delta_f:.6g}, "
-                f"compiled_delta_ratio={compiled_ratio_f:.4f}, "
-                f"compiled_vs_uncompiled={compiled_diff_f:.6g}"
-            )
-        if fast_attention_off_delta_f is not None:
-            parts.append(
-                f", fast_attention_off_cfg_delta={fast_attention_off_delta_f:.6g}, "
-                f"fast_attention_off_vs_current={fast_attention_off_diff_f:.6g}"
-            )
-        print("".join(parts))
-        if status == "compiled-conditioning-collapse":
+        status = metrics.get("status", "unknown")
+        print(f"SDMLX Conditioning Diagnostics: {conditioning_probe_summary(metrics)}")
+        if status in {"compiled-conditioning-collapse", "fast-path-conditioning-collapse"}:
             print(
                 "SDMLX Conditioning Diagnostics: compiled denoiser appears to ignore text conditioning. "
                 "Retest with SDMLX_DISABLE_STEP_COMPILE=1."
@@ -5528,8 +5606,112 @@ def run_conditioning_diagnostics(
                 "SDMLX Conditioning Diagnostics: uncompiled UNet output barely changes between positive "
                 "and negative conditioning. Retest with SDMLX_DISABLE_FAST_ATTENTION=1."
             )
+        return metrics
     except Exception as exc:
         print(f"SDMLX Conditioning Diagnostics: failed ({exc}).")
+        return None
+
+
+def conditioning_guard_should_fail(metrics):
+    return metrics.get("status") in {
+        "fast-path-conditioning-collapse",
+        "compiled-conditioning-collapse",
+        "fast-attention-conditioning-collapse",
+        "unet-conditioning-weak",
+        "compiled-output-drift",
+    }
+
+
+def conditioning_guard_cache_result(guard_key, metrics):
+    cached = dict(metrics)
+    cached.pop("uncompiled_cfg", None)
+    cached.pop("compiled_cfg", None)
+    CONDITIONING_GUARD_CACHE[guard_key] = cached
+    return cached
+
+
+def conditioning_guard_error(metrics):
+    return "\n".join([
+        "SDMLX Conditioning Guard stopped this run.",
+        "",
+        "The fast MLX sampler did not show a reliable text-conditioning response. "
+        "This usually means the generated image would ignore the prompt or look effectively unconditional, "
+        "so SDMLX stops before wasting a full run.",
+        "",
+        f"Guard metrics: {conditioning_probe_summary(metrics)}",
+        f"Device: {sdmlx_diagnostic_device_report()}",
+        "",
+        "Next steps:",
+        "1. Share the Guard metrics and Device line in the GitHub issue/community thread.",
+        "2. Run diagnostics and share the two 'SDMLX Conditioning Diagnostics' lines:",
+        "   SDMLX_CONDITIONING_DIAGNOSTICS=full /Applications/ComfyUI.app/Contents/MacOS/ComfyUI",
+        "   For shell installs: SDMLX_CONDITIONING_DIAGNOSTICS=full python main.py",
+        "3. To verify the compatibility path, restart with SDMLX_SAFE_MODE=1. "
+        "This is slower and is never enabled silently.",
+    ])
+
+
+def conditioning_texts_identical(positive, negative):
+    positive_text = positive.get("text") if isinstance(positive, dict) else None
+    negative_text = negative.get("text") if isinstance(negative, dict) else None
+    if isinstance(positive_text, str) and isinstance(negative_text, str):
+        return positive_text.strip() == negative_text.strip()
+    return False
+
+
+def maybe_run_conditioning_guard(
+    guard_key,
+    unet,
+    step_denoiser,
+    latents,
+    timestep,
+    context,
+    pooled,
+    time_ids,
+    cfg_value,
+    compute_dtype,
+    diagnostic_metrics=None,
+):
+    if not SDMLX_CONDITIONING_GUARD or step_denoiser is None:
+        return
+    cached = CONDITIONING_GUARD_CACHE.get(guard_key)
+    if cached is not None:
+        if conditioning_guard_should_fail(cached):
+            raise RuntimeError(conditioning_guard_error(cached))
+        return
+
+    metrics = diagnostic_metrics
+    if metrics is None or metrics.get("compiled_cfg_delta") is None:
+        metrics = evaluate_conditioning_probe(
+            unet,
+            step_denoiser,
+            latents,
+            timestep,
+            context,
+            pooled,
+            time_ids,
+            cfg_value,
+            compute_dtype,
+            include_uncompiled=False,
+            include_compiled=True,
+            return_compiled_cfg=True,
+        )
+
+    if metrics.get("status") == "conditioning-identical":
+        return
+
+    cached = conditioning_guard_cache_result(guard_key, metrics)
+    if conditioning_guard_should_fail(cached):
+        print(f"SDMLX Conditioning Guard: failed ({conditioning_probe_summary(cached)}).")
+        raise RuntimeError(conditioning_guard_error(cached))
+
+    ratio = cached.get("compiled_delta_ratio")
+    ratio_text = f", ratio={ratio:.4f}" if ratio is not None else ""
+    print(
+        "SDMLX: Conditioning guard ok "
+        f"(fast_cfg_delta={cached.get('compiled_cfg_delta', 0.0):.6g}{ratio_text})."
+    )
+    return metrics.get("compiled_cfg")
 
 
 def profiled_unet_block(block, x, profile, label, encoder_x=None, temb=None, residual_hidden_states=None):
@@ -5726,8 +5908,8 @@ def encode_text_pair(mlx_clip, positive_text, negative_text, conditioning_mode="
         pooled = mx.zeros_like(pooled)
     mx.eval(cond, pooled)
 
-    positive = {"cond": cond[0:1], "pooled": pooled[0:1]}
-    negative = {"cond": cond[1:2], "pooled": pooled[1:2]}
+    positive = {"cond": cond[0:1], "pooled": pooled[0:1], "text": positive_text}
+    negative = {"cond": cond[1:2], "pooled": pooled[1:2], "text": negative_text}
     CONDITIONING_CACHE[cache_key] = (positive, negative)
     return positive, negative
 
@@ -6226,12 +6408,13 @@ def sample_latents(
                 f"(strength={differential_mask_strength:g})."
             )
 
-    pbar = make_comfy_progress_bar(progress_steps) if comfy_progress else None
-    terminal_pbar = make_terminal_progress_bar(progress_steps) if terminal_progress else None
-    previewer, preview_device = get_sdxl_system_previewer() if preview else (None, None)
+    guard_supported = use_cfg and not dynamic_step_context and not profile_unet and not controlnets and mask is None
+    guard_auto_supported = guard_supported and not conditioning_texts_identical(positive, negative)
+    diagnostic_metrics = None
+    guard_first_noise_pred = None
     if SDMLX_CONDITIONING_DIAGNOSTICS:
-        if use_cfg and not dynamic_step_context and not profile_unet and not controlnets and mask is None:
-            run_conditioning_diagnostics(
+        if guard_supported:
+            diagnostic_metrics = run_conditioning_diagnostics(
                 mlx_model,
                 unet,
                 step_denoiser,
@@ -6265,6 +6448,32 @@ def sample_latents(
             if mask is not None:
                 reasons.append("inpaint mask")
             print(f"SDMLX Conditioning Diagnostics: skipped ({', '.join(reasons) or 'unsupported path'}).")
+    if guard_auto_supported:
+        guard_key = (
+            "conditioning_guard_v1",
+            denoiser_key,
+            width,
+            height,
+            progress_steps,
+            compute_dtype,
+        )
+        guard_first_noise_pred = maybe_run_conditioning_guard(
+            guard_key,
+            unet,
+            step_denoiser,
+            latents,
+            step_plan[0][0],
+            context,
+            pooled,
+            t_ids,
+            cfg_value,
+            compute_dtype,
+            diagnostic_metrics=diagnostic_metrics,
+        )
+
+    pbar = make_comfy_progress_bar(progress_steps) if comfy_progress else None
+    terminal_pbar = make_terminal_progress_bar(progress_steps) if terminal_progress else None
+    previewer, preview_device = get_sdxl_system_previewer() if preview else (None, None)
 
     def run_denoiser(latents_in, timestep, step_percent, step_has_control):
         if dynamic_step_context:
@@ -6327,7 +6536,11 @@ def sample_latents(
                 step_mask = active_mask_for_t(t)
                 preserved = noise_latents_at_sigma(initial_latents, init_noise, step_sigma)
                 latents = latents * step_mask + preserved * (1.0 - step_mask)
-            noise_pred = run_denoiser(latents, t, step_percent, step_has_control)
+            if i == 0 and guard_first_noise_pred is not None and not step_has_control:
+                noise_pred = guard_first_noise_pred
+                guard_first_noise_pred = None
+            else:
+                noise_pred = run_denoiser(latents, t, step_percent, step_has_control)
 
             denoised_latents = None
             if mask is not None or preview or sampler_name == "dpmpp_2m":
@@ -8029,9 +8242,12 @@ class SDMLX_CLIPTextEncode:
         start_time = time.perf_counter()
         conditioning_key = (CONDITIONING_CACHE_VERSION, mlx_clip["cache_key"], text)
         if conditioning_key in CONDITIONING_CACHE:
-            cond, pooled = CONDITIONING_CACHE[conditioning_key]
+            cached = CONDITIONING_CACHE[conditioning_key]
             log_timing("SDMLX: CLIP conditioning loaded from RAM cache.")
-            return ({"cond": cond, "pooled": pooled},)
+            if isinstance(cached, dict):
+                return (cached,)
+            cond, pooled = cached
+            return ({"cond": cond, "pooled": pooled, "text": text},)
 
         def run_clip(data, is_g=False):
             if not data: return None
@@ -8050,9 +8266,10 @@ class SDMLX_CLIPTextEncode:
         cond = mx.concatenate([res_l.last_hidden_state, res_g.last_hidden_state], axis=2)
         pooled = res_g.pooled_output if hasattr(res_g, "pooled_output") else mx.zeros((1, 1280))
         mx.eval(cond, pooled)
-        CONDITIONING_CACHE[conditioning_key] = (cond, pooled)
+        conditioning = {"cond": cond, "pooled": pooled, "text": text}
+        CONDITIONING_CACHE[conditioning_key] = conditioning
         log_timing(f"SDMLX: CLIP encode finished in {time.perf_counter() - start_time:.2f}s.")
-        return ({"cond": cond, "pooled": pooled},)
+        return (conditioning,)
 
 
 class SDMLX_InpaintConditioning:

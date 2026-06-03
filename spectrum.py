@@ -463,7 +463,9 @@ def sample_latents_spectrum(
     speed_patch_name = core.normalized_speed_patch_name(speed_patch)
     fast_mode = True
     effective_fast_ffn = fast_mode
-    effective_fast_attention = fast_mode
+    effective_fast_attention = fast_mode and not core.SDMLX_DISABLE_FAST_ATTENTION
+    if fast_mode and not effective_fast_attention and spectrum_verbose:
+        print("SDMLX Spectrum: Fast Attention disabled by environment.")
     if scheduled_loras and spectrum_verbose:
         print(
             "SDMLX Spectrum: Scheduled LoRA active: Fast FFN/Fast Attention are disabled "
@@ -592,7 +594,7 @@ def sample_latents_spectrum(
                 control["controlnet"],
                 fast_transformer=fast_mode,
                 fast_ffn=fast_mode,
-                fast_attention=fast_mode,
+                fast_attention=effective_fast_attention,
             )
 
     if spectrum_verbose:
