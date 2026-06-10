@@ -79,7 +79,7 @@ except ModuleNotFoundError as exc:
         "safetensors",
         "gguf",
     )):
-        SDMLX_VERSION = "0.1.16"
+        SDMLX_VERSION = "0.1.17"
         NODE_CLASS_MAPPINGS = {
             node_name: _make_unavailable_node(node_name) for node_name in _NODE_DISPLAY_NAMES
         }

@@ -89,6 +89,8 @@ Current sampler behavior:
 
 For FLUX Kontext, acceleration patches are turned off automatically when reference image conditioning is present. This avoids mixing a speed-patch trajectory with image-reference behavior that has not been validated. SeaCache is still allowed.
 
+Scale very large reference images before `SDMLX FLUX VAE Encode`. A 1024px or 768px long edge is usually the useful range for SDMLX Kontext workflows; raw multi-megapixel inputs can create very large MLX allocations without adding useful edit fidelity.
+
 SeaCache can give very useful speedups, especially for prompt testing. It can also change small details. The built-in FLUX-dev settings are starting points or sweet spots for many prompts, not a promise that every image will match an all-real run. For detail-heavy FLUX-dev txt2img prompts, adding a few steps with SeaCache can be better than trying to make the original step count faster. If exact detail fidelity matters, compare once with `seacache_acceleration=false` or connect `SDMLX FLUX SeaCache Advanced` to tune `threshold_start`, `threshold_end`, `start_at` and `final_guard`.
 
 SDXL Speed Patches and FLUX acceleration patches live in:

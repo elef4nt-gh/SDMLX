@@ -52,6 +52,7 @@ SEACACHE_ADVANCED_TYPE = "SDMLX_FLUX_SEACACHE_ADVANCED"
 VAE_CACHE: dict[tuple[str, str], VAE] = {}
 FLUX_PREVIEWER_CACHE: dict[str, Any] = {}
 POST_DECODE_CACHE_LIMIT_GB = 2.0
+FLUX_KONTEXT_MAX_ENCODE_PIXELS = 2048 * 2048
 DEFAULT_FLUX_GUIDANCE = 3.5
 VAE_DTYPE = "float16"
 FLUX_ACCEL_CACHE_VERSION = "v1"
@@ -1389,6 +1390,15 @@ def _comfy_image_to_mx_vae_image(image: Any, dtype: mx.Dtype) -> mx.array:
         raise RuntimeError("SDMLX FLUX VAE Encode currently supports batch_size=1.")
     if tensor.shape[-1] < 3:
         raise RuntimeError(f"SDMLX FLUX VAE Encode: expected RGB image, got shape {tuple(tensor.shape)}.")
+    height = int(tensor.shape[1])
+    width = int(tensor.shape[2])
+    pixels = height * width
+    if pixels > FLUX_KONTEXT_MAX_ENCODE_PIXELS:
+        raise RuntimeError(
+            "SDMLX FLUX VAE Encode: input image is too large for direct FLUX Kontext encoding "
+            f"({width}x{height}, {pixels / 1_000_000:.2f} MP). "
+            "Scale the reference image before VAE Encode, e.g. to a 1024px or 768px long edge."
+        )
     tensor = tensor[:, :, :, :3]
     tensor = torch.clamp(tensor, 0.0, 1.0)
     image_np = tensor.numpy().astype(np.float32, copy=False)

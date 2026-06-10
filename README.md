@@ -188,7 +188,7 @@ Typical FLUX txt2img wiring:
 5. `SDMLX FLUX MLX Sampler`.
 6. `SDMLX FLUX VAE Decode`.
 
-For FLUX Kontext, encode reference images with `SDMLX FLUX VAE Encode`, pass them through ComfyUI's `ReferenceLatent` node, and feed the resulting conditioning into the sampler. The sampler uses the validated `offset` reference method internally, so a separate reference-method node is not needed for the normal SDMLX workflow.
+For FLUX Kontext, encode reference images with `SDMLX FLUX VAE Encode`, pass them through ComfyUI's `ReferenceLatent` node, and feed the resulting conditioning into the sampler. The sampler uses the validated `offset` reference method internally, so a separate reference-method node is not needed for the normal SDMLX workflow. Very large source images should be scaled before VAE encode, typically to a 1024px or 768px long edge. Raw multi-megapixel reference images can create huge MLX allocations without improving the edit.
 
 FLUX speed in SDMLX currently comes from three different layers:
 
