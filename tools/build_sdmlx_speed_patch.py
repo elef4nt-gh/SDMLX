@@ -21,7 +21,7 @@ def add_import_paths():
     try:
         import folder_paths  # noqa: F401
     except Exception:
-        comfy_root = os.path.expanduser(os.environ.get("COMFYUI_PATH", "~/ComfyUI"))
+        comfy_root = os.path.expanduser(os.environ.get("COMFYUI_PATH") or os.environ.get("COMFYUI_ROOT") or "")
         if os.path.isdir(comfy_root) and comfy_root not in sys.path:
             sys.path.insert(0, comfy_root)
 

@@ -4,6 +4,7 @@ _NODE_DISPLAY_NAMES = {
     "SDMLX_GaussianBlurMask": "🍏 SDMLX Gaussian Blur Mask",
     "SDMLX_CheckpointLoader": "🍏 SDMLX Loader Universal",
     "SDMLX_Loader": "🍏 SDMLX Loader",
+    "SDMLX_VAELoader": "🍏 SDMLX VAE Loader",
     "SDMLX_CLIPTextEncode": "🍏 SDMLX CLIP Text Encode",
     "SDMLX_LoraLoader": "🍏 SDMLX LoRA Loader",
     "SDMLX_MultiLoraLoader": "🍏 SDMLX Multi LoRA Loader",
@@ -28,6 +29,12 @@ _NODE_DISPLAY_NAMES = {
     "SDMLX_HiresFix": "🍏 SDMLX Hires Fix",
     "SDMLX_TiledUpscale": "🍏 SDMLX Tiled Upscale",
     "SDMLX_NumberPicker": "🍏 SDMLX Number Picker",
+    "SDMLXFluxNativeLoader": "🍏 SDMLX Load Diffusion Model",
+    "SDMLXFluxCLIPLoader": "🍏 SDMLX FLUX CLIP Loader",
+    "SDMLXFluxNativeSampler": "🍏 SDMLX FLUX MLX Sampler",
+    "SDMLXFluxSeaCacheAdvanced": "🍏 SDMLX FLUX SeaCache Advanced",
+    "SDMLXFluxVAEEncode": "🍏 SDMLX FLUX VAE Encode",
+    "SDMLXFluxVAEDecode": "🍏 SDMLX FLUX VAE Decode",
 }
 
 
@@ -53,6 +60,11 @@ def _make_unavailable_node(name):
 
 try:
     from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, SDMLX_VERSION
+    from .flux_nodes import NODE_CLASS_MAPPINGS as FLUX_NODE_CLASS_MAPPINGS
+    from .flux_nodes import NODE_DISPLAY_NAME_MAPPINGS as FLUX_NODE_DISPLAY_NAME_MAPPINGS
+
+    NODE_CLASS_MAPPINGS = {**NODE_CLASS_MAPPINGS, **FLUX_NODE_CLASS_MAPPINGS}
+    NODE_DISPLAY_NAME_MAPPINGS = {**NODE_DISPLAY_NAME_MAPPINGS, **FLUX_NODE_DISPLAY_NAME_MAPPINGS}
 except ModuleNotFoundError as exc:
     # The Comfy Registry parser may import custom nodes on a non-macOS host where
     # mlx is unavailable. Keep the node list visible there; real runtime imports
@@ -65,6 +77,7 @@ except ModuleNotFoundError as exc:
         "PIL",
         "huggingface_hub",
         "safetensors",
+        "gguf",
     )):
         SDMLX_VERSION = "0.1.16"
         NODE_CLASS_MAPPINGS = {

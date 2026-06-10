@@ -2,7 +2,7 @@
 
 SDMLX tries to keep ComfyUI familiar while making SDXL on Apple Silicon feel more direct. A few controls are named differently from older diffusion nodes on purpose: the goal is to describe what the control does in the image or workflow, not the implementation detail behind it.
 
-Example workflows are shipped with the node suite in `resources/workflows`. The `speed_workflows` subfolder contains DMD2 and Lightning variants, and `resources/workflow_png` contains PNG previews without embedded workflow JSON.
+Example workflows are shipped with the node suite in `resources/workflows`. The `speed_workflows` subfolder contains DMD2 and Lightning variants, the `flux` subfolder contains basic FLUX workflows, and `resources/workflow_png` contains PNG previews without embedded workflow JSON.
 
 ## Loaders And Memory Assist
 
@@ -29,13 +29,13 @@ The sampler and Hires Fix node have a simple `spectrum_acceleration` switch:
 
 - `off`: normal SDMLX sampling.
 - `fast`: Spectrum scheduling plus three final real steps. Best when speed matters most.
-- `standard`: balanced Spectrum mode. Below 35 steps it uses a more conservative SDMLX short-run policy; from 35 steps upward it uses five warmup steps and three final real steps.
+- `standard`: balanced Spectrum mode. Below 35 steps it uses a cleaner Spectrum-Proper-style short-run path; from 35 steps upward it uses five warmup steps and three final real steps.
 
 Spectrum is different from a speed patch: a speed patch changes the model behavior, while Spectrum predicts selected internal UNet features and skips some real UNet evaluations.
 
 The `fast` mode follows the public Spectrum scheduling idea used by ComfyUI Spectrum implementations: run real steps to build a cache, forecast selected internal features, and keep a small real-step safety zone at the end.
 
-The `standard` mode keeps that foundation but adds an SDMLX short-run guard below 35 steps. These shorter runs need more protection because there are fewer real UNet steps to recover from a bad forecast.
+The `standard` mode keeps that foundation but splits the policy by step count. Shorter runs use the cleaner short-run path found in the SDXL Spectrum audit; higher-step runs keep the conservative schedule that tested better from roughly 35 steps upward.
 
 Hires Fix uses the same switch and defaults to `fast`. In low-denoise upscale tests this gave the strongest speed win while staying visually indistinguishable from the full run.
 
@@ -62,6 +62,48 @@ The advanced node intentionally has no presets or manual step plan. It is for ex
 Spectrum can be excellent on portraits and simpler scenes, but it can expose small artifacts in very dense prompts with hands, tiny objects or lots of overlapping details. If a prompt is already pushing SDXL hard, set `spectrum_acceleration` to `off` or use the advanced node to experiment.
 
 Credits: Spectrum support in SDMLX is an MLX adaptation inspired by the official [hanjq17/Spectrum](https://github.com/hanjq17/Spectrum) project and the paper [Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration](https://arxiv.org/abs/2603.01623) by Jiaqi Han, Juntong Shi, Puheng Li, Haotian Ye, Qiushan Guo and Stefano Ermon. The ComfyUI implementations [judian17/ComfyUI-Spectrum](https://github.com/judian17/ComfyUI-Spectrum) and [ruwwww/ComfyUI-Spectrum-sdxl](https://github.com/ruwwww/ComfyUI-Spectrum-sdxl) were important practical references for ComfyUI-facing behavior and SDXL-specific use. The short-run `standard` policy is our own MLX/SDXL tuning on top of that foundation.
+
+## FLUX Acceleration
+
+FLUX workflows use a separate node family: `SDMLX Load Diffusion Model`, `SDMLX FLUX CLIP Loader`, `SDMLX FLUX MLX Sampler`, `SDMLX FLUX VAE Encode`, and `SDMLX FLUX VAE Decode`.
+
+The FLUX sampler has two user-facing speed controls:
+
+- `acceleration_patch`: optional FLUX-dev speed patch. Supported patches are downloaded or loaded as SDMLX acceleration-patch packages and cached locally when needed.
+- `seacache_acceleration`: optional training-free cache/reuse acceleration. It is off by default.
+
+These controls are separate. An acceleration patch changes the model trajectory. SeaCache tries to avoid recomputing selected sampler work. Turning both on can be useful, but it is still a speed/quality trade-off.
+
+Current sampler behavior:
+
+| Model path | `acceleration_patch` | `seacache_acceleration` | What runs |
+| --- | --- | --- | --- |
+| FLUX-schnell | ignored / not applicable | `false` | all real SDMLX FLUX-schnell steps |
+| FLUX-schnell | ignored / not applicable | `true` | short 4-step SeaCache path plus late `pad_pool128` token pooling |
+| FLUX-dev, no patch | `None` | `false` | all real SDMLX FLUX-dev steps |
+| FLUX-dev, no patch | `None` | `true` | resolution-aware rising-threshold SeaCache starting point for longer Dev runs |
+| FLUX-dev, 4-step patch | selected | `false` | all real speed-patch steps |
+| FLUX-dev, 4-step patch | selected | `true` | speed patch plus one SeaCache reuse step for fast prompt tests |
+| FLUX Kontext | automatically off | `false` | all real Kontext path with SDMLX `offset` reference method |
+| FLUX Kontext | automatically off | `true` | Kontext path plus resolution-aware rising-threshold SeaCache |
+
+For FLUX Kontext, acceleration patches are turned off automatically when reference image conditioning is present. This avoids mixing a speed-patch trajectory with image-reference behavior that has not been validated. SeaCache is still allowed.
+
+SeaCache can give very useful speedups, especially for prompt testing. It can also change small details. The built-in FLUX-dev settings are starting points or sweet spots for many prompts, not a promise that every image will match an all-real run. For detail-heavy FLUX-dev txt2img prompts, adding a few steps with SeaCache can be better than trying to make the original step count faster. If exact detail fidelity matters, compare once with `seacache_acceleration=false` or connect `SDMLX FLUX SeaCache Advanced` to tune `threshold_start`, `threshold_end`, `start_at` and `final_guard`.
+
+SDXL Speed Patches and FLUX acceleration patches live in:
+
+```text
+ComfyUI/models/SDMLX/AccelerationPatches
+```
+
+Generated FLUX acceleration caches live in:
+
+```text
+ComfyUI/models/SDMLX/cache/acceleration-patches
+```
+
+Both folders are intentionally user-visible so generated caches can be removed if needed.
 
 ## Scheduler Curves
 

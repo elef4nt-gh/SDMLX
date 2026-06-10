@@ -1,8 +1,8 @@
 # 🍏 SDMLX - ComfyUI Node Suite for Faster Image Generation on macOS
 
-SDMLX is an alpha-stage ComfyUI custom node suite for running SDXL workflows on Apple Silicon with Apple's MLX framework.
+SDMLX is an alpha-stage ComfyUI custom node suite for running SDXL workflows on Apple Silicon with Apple's MLX framework. It also includes an early FLUX.1 MLX path.
 
-The goal is straightforward: make SDXL on the Mac feel less like a compromise. SDMLX ports the core SDXL workflow from the usual PyTorch-MPS path to an MLX-native runtime, with easy checkpoint conversion, `.sdmlx` package caching, Speed Patches, macOS-aware memory handling, and workflow nodes that try to stay close to familiar ComfyUI patterns.
+The goal is straightforward: make image generation on the Mac feel less like a compromise. For SDXL, SDMLX ports the core workflow from the usual PyTorch-MPS path to an MLX-native runtime, with easy checkpoint conversion, `.sdmlx` package caching, Speed Patches, macOS-aware memory handling, and workflow nodes that try to stay close to familiar ComfyUI patterns. FLUX support follows the same Mac-first idea, but uses separate FLUX diffusion, CLIP and VAE nodes instead of the SDXL checkpoint package flow.
 
 In current local tests, SDMLX is typically about 25-30% faster than comparable PyTorch-MPS SDXL workflows on the same Mac, depending on the checkpoint, sampler, resolution, speed patch, ControlNet/IP-Adapter usage, and preview settings. It is still alpha software; results and APIs can change.
 
@@ -20,6 +20,8 @@ In current local tests, SDMLX is typically about 25-30% faster than comparable P
 - ControlNet Union ProMax support with schedule curves
 - Classic inpaint conditioning and SDMLX Inpaint Detailer
 - Hires Fix and Tiled Upscale nodes
+- Early FLUX.1 nodes for diffusion model loading, CLIP/T5 loading, sampling, VAE encode/decode and Kontext reference workflows
+- Optional SeaCache acceleration for FLUX.1 runs
 - ComfyUI preview toggle where useful
 - macOS-oriented Memory Assist with optional preload / keep-warm behavior
 - Auto-download helpers for common companion models
@@ -111,9 +113,11 @@ For a first workflow:
 
 `SDMLX Loader Universal` is the easiest starting point: it checks whether a checkpoint has already been converted and automatically prefers the cached `.sdmlx` package when available. `SDMLX Loader` is the cache-only loader; it lists only existing `.sdmlx` packages.
 
+For FLUX.1 workflows, do not use `SDMLX Loader Universal`. Use `SDMLX Load Diffusion Model`, `SDMLX FLUX CLIP Loader`, `SDMLX FLUX MLX Sampler`, and the FLUX VAE nodes instead.
+
 For a short explanation of SDMLX-specific controls such as Memory Assist, speed patches, scheduler curves, FaceID names, ControlNet curves and inpaint detailer settings, see [SDMLX Mini Guide](docs/SDMLX_GUIDE.md).
 
-Example workflows are included in [resources/workflows](resources/workflows). Preview PNGs for quick inspection are in [resources/workflow_png](resources/workflow_png), and DMD2/Lightning variants are grouped under [resources/workflows/speed_workflows](resources/workflows/speed_workflows).
+Example workflows are included in [resources/workflows](resources/workflows). Preview PNGs for quick inspection are in [resources/workflow_png](resources/workflow_png), DMD2/Lightning variants are grouped under [resources/workflows/speed_workflows](resources/workflows/speed_workflows), and basic FLUX workflows are grouped under [resources/workflows/flux](resources/workflows/flux).
 
 ## Model Cache
 
@@ -123,13 +127,19 @@ Converted checkpoints are stored as macOS-style `.sdmlx` packages under:
 ComfyUI/models/SDMLX
 ```
 
-Speed Patches are stored under:
+SDXL Speed Patches and FLUX acceleration patches are stored under:
 
 ```text
-ComfyUI/models/SDMLX/SpeedPatches
+ComfyUI/models/SDMLX/AccelerationPatches
 ```
 
-The package format is intentionally simple: one visible model package per converted checkpoint, instead of loose UNet/CLIP/VAE files scattered through the custom node folder.
+Generated FLUX acceleration caches are stored under:
+
+```text
+ComfyUI/models/SDMLX/cache/acceleration-patches
+```
+
+The package format is intentionally simple: one visible model package or patch package, instead of loose files scattered through the custom node folder.
 
 ## Speed Patches
 
@@ -149,9 +159,9 @@ Important: Speed Patches are model-derived assets. Their licenses are not replac
 The sampler and Hires Fix node have a simple `spectrum_acceleration` switch with two user-facing modes. Spectrum is a training-free forecasting technique that skips selected UNet evaluations by predicting internal UNet features and running the final output projection normally.
 
 - `fast`: Spectrum scheduling with three final real steps. This is the speed-first mode.
-- `standard`: balanced Spectrum mode. It uses a guarded short-run policy below 35 steps and a more conservative schedule with five warmup steps and three final real steps from 35 steps upward.
+- `standard`: balanced Spectrum mode. Below 35 steps it uses a cleaner Spectrum-Proper-style short-run path; from 35 steps upward it uses the more conservative schedule with five warmup steps and three final real steps.
 
-The `fast` mode is based on the public Spectrum scheduling approach and ComfyUI reference implementations. `standard` keeps that foundation but adds SDMLX-specific policy choices for short SDXL runs, where overly aggressive forecasting can create more rejects than saved seconds. Hires Fix defaults to `fast`, because low-denoise upscale tests showed large speedups with no visible image difference.
+The `fast` mode is based on the public Spectrum scheduling approach and ComfyUI reference implementations. `standard` keeps that foundation but uses separate SDMLX policy choices for fragile short SDXL runs and higher-step runs. Hires Fix defaults to `fast`, because low-denoise upscale tests showed large speedups with no visible image difference.
 
 Use `SDMLX Spectrum Advanced` only when you want to override the sampler or Hires Fix switch. It plugs into `spectrum_acceleration_advanced` and exposes the raw Spectrum parameters without presets. If you connect it, the simple switch is ignored.
 
@@ -164,6 +174,52 @@ Current observations:
 - Dense prompts with hands, tiny objects, text or many overlapping details still need visual checking.
 
 Credits: SDMLX's Spectrum support is an MLX adaptation inspired by the official [hanjq17/Spectrum](https://github.com/hanjq17/Spectrum) project and the paper [Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration](https://arxiv.org/abs/2603.01623). The ComfyUI implementations [judian17/ComfyUI-Spectrum](https://github.com/judian17/ComfyUI-Spectrum) and [ruwwww/ComfyUI-Spectrum-sdxl](https://github.com/ruwwww/ComfyUI-Spectrum-sdxl) were important practical references for ComfyUI-facing behavior and SDXL-specific use. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for license notes.
+
+## FLUX.1 Nodes
+
+SDMLX also includes an early FLUX.1 MLX path. It is separate from the SDXL checkpoint loader because FLUX workflows normally keep the diffusion model, text encoders and VAE as separate components.
+
+Typical FLUX txt2img wiring:
+
+1. `SDMLX Load Diffusion Model` for the FLUX diffusion model.
+2. `SDMLX FLUX CLIP Loader` for `clip_l` plus a T5XXL encoder such as `t5xxl_fp8_e4m3fn.safetensors`, `t5xxl_fp16.safetensors`, or compatible T5XXL variants.
+3. A normal FLUX conditioning node.
+4. `EmptySD3LatentImage`.
+5. `SDMLX FLUX MLX Sampler`.
+6. `SDMLX FLUX VAE Decode`.
+
+For FLUX Kontext, encode reference images with `SDMLX FLUX VAE Encode`, pass them through ComfyUI's `ReferenceLatent` node, and feed the resulting conditioning into the sampler. The sampler uses the validated `offset` reference method internally, so a separate reference-method node is not needed for the normal SDMLX workflow.
+
+FLUX speed in SDMLX currently comes from three different layers:
+
+- **MLX runtime work:** SDMLX uses its own FLUX transformer execution path, prepared weights, fp16 compute, memory guardrails and MLX-side VAE encode/decode. These are SDMLX implementation choices for running FLUX on Apple Silicon without relying on the normal PyTorch-MPS sampler path.
+- **Acceleration patches:** the sampler can apply supported FLUX-dev speed patches as first-class sampling options. For canonical base models, SDMLX can build and reuse a local baked cache. Other compatible models may fall back to a runtime low-rank patch path.
+- **SeaCache acceleration:** the sampler has an optional `seacache_acceleration` switch. SeaCache is a separate training-free cache method; SDMLX integrates and tunes FLUX-oriented SeaCache paths for MLX, but the core idea is not an SDMLX invention.
+
+SeaCache is disabled by default. Turn it on when you want the extra speed/quality trade-off and visually check difficult prompts. The sampler chooses the SeaCache policy from the detected FLUX family:
+
+- FLUX-schnell uses a short 4-step SeaCache path with token pooling on the late steps.
+- FLUX-dev and FLUX Kontext use resolution-aware rising-threshold SeaCache starting points for longer runs. Squarer, high-token outputs use a gentler profile; other outputs use a more open profile.
+- FLUX-dev with a 4-step acceleration patch uses a narrow one-step SeaCache path. This is useful for fast prompt tests, but still prompt-dependent.
+
+FLUX acceleration patches and SeaCache are separate mechanisms: an acceleration patch changes the model trajectory, while SeaCache reuses part of the sampler computation. For Kontext image-conditioning workflows, acceleration patches are disabled automatically; SeaCache can still be used.
+
+For FLUX-dev txt2img, SeaCache should be treated as a practical starting point, not a universal quality-preserving shortcut. Detail-heavy prompts and square `1024x1024` style outputs may prefer a few extra steps with SeaCache rather than the same step count with SeaCache. In local tests, `25` SeaCache steps can land near the runtime of `20` all-real steps while preserving more fine detail. If a prompt needs a different trade-off, connect `SDMLX FLUX SeaCache Advanced` and tune `threshold_start`, `threshold_end`, `start_at` and `final_guard`.
+
+Example local FLUX-Kontext comparison, `1024x1024`, `20` steps:
+
+| SDMLX FLUX-Kontext | SDMLX FLUX-Kontext + SeaCache |
+| --- | --- |
+| ![SDMLX FLUX-Kontext without SeaCache](docs/images/flux-kontext-sdmlx.jpg) | ![SDMLX FLUX-Kontext with SeaCache](docs/images/flux-kontext-seacache.jpg) |
+| `351.80s` | `185.60s` |
+
+For the same reference setup, the native ComfyUI PyTorch-MPS run was measured at `571.26s` on the test Mac. Timings vary by Mac, model file, resolution, memory pressure and workflow details, but this is the kind of speedup SeaCache is meant to unlock while keeping the image visually usable.
+
+For the practical control matrix, see [SDMLX Mini Guide](docs/SDMLX_GUIDE.md).
+
+Credits: the FLUX SeaCache path is an MLX adaptation inspired by [jiwoogit/SeaCache](https://github.com/jiwoogit/SeaCache) and the paper [SeaCache: Spectral-Evolution-Aware Cache for Accelerating Diffusion Models](https://arxiv.org/abs/2602.18993). SDMLX's implementation and defaults are practical Apple Silicon tuning choices layered on top of that idea.
+
+SDMLX's FLUX sampler uses an SDMLX MLX sampling loop with Euler-style flow updates and sigma/runtime scheduling adapted from [mflux](https://github.com/filipstrand/mflux). The surrounding FLUX runtime, cache paths, acceleration-patch handling, Kontext path and VAE integration are SDMLX implementation work.
 
 ## Companion Models
 
@@ -189,16 +245,17 @@ If you already keep models on another drive through ComfyUI's `extra_model_paths
 - ControlNet: `SDMLX ControlNet Union ProMax Loader`, `SDMLX Apply ControlNet`
 - Inpaint: `SDMLX Inpaint Conditioning`, `SDMLX Inpaint Detailer`, `SDMLX Differential Diffusion`
 - Upscale: `SDMLX Hires Fix`, `SDMLX Tiled Upscale`
+- FLUX: `SDMLX Load Diffusion Model`, `SDMLX FLUX CLIP Loader`, `SDMLX FLUX MLX Sampler`, `SDMLX FLUX VAE Encode`, `SDMLX FLUX VAE Decode`
 
 ## Known Limits
 
-SDMLX is focused on SDXL base-style checkpoints. The converter is expected to reject or fail on architectures that are not SDXL-compatible.
+The SDXL checkpoint converter is focused on SDXL base-style checkpoints. It is expected to reject or fail on architectures that are not SDXL-compatible. FLUX.1 uses a separate diffusion-model loader and is not converted into `.sdmlx` checkpoint packages.
 
 Currently out of scope or not supported:
 
 - SD 1.x and SD 2.x checkpoints
 - SD3 / SD3.5 style checkpoints
-- Flux, Qwen-Image, Z-Image and other non-SDXL transformer architectures
+- Qwen-Image, Z-Image and other non-SDXL transformer architectures outside the current FLUX.1 path
 - SDXL refiner checkpoints
 - native 9-channel SDXL inpaint checkpoints
 - arbitrary ControlNet models other than the supported Union ProMax path
@@ -213,6 +270,7 @@ Some SDXL finetunes and merges can still behave differently from PyTorch-MPS, es
 - First conversion and first warm run can be slower than later runs.
 - Scheduled LoRA disables some fast-path module fusions for that run, so it can cost performance.
 - Spectrum Acceleration is experimental. Complex prompts with many small objects, hands or text may show small artifacts; set it to `off` when quality matters more than speed.
+- FLUX.1 support is newer than the SDXL path. SeaCache acceleration, Kontext, FP8 checkpoints, LoRAs and acceleration patches should be treated as alpha features and checked visually.
 - FaceID Portrait variants can be sensitive to weights, CFG and source images; FaceID PlusV2 is usually the more stable starting point.
 - Very large tiled upscale jobs can be memory-heavy and slow even on high-end Macs.
 - ComfyUI Desktop and Easy Install use different Python environments; dependencies must be installed into the environment that actually runs ComfyUI.
@@ -247,7 +305,9 @@ ComfyUI on macOS normally runs SDXL through PyTorch with the MPS backend. That p
 
 SDMLX takes a different route for SDXL. Checkpoints are converted into `.sdmlx` packages and loaded into an MLX runtime. The UNet, CLIP text encoders, VAE decode path, IP-Adapter attention integration, ControlNet Union path, Speed Patches and memory behavior are handled as directly as possible in MLX. The fast path uses float16 compute for the diffusion model, keeps VAE decode conservative by default, applies SDXL speed-LoRA derivatives as mapped MLX Speed Patches, and uses a Mac-specific Memory Assist layer to balance cache reuse against system memory pressure.
 
-That does not make SDMLX a universal replacement for every ComfyUI model family. It is deliberately narrower: SDXL on Apple Silicon, with a strong bias toward practical Mac workflows.
+The FLUX.1 path is separate: it loads diffusion-model files directly, uses dedicated CLIP/T5 and VAE nodes, and runs a native MLX transformer path. SeaCache is an optional cache/reuse layer on top of that FLUX runtime, not the same thing as the underlying MLX port.
+
+That does not make SDMLX a universal replacement for every ComfyUI model family. It is deliberately narrower: practical Apple Silicon workflows for SDXL and selected FLUX.1 models.
 
 ## Project Note
 

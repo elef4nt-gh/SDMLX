@@ -8,3 +8,4 @@ psutil
 tqdm
 insightface
 onnxruntime
+gguf

@@ -12,9 +12,13 @@ venv/
 .vscode/
 
 # Local development notes
-SESSION_LOG.md
+SESSION_LOG.md*
 perf_wave*.csv
 local_milestones/
+fallback/
+check_*_mapping.py
+generate_flux_schnell.py
+smoke_transformer_step.py
 
 # ComfyUI/runtime output
 input/

@@ -22,6 +22,8 @@ def _spectrum_preset(
     flex_window=0.0,
     warmup_steps=5,
     final_real_steps=3,
+    min_points=0,
+    time_coord_mode="step",
 ):
     return {
         "spectrum_mode": mode,
@@ -34,6 +36,8 @@ def _spectrum_preset(
         "spectrum_warmup_steps": int(warmup_steps),
         "stop_caching_step": 100,
         "_final_real_steps": int(final_real_steps),
+        "spectrum_min_points": int(min_points),
+        "spectrum_time_coord_mode": str(time_coord_mode or "step"),
     }
 
 
@@ -51,41 +55,34 @@ def _with_final_real_steps(preset, steps, final_real_steps=None):
     return result
 
 
-def _spectrum_policy_flex_standard_short_run(steps):
-    steps = int(steps)
-    if steps <= 20:
-        return 0.35
-    if steps <= 25:
-        t = (steps - 20) / 5.0
-        return 0.35 + t * (0.325 - 0.35)
-    if steps <= 34:
-        t = (steps - 25) / 9.0
-        return 0.325 + t * (0.275 - 0.325)
-    return 0.275
-
-
 def _spectrum_user_policy_preset(policy, steps):
     policy = str(policy or "standard").lower().replace(" ", "_")
     steps = int(steps)
     if policy == "standard" and steps < 35:
         preset = _with_final_real_steps(
             _spectrum_preset(
-                "adaptive_limiter",
+                "repo",
                 "",
-                1.0,
-                4 if steps <= 25 else 3,
+                0.5,
+                4,
                 0.1,
                 2.0,
-                _spectrum_policy_flex_standard_short_run(steps),
-                7,
-                2,
+                0.75,
+                5,
+                3,
+                min_points=5,
+                time_coord_mode="sigma",
             ),
             steps,
-            2,
+            3,
         )
         preset.update({
-            "spectrum_limiter_max_intervention": 1.0,
+            "spectrum_limiter_max_intervention": 0.0,
             "spectrum_limiter_mode": "fast",
+            "spectrum_schedule_mode": "repo",
+            "spectrum_time_base": max(1, steps),
+            "spectrum_dynamic_max_w": 0.0,
+            "spectrum_dynamic_w_bias": 0.0,
         })
         return preset
     if policy in ("fast", "standard"):
@@ -295,6 +292,29 @@ def _repo_dynamic_weight(current_window, progress_steps, step_index, max_w=0.8, 
     return base
 
 
+def _normalized_spectrum_coords(values):
+    values = [float(value) for value in values]
+    if not values:
+        return []
+    start = values[0]
+    end = values[-1]
+    denom = end - start
+    if abs(denom) < 1e-12:
+        return [0.0 for _ in values]
+    return [((value - start) / denom) * 2.0 - 1.0 for value in values]
+
+
+def _spectrum_time_coords_from_step_plan(step_plan, mode):
+    mode = str(mode or "step").lower().strip()
+    if mode == "sigma":
+        sigmas = [core.mx_scalar_float(row[6]) for row in step_plan]
+        return _normalized_spectrum_coords(sigmas), True
+    if mode == "log_sigma":
+        sigmas = [max(core.mx_scalar_float(row[6]), 1e-6) for row in step_plan]
+        return _normalized_spectrum_coords([math.log(value) for value in sigmas]), True
+    return [float(index) for index in range(len(step_plan))], False
+
+
 def _chebyshev_basis(taus, degree):
     taus = taus.reshape(-1, 1)
     cols = [mx.ones_like(taus)]
@@ -306,11 +326,12 @@ def _chebyshev_basis(taus, degree):
 
 
 class _ChebyshevForecaster:
-    def __init__(self, degree=3, max_points=100, ridge=0.1, total_steps=50):
+    def __init__(self, degree=3, max_points=100, ridge=0.1, total_steps=50, normalized_time=False):
         self.degree = int(max(1, degree))
         self.max_points = int(max(self.degree + 2, max_points))
         self.ridge = float(ridge)
         self.total_steps = float(total_steps)
+        self.normalized_time = bool(normalized_time)
         self.times = []
         self.values = []
         self.shape = None
@@ -322,6 +343,8 @@ class _ChebyshevForecaster:
 
     def _tau(self, values):
         values = mx.array(values, dtype=mx.float32)
+        if self.normalized_time:
+            return values
         return (values - (self.total_steps * 0.5)) * (2.0 / self.total_steps)
 
     def update(self, step_index, value):
@@ -375,8 +398,23 @@ class _ChebyshevForecaster:
 
 
 class _SpectrumForecaster:
-    def __init__(self, degree=3, max_points=100, ridge=0.1, total_steps=50, weight=0.3, taylor_order=1):
-        self.cheb = _ChebyshevForecaster(degree, max_points, ridge, total_steps)
+    def __init__(
+        self,
+        degree=3,
+        max_points=100,
+        ridge=0.1,
+        total_steps=50,
+        weight=0.3,
+        taylor_order=1,
+        normalized_time=False,
+    ):
+        self.cheb = _ChebyshevForecaster(
+            degree,
+            max_points,
+            ridge,
+            total_steps,
+            normalized_time=normalized_time,
+        )
         self.weight = float(weight)
         self.taylor_order = int(max(1, min(3, taylor_order)))
 
@@ -440,6 +478,8 @@ def sample_latents_spectrum(
     spectrum_time_base=50,
     spectrum_dynamic_max_w=0.0,
     spectrum_dynamic_w_bias=0.0,
+    spectrum_min_points=0,
+    spectrum_time_coord_mode="step",
     stop_caching_step=-1,
     spectrum_metrics=None,
     spectrum_verbose=True,
@@ -562,6 +602,10 @@ def sample_latents_spectrum(
     spectrum_time_base = max(1.0, float(spectrum_time_base))
     spectrum_dynamic_max_w = max(0.0, min(1.0, float(spectrum_dynamic_max_w)))
     spectrum_dynamic_w_bias = max(-1.0, min(1.0, float(spectrum_dynamic_w_bias)))
+    spectrum_min_points = max(0, int(spectrum_min_points))
+    spectrum_time_coord_mode = str(spectrum_time_coord_mode or "step").lower().strip()
+    if spectrum_time_coord_mode not in ("step", "sigma", "log_sigma"):
+        spectrum_time_coord_mode = "step"
 
     dynamic_step_context = bool(ip_adapters or scheduled_loras)
     control_active_by_step = [
@@ -787,8 +831,14 @@ def sample_latents_spectrum(
     adaptive_window_cooldown = 0
     adaptive_window_scale = 1.0
     adaptive_window_cap = None
+    spectrum_time_coords, spectrum_normalized_time = _spectrum_time_coords_from_step_plan(
+        step_plan,
+        spectrum_time_coord_mode,
+    )
     try:
         for i, (t, next_t, step_scale, step_dt, step_noise_scale, step_out_scale, step_sigma, next_sigma) in enumerate(step_plan):
+            current_time_coord = spectrum_time_coords[i] if i < len(spectrum_time_coords) else float(i)
+            min_points_for_ready = spectrum_min_points if spectrum_min_points > 0 else None
             step_percent = i / max(progress_steps - 1, 1)
             step_has_control = control_active_by_step[i] if control_active_by_step else False
             if mask is not None:
@@ -803,14 +853,19 @@ def sample_latents_spectrum(
                     ridge=spectrum_ridge,
                     total_steps=spectrum_time_base,
                     weight=spectrum_weight,
+                    normalized_time=spectrum_normalized_time,
                 )
 
             final_guard_active = i >= stop_at_step
             if spectrum_mode == "manual":
-                ready = forecaster.ready(min_points=2)
+                ready = forecaster.ready(min_points=min_points_for_ready or 2)
                 can_forecast = bool(i in forecast_steps and ready and not step_has_control and not final_guard_active)
             else:
-                ready = forecaster.ready(min_points=2) if spectrum_schedule_mode == "repo" else forecaster.ready()
+                ready = (
+                    forecaster.ready(min_points=min_points_for_ready or 2)
+                    if spectrum_schedule_mode == "repo"
+                    else forecaster.ready(min_points=min_points_for_ready)
+                )
                 interval = max(1, math.floor(current_window))
                 can_forecast = bool(
                     i >= spectrum_warmup_steps
@@ -833,7 +888,7 @@ def sample_latents_spectrum(
                     if spectrum_dynamic_max_w > 0.0
                     else None
                 )
-                feature = forecaster.predict(i, weight=dynamic_weight)
+                feature = forecaster.predict(current_time_coord, weight=dynamic_weight)
                 limiter_scale = None
                 limiter_ratio = None
                 limiter_pre_ratio_value = 0.0
@@ -892,7 +947,7 @@ def sample_latents_spectrum(
                                 })
                         elif limiter_push_value > 0.0:
                             feature = forecaster.predict(
-                                i,
+                                current_time_coord,
                                 weight=limiter_dynamic_weight,
                                 ridge=limiter_dynamic_ridge,
                             )
@@ -951,7 +1006,7 @@ def sample_latents_spectrum(
                     forecast_block_force_real += 1
                     feature = run_unet_feature(latents, t, step_percent, step_has_control)
                     mx.eval(feature)
-                    forecaster.update(i, feature)
+                    forecaster.update(current_time_coord, feature)
                     num_cached = 0
                     can_forecast = False
                     raw = finish_unet_feature(feature)
@@ -966,8 +1021,8 @@ def sample_latents_spectrum(
                     forecast_count += 1
             else:
                 shadow_prediction = None
-                if adaptive_shadow_enabled and forecaster.ready():
-                    shadow_prediction = forecaster.predict(i)
+                if adaptive_shadow_enabled and forecaster.ready(min_points=min_points_for_ready):
+                    shadow_prediction = forecaster.predict(current_time_coord)
                 feature = run_unet_feature(latents, t, step_percent, step_has_control)
                 mx.eval(feature)
                 if shadow_prediction is not None:
@@ -1079,7 +1134,7 @@ def sample_latents_spectrum(
                             f"window_scale={window_scale:.6f},"
                             f"window_cooldown={window_cooldown}"
                         )
-                forecaster.update(i, feature)
+                forecaster.update(current_time_coord, feature)
                 num_cached = 0
                 forecast_block_candidates = 0
                 forecast_block_force_real = 0

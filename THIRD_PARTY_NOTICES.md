@@ -44,7 +44,7 @@ SDMLX can download common companion models into ComfyUI's normal model folders. 
 
 SDMLX includes an MLX adaptation of Spectrum-style feature forecasting for SDXL sampling. Spectrum is described in the paper [Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration](https://arxiv.org/abs/2603.01623) by Jiaqi Han, Juntong Shi, Puheng Li, Haotian Ye, Qiushan Guo and Stefano Ermon.
 
-The implementation in SDMLX is written for MLX and SDXL, but it is inspired by and cross-checked against the official Spectrum project and community ComfyUI implementations. The normal sampler and Hires Fix `fast` mode use public Spectrum scheduling behavior with three final real steps. The `standard` mode uses the same scheduling family from 35 steps upward and an SDMLX-specific guarded short-run policy below 35 steps.
+The implementation in SDMLX is written for MLX and SDXL, but it is inspired by and cross-checked against the official Spectrum project and community ComfyUI implementations. The normal sampler and Hires Fix `fast` mode use public Spectrum scheduling behavior with three final real steps. The `standard` mode uses a cleaner Spectrum-Proper-style short-run path below 35 steps and the more conservative scheduling family from 35 steps upward.
 
 | Component | Upstream source | License | Notes |
 | --- | --- | --- | --- |
@@ -54,3 +54,24 @@ The implementation in SDMLX is written for MLX and SDXL, but it is inspired by a
 | ComfyUI SDXL Spectrum reference | [ruwwww/ComfyUI-Spectrum-sdxl](https://github.com/ruwwww/ComfyUI-Spectrum-sdxl) | MIT License, copyright (c) 2026 A. Izzuddin Al Faruq | Reference for SDXL-oriented ComfyUI integration, manual parameters and final real-step guard behavior. |
 
 SDMLX's default `fast` and `standard` policies are practical SDXL/MLX presets, not upstream defaults. They should be treated as SDMLX tuning choices layered on top of the Spectrum idea.
+
+## SeaCache Acceleration
+
+SDMLX includes an MLX adaptation of a SeaCache-style cache path for FLUX.1 sampling. SeaCache is described in the paper [SeaCache: Spectral-Evolution-Aware Cache for Accelerating Diffusion Models](https://arxiv.org/abs/2602.18993) by Jiwoo Chung, Sangeek Hyun, MinKyu Lee, Byeongju Han, Geonho Cha, Dongyoon Wee, Youngjun Hong and Jae-Pil Heo.
+
+The implementation in SDMLX is written for the SDMLX FLUX MLX runtime and uses SDMLX-specific defaults. The core cache idea and terminology come from the public SeaCache work.
+
+| Component | Upstream source | License / terms | Notes |
+| --- | --- | --- | --- |
+| SeaCache paper | [arXiv:2602.18993](https://arxiv.org/abs/2602.18993) | Paper license as listed by arXiv | Original SeaCache method and terminology. |
+| SeaCache code | [jiwoogit/SeaCache](https://github.com/jiwoogit/SeaCache) | Check upstream repository before reuse or redistribution | Practical reference for the FLUX-oriented cache path. |
+
+SDMLX's SeaCache defaults are practical FLUX/MLX tuning choices, not upstream defaults.
+
+## FLUX Runtime Reference
+
+SDMLX's FLUX sampler uses an SDMLX MLX sampling loop with Euler-style flow updates and sigma/runtime scheduling adapted from `mflux`. SDMLX also includes a small local FLUX VAE implementation adapted from `mflux`, so the full `mflux` package is not required at runtime.
+
+| Component | Upstream source | License | Notes |
+| --- | --- | --- | --- |
+| mflux | [filipstrand/mflux](https://github.com/filipstrand/mflux) | MIT License, copyright (c) 2024 Filip Strand | Reference for FLUX configuration, sigma scheduling behavior and the local FLUX VAE code adapted into SDMLX. |

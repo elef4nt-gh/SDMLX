@@ -19,6 +19,7 @@ dependencies = [
     "tqdm",
     "insightface",
     "onnxruntime",
+    "gguf",
 ]
 classifiers = [
     "Operating System :: MacOS",

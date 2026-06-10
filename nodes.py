@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 SDMLX_IMPORT_ERROR = None
 
@@ -61,10 +62,12 @@ if SDMLX_IMPORT_ERROR is None:
     from .sdxl_adapter import (
         apply_mapped_weights,
         ldm_unet_key_to_diffusers,
+        ldm_vae_key_to_diffusers,
         map_clip_g_weights,
         map_clip_l_weights,
         map_vae_weights_for_apple,
         split_sdxl_checkpoint,
+        to_mlx,
         validate_sdxl_checkpoint_keys,
     )
     from .mlx_sd.model_io import map_unet_weights, map_vae_weights
@@ -93,10 +96,12 @@ else:
 
     apply_mapped_weights = _missing_runtime
     ldm_unet_key_to_diffusers = _missing_runtime
+    ldm_vae_key_to_diffusers = _missing_runtime
     map_clip_g_weights = _missing_runtime
     map_clip_l_weights = _missing_runtime
     map_vae_weights_for_apple = _missing_runtime
     split_sdxl_checkpoint = _missing_runtime
+    to_mlx = _missing_runtime
     validate_sdxl_checkpoint_keys = _missing_runtime
     map_unet_weights = _missing_runtime
     map_vae_weights = _missing_runtime
@@ -155,6 +160,7 @@ MLX_MEMORY_LIMIT_STATE = {
 }
 MEMORY_ASSIST_OPTIONS = ["auto", "max_performance", "low_memory", "off"]
 SDMLX_SELECT_CHECKPOINT = ""
+SDMLX_MODEL_TYPE = "MLX_MODEL,SDMLX_FLUX_MODEL"
 
 SDXL_SIZE_PRESETS = [
     "1024x1024",
@@ -1303,7 +1309,7 @@ def cache_dir():
 
 
 def speed_patch_dir():
-    path = os.path.join(cache_dir(), "SpeedPatches")
+    path = os.path.join(cache_dir(), "AccelerationPatches")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -1329,6 +1335,17 @@ def speed_patch_label(package_name):
     return SPEED_PATCH_LABELS.get(package_name, package_name.removesuffix(".sdmlxpatch"))
 
 
+def is_sdxl_speed_patch_package(package_path):
+    try:
+        with open(os.path.join(package_path, "manifest.json"), "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except Exception:
+        return False
+    if manifest.get("format") != "sdmlx-acceleration-patch-v1":
+        return False
+    return str(manifest.get("base_model_family", "")).strip().lower() == "sdxl"
+
+
 SPEED_PATCH_OPTIONS_CACHE = None
 SPEED_PATCH_MARKED_PACKAGES = set()
 
@@ -1347,10 +1364,12 @@ def speed_patch_options():
     try:
         root = speed_patch_dir()
         for entry in os.listdir(root):
-            if entry.endswith(".sdmlxpatch"):
+            if not entry.endswith(".sdmlxpatch"):
+                continue
+            package_path = os.path.join(root, entry)
+            if os.path.isdir(package_path) and is_sdxl_speed_patch_package(package_path):
                 names.add(entry)
-                package_path = os.path.join(root, entry)
-                if os.path.isdir(package_path) and package_path not in SPEED_PATCH_MARKED_PACKAGES:
+                if package_path not in SPEED_PATCH_MARKED_PACKAGES:
                     mark_macos_package(package_path)
                     SPEED_PATCH_MARKED_PACKAGES.add(package_path)
     except Exception:
@@ -4308,6 +4327,39 @@ def load_sdmlx_package(package_path, preload=False):
     if preload:
         preload_mlx_model(mlx_model, mlx_clip, mlx_vae, fast_mode=True, compute_dtype="float16", vae_dtype="float32")
     return mlx_model, mlx_clip, mlx_vae
+
+
+def normalize_vae_weight_key(key):
+    key = str(key)
+    if key.startswith("first_stage_model."):
+        return ldm_vae_key_to_diffusers(key[len("first_stage_model."):])
+    for prefix in ("vae.", "autoencoder."):
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+            break
+    mapped = ldm_vae_key_to_diffusers(key)
+    return mapped if mapped is not None else key
+
+
+def load_external_vae_weights(path, dtype=mx.float16):
+    from comfy.utils import load_torch_file
+
+    raw = load_torch_file(path, safe_load=True)
+    weights = {}
+    skipped = 0
+    for key, value in raw.items():
+        mapped_key = normalize_vae_weight_key(key)
+        if mapped_key is None:
+            skipped += 1
+            continue
+        weights[mapped_key] = to_mlx(value, dtype=dtype)
+    if not weights:
+        raise RuntimeError(f"SDMLX: VAE contains no recognizable weights: {os.path.basename(path)}")
+    log_timing(
+        "SDMLX: External VAE loaded "
+        f"({os.path.basename(path)}, tensors={len(weights)}, skipped={skipped})."
+    )
+    return weights
 
 
 def bytes_to_gb(value):
@@ -7349,6 +7401,35 @@ class SDMLX_Loader:
         return load_sdmlx_package(package_path, preload=preload)
 
 
+class SDMLX_VAELoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        try:
+            import folder_paths
+            vae_names = list(folder_paths.get_filename_list("vae"))
+        except Exception:
+            vae_names = []
+        if not vae_names:
+            vae_names = ["<no VAE files found>"]
+        return {"required": {
+            "vae_name": (vae_names,),
+        }}
+
+    RETURN_TYPES = ("MLX_VAE",)
+    RETURN_NAMES = ("mlx_vae",)
+    FUNCTION = "load_vae"
+    CATEGORY = "SDMLX/Loaders"
+
+    def load_vae(self, vae_name):
+        if not vae_name or str(vae_name).startswith("<"):
+            raise FileNotFoundError("SDMLX: No VAE file selected.")
+        import folder_paths
+
+        path = folder_paths.get_full_path_or_raise("vae", vae_name)
+        weights = load_external_vae_weights(path, dtype=mx.float16)
+        return ({"weights": weights, "cache_key": path},)
+
+
 class SDMLX_ControlNetUnionLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -7464,7 +7545,7 @@ class SDMLX_LoraLoader:
             lora_names = [MULTI_LORA_NONE]
         return {
             "required": {
-                "mlx_model": ("MLX_MODEL",),
+                "mlx_model": (SDMLX_MODEL_TYPE,),
                 "lora_name": (lora_names,),
                 "strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05}),
                 "enabled": ("BOOLEAN", {"default": True}),
@@ -7474,8 +7555,8 @@ class SDMLX_LoraLoader:
             },
         }
 
-    RETURN_TYPES = ("MLX_MODEL",)
-    RETURN_NAMES = ("mlx_model",)
+    RETURN_TYPES = (SDMLX_MODEL_TYPE,)
+    RETURN_NAMES = ("sdmlx_model",)
     FUNCTION = "load_lora"
     CATEGORY = "SDMLX"
 
@@ -7493,6 +7574,16 @@ class SDMLX_LoraLoader:
             log_timing(f"SDMLX: LoRA disabled: {lora_name}")
             return (mlx_model,)
 
+        from .flux_nodes import SDMLXFluxNativeModel, _apply_flux_lora
+
+        strength = float(strength)
+        schedule = lora_scheduler if isinstance(lora_scheduler, dict) else None
+        effective_strength_model = lora_strength_for_item(strength, schedule)
+        if isinstance(mlx_model, SDMLXFluxNativeModel):
+            if schedule is not None:
+                log_timing("SDMLX: LoRA schedule is not supported for FLUX; using the current effective strength.")
+            return (_apply_flux_lora(mlx_model, lora_name, effective_strength_model),)
+
         if hasattr(folder_paths, "get_full_path_or_raise"):
             path = folder_paths.get_full_path_or_raise("loras", lora_name)
         else:
@@ -7500,9 +7591,6 @@ class SDMLX_LoraLoader:
             if path is None:
                 raise FileNotFoundError(f"SDMLX: LoRA not found: {lora_name}")
 
-        strength = float(strength)
-        schedule = lora_scheduler if isinstance(lora_scheduler, dict) else None
-        effective_strength_model = lora_strength_for_item(strength, schedule)
         model_loras = list(mlx_model.get("loras", []))
         if effective_strength_model != 0.0:
             item = {
@@ -7557,7 +7645,7 @@ class SDMLX_MultiLoraLoader:
     @classmethod
     def INPUT_TYPES(s):
         required = {
-            "mlx_model": ("MLX_MODEL",),
+            "mlx_model": (SDMLX_MODEL_TYPE,),
         }
         loras = lora_file_options_with_none()
         required["slot_count"] = ("INT", {"default": 1, "min": 1, "max": MULTI_LORA_SLOT_COUNT, "socketless": True})
@@ -7567,12 +7655,36 @@ class SDMLX_MultiLoraLoader:
             required[f"strength_{index}"] = ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05, "socketless": True})
         return {"required": required}
 
-    RETURN_TYPES = ("MLX_MODEL",)
-    RETURN_NAMES = ("mlx_model",)
+    RETURN_TYPES = (SDMLX_MODEL_TYPE,)
+    RETURN_NAMES = ("sdmlx_model",)
     FUNCTION = "load_loras"
     CATEGORY = "SDMLX"
 
     def load_loras(self, mlx_model, **kwargs):
+        from .flux_nodes import SDMLXFluxNativeModel, _apply_flux_lora
+
+        if isinstance(mlx_model, SDMLXFluxNativeModel):
+            patched_model = mlx_model
+            added = []
+            slot_count = int(kwargs.get("slot_count", 1))
+            slot_count = max(1, min(MULTI_LORA_SLOT_COUNT, slot_count))
+            for index in range(1, slot_count + 1):
+                if not bool(kwargs.get(f"enabled_{index}", True)):
+                    continue
+                lora_name = kwargs.get(f"lora_{index}", MULTI_LORA_NONE)
+                if not lora_name or lora_name == MULTI_LORA_NONE:
+                    continue
+                strength_model = float(kwargs.get(f"strength_{index}", 1.0))
+                if strength_model == 0.0:
+                    continue
+                patched_model = _apply_flux_lora(patched_model, lora_name, strength_model)
+                added.append(f"#{index} {lora_name} strength={strength_model:g}")
+            if added:
+                log_timing(f"SDMLX: Multi LoRA FLUX stack extended ({len(added)} LoRAs): " + "; ".join(added))
+            else:
+                log_timing("SDMLX: Multi LoRA Loader: no active LoRA selected.")
+            return (patched_model,)
+
         model_loras = list(mlx_model.get("loras", []))
         added = []
         slot_count = int(kwargs.get("slot_count", 1))
@@ -9564,6 +9676,7 @@ NODE_CLASS_MAPPINGS = {
     "SDMLX_GaussianBlurMask": SDMLX_GaussianBlurMask,
     "SDMLX_CheckpointLoader": SDMLX_LoaderUniversal,
     "SDMLX_Loader": SDMLX_Loader,
+    "SDMLX_VAELoader": SDMLX_VAELoader,
     "SDMLX_CLIPTextEncode": SDMLX_CLIPTextEncode,
     "SDMLX_LoraLoader": SDMLX_LoraLoader,
     "SDMLX_MultiLoraLoader": SDMLX_MultiLoraLoader,
@@ -9594,6 +9707,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SDMLX_GaussianBlurMask": "🍏 SDMLX Gaussian Blur Mask",
     "SDMLX_CheckpointLoader": "🍏 SDMLX Loader Universal",
     "SDMLX_Loader": "🍏 SDMLX Loader",
+    "SDMLX_VAELoader": "🍏 SDMLX VAE Loader",
     "SDMLX_CLIPTextEncode": "🍏 SDMLX CLIP Text Encode",
     "SDMLX_LoraLoader": "🍏 SDMLX LoRA Loader",
     "SDMLX_MultiLoraLoader": "🍏 SDMLX Multi LoRA Loader",
