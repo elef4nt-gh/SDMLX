@@ -4331,6 +4331,11 @@ def load_sdmlx_package(package_path, preload=False):
 
 def normalize_vae_weight_key(key):
     key = str(key)
+    if key.startswith(("model_ema.", "loss.", "loss_")) or key in {
+        "model_ema.decay",
+        "model_ema.num_updates",
+    }:
+        return None
     if key.startswith("first_stage_model."):
         return ldm_vae_key_to_diffusers(key[len("first_stage_model."):])
     for prefix in ("vae.", "autoencoder."):
@@ -4998,7 +5003,7 @@ def get_vae_model(cache_key, weights, compute_dtype="float32"):
             scaling_factor=0.13025,
         )
     )
-    mapped_count = apply_mapped_weights(vae, weights, map_vae_weights_for_apple)
+    mapped_count = apply_mapped_weights(vae, weights, map_vae_weights_for_apple, ignore_unknown=True)
     if compute_dtype == "float16":
         vae.set_dtype(mx.float16)
         log_timing("SDMLX: VAE compute dtype float16 enabled.")

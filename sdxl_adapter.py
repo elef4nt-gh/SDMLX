@@ -1,5 +1,5 @@
 import mlx.core as mx
-from mlx.utils import tree_unflatten
+from mlx.utils import tree_flatten, tree_unflatten
 
 from .mlx_sd.model_io import (
     map_clip_text_encoder_weights,
@@ -23,10 +23,17 @@ def to_mlx(value, dtype=mx.float16):
     return mx.array(value).astype(dtype)
 
 
-def apply_mapped_weights(model, weights, mapper):
+def apply_mapped_weights(model, weights, mapper, ignore_unknown=False):
     mapped = []
     for key, value in weights.items():
         mapped.extend(mapper(key, value))
+    if ignore_unknown:
+        valid_keys = {key for key, _value in tree_flatten(model.parameters())}
+        before = len(mapped)
+        mapped = [(key, value) for key, value in mapped if key in valid_keys]
+        skipped = before - len(mapped)
+        if skipped:
+            print(f"SDMLX: skipped {skipped} unsupported VAE metadata/key(s).")
     model.update(tree_unflatten(mapped))
     return len(mapped)
 
