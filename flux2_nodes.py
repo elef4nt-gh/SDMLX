@@ -318,6 +318,12 @@ def _flux2_raw_fp8_dense_dtype(quant_contract: dict[str, Any] | None) -> str | N
     return "bf16"
 
 
+def _flux2_runtime_lora_rebind_enabled(quant_contract: dict[str, Any] | None) -> bool:
+    return _flux2_quant_contract_kind(quant_contract) == _FLUX2_QUANT_RAW_FP8 and (
+        _flux2_raw_fp8_dense_dtype(quant_contract) is not None
+    )
+
+
 def _normalize_flux2_kv_first_step_barriers(value: Any) -> int:
     if isinstance(value, bool):
         return 1 if value else 0
@@ -3154,6 +3160,86 @@ def _validate_flux2_lora_specs(lora_specs: tuple[tuple[str, float, tuple], ...],
             )
 
 
+def _flux2_strip_lora_wrappers(module: Any) -> int:
+    _ensure_suite_qwen_native_runtime()
+    from sdmlx_qwen_native.models.common.lora.layer.fused_linear_lora_layer import FusedLoRALinear
+    from sdmlx_qwen_native.models.common.lora.layer.linear_lora_layer import LoRALinear
+    from sdmlx_qwen_native.models.common.lora.layer.lokr_linear_layer import LoKrLinear
+
+    visited: set[int] = set()
+
+    def _base_from_wrapper(obj: Any) -> Any | None:
+        if isinstance(obj, FusedLoRALinear):
+            return obj.base_linear
+        if isinstance(obj, (LoRALinear, LoKrLinear)):
+            return obj.linear
+        return None
+
+    def _walk(obj: Any) -> int:
+        obj_id = id(obj)
+        if obj_id in visited:
+            return 0
+        visited.add(obj_id)
+        count = 0
+
+        if isinstance(obj, list):
+            for index, child in enumerate(list(obj)):
+                base = _base_from_wrapper(child)
+                if base is not None:
+                    obj[index] = base
+                    child = base
+                    count += 1
+                count += _walk(child)
+            return count
+
+        if isinstance(obj, dict):
+            for key, child in list(obj.items()):
+                base = _base_from_wrapper(child)
+                if base is not None:
+                    obj[key] = base
+                    child = base
+                    count += 1
+                count += _walk(child)
+            return count
+
+        if not isinstance(obj, nn.Module):
+            return 0
+
+        for name, child in list(obj.items()):
+            base = _base_from_wrapper(child)
+            if base is not None:
+                obj[name] = base
+                child = base
+                count += 1
+            count += _walk(child)
+        return count
+
+    return _walk(module)
+
+
+def _flux2_rebind_runtime_loras(model: Any, lora_specs: tuple[tuple[str, float, tuple], ...]) -> None:
+    current_specs = tuple(getattr(model, "_sdmlx_lora_specs", ()) or ())
+    if hasattr(model, "_sdmlx_lora_specs") and current_specs == tuple(lora_specs):
+        return
+
+    removed = _flux2_strip_lora_wrappers(model.transformer)
+    lora_paths = [path for path, _scale, _identity in lora_specs] or None
+    lora_scales = [scale for _path, scale, _identity in lora_specs] or None
+
+    from sdmlx_qwen_native.models.flux2.flux2_initializer import Flux2Initializer
+
+    Flux2Initializer._apply_lora(model, lora_paths, lora_scales)
+    model._sdmlx_lora_specs = tuple(lora_specs)
+    if removed or lora_specs:
+        gc.collect()
+        mx.clear_cache()
+    _flux2_log(
+        "SDMLX FLUX.2 Klein: rebound runtime LoRA stack "
+        f"(removed={removed}, active={len(lora_specs)})",
+        verbose=True,
+    )
+
+
 def _validate_flux2_text_encoder_for_model(text_encoder_path: Path, model_config) -> None:
     expected_hidden = int((model_config.text_encoder_overrides or {}).get("hidden_size") or 0)
     actual_hidden = int(_flux2_text_encoder_hidden_size(text_encoder_path) or 0)
@@ -3685,6 +3771,16 @@ def _load_flux2_model(
     mode = "edit" if edit else "txt2img"
     vae_variant = _normalize_flux2_vae_variant(vae_variant)
     lora_quant_bake_mode = _flux2_lora_quant_bake_mode()
+    transformer_path = _flux2_transformer_file(root)
+    transformer_quant_contract = (
+        _flux2_inspect_transformer_quant_contract(transformer_path)
+        if _is_packed_flux2_transformer(transformer_path)
+        else None
+    )
+    raw_fp8_dense_dtype = _flux2_raw_fp8_dense_dtype(transformer_quant_contract) or ""
+    lora_rebind_enabled = _flux2_runtime_lora_rebind_enabled(transformer_quant_contract)
+    lora_cache_key = () if lora_rebind_enabled else tuple(lora_specs)
+    lora_mode_key = "runtime_rebind" if lora_rebind_enabled else lora_quant_bake_mode
     key = (
         str(root.resolve()),
         config_name,
@@ -3693,8 +3789,9 @@ def _load_flux2_model(
         str(vae_path or ""),
         str(clip_path or ""),
         str(tokenizer_path or ""),
-        tuple(lora_specs),
-        lora_quant_bake_mode,
+        raw_fp8_dense_dtype,
+        lora_cache_key,
+        lora_mode_key,
     )
     cached = _FLUX2_MODEL_CACHE.get(key)
     if cached is not None:
@@ -3703,6 +3800,8 @@ def _load_flux2_model(
             _ensure_suite_qwen_native_runtime()
         else:
             _ensure_flux2_text_encoder_loaded(cached, root, clip_path=clip_path)
+            if lora_rebind_enabled:
+                _flux2_rebind_runtime_loras(cached, lora_specs)
             _apply_flux2_kv_first_step_barriers(cached, 0)
             _apply_flux2_decode_tiling_default(cached)
             _clear_flux2_model_cache(keep_key=key)
@@ -3715,7 +3814,7 @@ def _load_flux2_model(
         return cached
     model_config = _flux2_model_config_by_name(config_name) if config_name else _model_config_for_root(root)
     _validate_flux2_lora_specs(lora_specs, model_config)
-    transformer_path = _flux2_transformer_file(root)
+    load_lora_specs = () if lora_rebind_enabled else lora_specs
     if _is_packed_flux2_transformer(transformer_path):
         model = _load_flux2_packed_model(
             root,
@@ -3725,12 +3824,12 @@ def _load_flux2_model(
             vae_path=vae_path,
             clip_path=clip_path,
             tokenizer_path=tokenizer_path,
-            lora_specs=lora_specs,
+            lora_specs=load_lora_specs,
         )
     else:
         cls = Flux2KleinEdit if edit else Flux2Klein
-        lora_paths = [path for path, _scale, _identity in lora_specs] or None
-        lora_scales = [scale for _path, scale, _identity in lora_specs] or None
+        lora_paths = [path for path, _scale, _identity in load_lora_specs] or None
+        lora_scales = [scale for _path, scale, _identity in load_lora_specs] or None
         model = cls(
             model_path=str(root),
             model_config=model_config,
@@ -3761,6 +3860,9 @@ def _load_flux2_model(
     model._sdmlx_model_path = str(root)
     model._sdmlx_clip_path = str(clip_path or "")
     _ensure_flux2_text_encoder_loaded(model, root, clip_path=clip_path)
+    model._sdmlx_lora_specs = tuple(load_lora_specs)
+    if lora_rebind_enabled:
+        _flux2_rebind_runtime_loras(model, lora_specs)
     _apply_flux2_kv_first_step_barriers(model, 0)
     _apply_flux2_decode_tiling_default(model)
     _FLUX2_MODEL_CACHE[key] = model

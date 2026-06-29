@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sdmlx"
-version = "0.1.18"
+version = "0.1.19"
 description = "ComfyUI node suite for faster SDXL image generation on Apple Silicon with MLX."
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
