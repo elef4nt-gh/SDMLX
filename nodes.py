@@ -55,7 +55,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.17"
+SDMLX_VERSION = "0.1.18"
 SDMLX_CACHE_VERSION = "adapter-v7"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -147,6 +147,7 @@ SDMLX_SAFE_MODE = sdmlx_env_flag("SDMLX_SAFE_MODE")
 SDMLX_DISABLE_STEP_COMPILE = SDMLX_SAFE_MODE or sdmlx_env_flag("SDMLX_DISABLE_STEP_COMPILE")
 SDMLX_DISABLE_FAST_ATTENTION = SDMLX_SAFE_MODE or sdmlx_env_flag("SDMLX_DISABLE_FAST_ATTENTION")
 SDMLX_CONDITIONING_GUARD = not sdmlx_env_flag("SDMLX_DISABLE_CONDITIONING_GUARD")
+SDMLX_NAN_DIAGNOSTICS = sdmlx_env_flag("SDMLX_NAN_DIAGNOSTICS")
 SDMLX_CONDITIONING_DIAGNOSTICS_HEADER_PRINTED = False
 TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
 CONDITIONING_CACHE_VERSION = "shared-tokenizer-v2"
@@ -160,7 +161,12 @@ MLX_MEMORY_LIMIT_STATE = {
 }
 MEMORY_ASSIST_OPTIONS = ["auto", "max_performance", "low_memory", "off"]
 SDMLX_SELECT_CHECKPOINT = ""
-SDMLX_MODEL_TYPE = "MLX_MODEL,SDMLX_FLUX_MODEL"
+SDMLX_SELECT_PACKAGE = "<use checkpoint>"
+SDMLX_MODEL_TYPE = "sdmlx_model"
+SDMLX_CHECKPOINT_DISPLAY_TO_PATH = {}
+SDMLX_TEXT_ENCODER_DISPLAY_TO_PATH = {}
+SDMLX_VAE_DISPLAY_TO_PATH = {}
+SDMLX_PACKAGE_MENU_PREFIX = "sdmlx"
 
 SDXL_SIZE_PRESETS = [
     "1024x1024",
@@ -1243,6 +1249,21 @@ def get_mlx_array(tensor):
     return mx.array(tensor)
 
 
+def latent_pixel_size(samples, *, fallback_width=None, fallback_height=None):
+    shape = tuple(getattr(samples, "shape", ()) or ())
+    if len(shape) == 4:
+        # Comfy LATENT tensors are usually channels-first: [B, C, H, W].
+        # SDXL uses 4 channels, SD3/FLUX/Qwen use 16 channels.
+        if shape[1] in (4, 16):
+            return int(shape[3] * 8), int(shape[2] * 8)
+        # Some internal SDMLX paths use channels-last: [B, H, W, C].
+        if shape[3] in (4, 16):
+            return int(shape[2] * 8), int(shape[1] * 8)
+    if fallback_width is not None and fallback_height is not None:
+        return int(fallback_width), int(fallback_height)
+    raise ValueError(f"SDMLX: Cannot infer latent pixel size from shape {shape}")
+
+
 def get_numpy_array(tensor):
     if isinstance(tensor, np.ndarray):
         return tensor
@@ -1296,9 +1317,32 @@ def summarize_source_dtypes(state_dict):
     return "mixed:" + ",".join(f"{name}:{size / total * 100:.0f}%" for name, size in ordered[:3])
 
 
-def cache_dir():
+def sdmlx_model_root_dir():
     try:
         import folder_paths
+        if hasattr(folder_paths, "get_folder_paths"):
+            folder_map = getattr(folder_paths, "folder_names_and_paths", {})
+            candidate_paths = []
+            for key in ("sdmlx", "SDMLX"):
+                if key in folder_map:
+                    candidate_paths.extend(folder_paths.get_folder_paths(key))
+            seen = set()
+            candidate_paths = [p for p in candidate_paths if not (p in seen or seen.add(p))]
+            for path in candidate_paths:
+                if os.path.isdir(path):
+                    try:
+                        entries = os.listdir(path)
+                    except OSError:
+                        entries = []
+                    if "cache" in entries or "AccelerationPatches" in entries or any(entry.endswith(".sdmlx") for entry in entries):
+                        return path
+            for path in candidate_paths:
+                if os.path.isdir(path):
+                    return path
+            if candidate_paths:
+                path = candidate_paths[0]
+                os.makedirs(path, exist_ok=True)
+                return path
         models_dir = folder_paths.models_dir
     except Exception:
         comfy_dir = os.path.dirname(os.path.dirname(current_path))
@@ -1306,6 +1350,10 @@ def cache_dir():
     path = os.path.join(models_dir, "SDMLX")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def cache_dir():
+    return sdmlx_model_root_dir()
 
 
 def speed_patch_dir():
@@ -1316,6 +1364,8 @@ def speed_patch_dir():
 
 def normalized_speed_patch_name(speed_patch):
     if not speed_patch or speed_patch == SPEED_PATCH_NONE:
+        return None
+    if is_qwen_speed_patch_selection(speed_patch):
         return None
     value = str(speed_patch)
     name = SPEED_PATCH_BY_LABEL.get(value, value)
@@ -1333,6 +1383,15 @@ def speed_patch_override(widget_value, speed_patch_input=None):
 
 def speed_patch_label(package_name):
     return SPEED_PATCH_LABELS.get(package_name, package_name.removesuffix(".sdmlxpatch"))
+
+
+def is_qwen_speed_patch_selection(speed_patch):
+    try:
+        from .qwen_nodes import is_qwen_acceleration_patch_selection
+
+        return is_qwen_acceleration_patch_selection(speed_patch)
+    except Exception:
+        return False
 
 
 def is_sdxl_speed_patch_package(package_path):
@@ -1374,10 +1433,14 @@ def speed_patch_options():
                     SPEED_PATCH_MARKED_PACKAGES.add(package_path)
     except Exception:
         pass
-    options = [SPEED_PATCH_NONE] + sorted(
-        (speed_patch_label(name) for name in names),
-        key=str.lower,
-    )
+    labels = [speed_patch_label(name) for name in names]
+    try:
+        from .qwen_nodes import qwen_acceleration_patch_options
+
+        labels.extend(qwen_acceleration_patch_options())
+    except Exception:
+        pass
+    options = [SPEED_PATCH_NONE] + sorted(set(labels), key=str.lower)
     SPEED_PATCH_OPTIONS_CACHE = tuple(options)
     return list(options)
 
@@ -3846,6 +3909,240 @@ def safe_package_name(path):
     return name or "checkpoint"
 
 
+def is_flux_vae_file(path):
+    try:
+        from safetensors import safe_open
+
+        with safe_open(path, framework="np") as handle:
+            keys = set(handle.keys())
+        return "decoder.mid.attn_1.q.weight" in keys and "encoder.conv_in.weight" in keys
+    except Exception:
+        return False
+
+
+def sdmlx_checkpoint_display_options():
+    import folder_paths
+
+    checkpoint_paths = list(folder_paths.get_filename_list("checkpoints"))
+    display_to_path = {}
+    options = [SDMLX_SELECT_CHECKPOINT]
+    for checkpoint_path in checkpoint_paths:
+        display_name = checkpoint_path
+        display_to_path[display_name] = checkpoint_path
+        options.append(display_name)
+    try:
+        diffusion_model_paths = list(folder_paths.get_filename_list("diffusion_models"))
+    except Exception:
+        diffusion_model_paths = []
+    for model_path in diffusion_model_paths:
+        display_name = f"diffusion_models/{model_path}"
+        display_to_path[display_name] = display_name
+        options.append(display_name)
+    for package_name in sdmlx_package_options():
+        display_name = f"{SDMLX_PACKAGE_MENU_PREFIX}/{package_name}"
+        display_to_path[display_name] = display_name
+        options.append(display_name)
+    seen = set()
+    deduped = []
+    for option in options:
+        if option in seen:
+            continue
+        seen.add(option)
+        deduped.append(option)
+    return deduped, display_to_path
+
+
+def sdmlx_package_from_model_selection(selection):
+    value = str(selection or "").strip()
+    prefix = f"{SDMLX_PACKAGE_MENU_PREFIX}/"
+    if value.startswith(prefix):
+        return value[len(prefix):]
+    return None
+
+
+def sdmlx_resolve_checkpoint_path(checkpoint_path_name):
+    import folder_paths
+
+    value = str(checkpoint_path_name or "")
+    diffusion_prefix = "diffusion_models/"
+    if value.startswith(diffusion_prefix):
+        name = value[len(diffusion_prefix):]
+        try:
+            path = folder_paths.get_full_path("diffusion_models", name)
+        except Exception:
+            path = None
+        if path and os.path.exists(path):
+            return path
+
+    try:
+        path = folder_paths.get_full_path("checkpoints", checkpoint_path_name)
+    except Exception:
+        path = None
+    if path and os.path.exists(path):
+        return path
+
+    direct = Path(str(checkpoint_path_name)).expanduser()
+    if direct.is_absolute() and direct.exists():
+        return str(direct.resolve())
+
+    roots = []
+    try:
+        roots.extend(Path(root) for root in folder_paths.get_folder_paths("checkpoints"))
+    except Exception:
+        pass
+    try:
+        roots.append(Path(folder_paths.models_dir) / "checkpoints")
+    except Exception:
+        pass
+    seen = set()
+    for root in roots:
+        try:
+            root = root.expanduser()
+            key = str(root.resolve())
+        except Exception:
+            continue
+        if key in seen or not root.exists():
+            continue
+        seen.add(key)
+        candidate = root / str(checkpoint_path_name)
+        if candidate.exists():
+            return str(candidate.resolve())
+    return None
+
+
+def sdmlx_text_encoder_display_options():
+    import folder_paths
+
+    def is_sharded_qwen3_text_encoder_dir(path):
+        path = Path(path)
+        if not path.is_dir():
+            return False
+        if not (path / "config.json").is_file() or not (path / "model.safetensors.index.json").is_file():
+            return False
+        try:
+            with (path / "config.json").open("r", encoding="utf-8") as handle:
+                config = json.load(handle)
+        except Exception:
+            return False
+        architectures = " ".join(str(item) for item in config.get("architectures") or [])
+        return str(config.get("model_type") or "").lower() == "qwen3" or "qwen3" in architectures.lower()
+
+    display_to_path = {}
+    options = []
+    hidden_sharded_prefixes = set()
+    try:
+        for folder_root in folder_paths.get_folder_paths("text_encoders"):
+            root_path = Path(folder_root)
+            if not root_path.is_dir():
+                continue
+            for child in root_path.iterdir():
+                if is_sharded_qwen3_text_encoder_dir(child):
+                    hidden_sharded_prefixes.add(os.path.relpath(child, root_path).replace(os.sep, "/"))
+    except Exception:
+        pass
+
+    try:
+        for name in folder_paths.get_filename_list("text_encoders"):
+            first_segment = str(name).split("/", 1)[0]
+            if first_segment in hidden_sharded_prefixes:
+                continue
+            display_to_path[name] = ("text_encoders", name)
+            options.append(name)
+    except Exception:
+        pass
+    options = sorted(dict.fromkeys(options), key=str.lower)
+    return options, display_to_path
+
+
+def sdmlx_text_encoder_path(selection):
+    import folder_paths
+
+    entry = SDMLX_TEXT_ENCODER_DISPLAY_TO_PATH.get(selection)
+    if entry is not None:
+        folder_name, name = entry
+        if folder_name == "__path__":
+            path = str(Path(name).expanduser())
+            if os.path.exists(path):
+                return path, folder_name, os.path.basename(path)
+        path = folder_paths.get_full_path(folder_name, name)
+        if path is not None:
+            return path, folder_name, name
+    value = str(selection or "")
+    package_prefix = f"{SDMLX_PACKAGE_MENU_PREFIX}/"
+    if value.startswith(package_prefix):
+        candidate = Path(cache_dir()) / value[len(package_prefix):]
+        if candidate.exists():
+            return str(candidate), "__path__", candidate.name
+
+    for folder_name in ("text_encoders", "clip"):
+        name = selection
+        prefix = f"{folder_name}/"
+        if str(name).startswith(prefix):
+            name = str(name)[len(prefix):]
+        try:
+            path = folder_paths.get_full_path(folder_name, name)
+        except Exception:
+            path = None
+        if path is not None:
+            return path, folder_name, name
+    raise FileNotFoundError(f"SDMLX CLIP Loader: text encoder not found: {selection}")
+
+
+def is_qwen_text_encoder_file(path):
+    try:
+        from safetensors import safe_open
+
+        with safe_open(path, framework="np") as handle:
+            keys = set(handle.keys())
+        qwen_comfy = ("lm_head.weight" in keys or "model.lm_head.weight" in keys) and "model.embed_tokens.weight" in keys
+        qwen_native = ("lm_head.weight" in keys or "model.lm_head.weight" in keys) and "encoder.embed_tokens.weight" in keys and any(
+            key.startswith("encoder.layers.0.self_attn.") for key in keys
+        )
+        qwen_visual = any(key.startswith("visual.") or key.startswith("encoder.visual.") for key in keys)
+        return qwen_visual and (qwen_comfy or qwen_native)
+    except Exception:
+        return False
+
+
+def sdmlx_vae_display_options():
+    import folder_paths
+
+    display_to_path = {}
+    options = []
+    try:
+        for name in folder_paths.get_filename_list("vae"):
+            display_to_path[name] = ("vae", name)
+            options.append(name)
+    except Exception:
+        pass
+    return options, display_to_path
+
+
+def sdmlx_vae_path(selection):
+    import folder_paths
+
+    entry = SDMLX_VAE_DISPLAY_TO_PATH.get(selection)
+    if entry is not None:
+        folder_name, name = entry
+        if folder_name == "__path__":
+            path = str(Path(name).expanduser())
+            if os.path.exists(path):
+                return path, folder_name, os.path.basename(path)
+        path = folder_paths.get_full_path(folder_name, name)
+        if path is not None:
+            return path, folder_name, name
+    try:
+        path = folder_paths.get_full_path("vae", selection)
+    except Exception:
+        path = None
+    if path is not None:
+        return path, "vae", selection
+    direct = Path(str(selection)).expanduser()
+    if direct.is_absolute() and direct.exists():
+        return str(direct.resolve()), "__path__", direct.name
+    raise FileNotFoundError(f"SDMLX VAE Loader: VAE not found: {selection}")
+
+
 def manifest_path(package_path):
     return os.path.join(package_path, "manifest.json")
 
@@ -4064,6 +4361,24 @@ def mark_macos_package(path):
     add_macos_finder_flags(path, flags)
 
 
+def iter_sdmlx_package_dirs(root):
+    if not os.path.isdir(root):
+        return
+    skip_dirs = {"cache", "AccelerationPatches", "SpeedPatches"}
+    for dirpath, dirnames, _filenames in os.walk(root):
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if not name.startswith(".") and name not in skip_dirs
+        )
+        for dirname in list(dirnames):
+            if not dirname.endswith(".sdmlx"):
+                continue
+            package_path = os.path.join(dirpath, dirname)
+            if os.path.isdir(package_path):
+                yield package_path
+            dirnames.remove(dirname)
+
+
 def checkpoint_cache_package(path):
     identity = checkpoint_cache_identity(path)
     base = safe_package_name(path)
@@ -4078,10 +4393,10 @@ def checkpoint_cache_package(path):
             print(f"SDMLX: Reused existing package after checkpoint relocation: {os.path.basename(package_path)}")
             return package_path, identity
 
-    for name in sorted(os.listdir(root)):
-        candidate = os.path.join(root, name)
-        if not name.endswith(".sdmlx") or not os.path.isdir(candidate) or candidate == package_path:
+    for candidate in iter_sdmlx_package_dirs(root):
+        if os.path.realpath(candidate) == os.path.realpath(package_path):
             continue
+        name = os.path.relpath(candidate, root)
         manifest = read_cache_manifest(candidate)
         if manifest_matches_identity(manifest, identity):
             return candidate, identity
@@ -4179,10 +4494,7 @@ def reusable_package_component_path(component, digest, exclude_package_path=None
     if not os.path.isdir(root):
         return None
     exclude = os.path.realpath(exclude_package_path) if exclude_package_path else None
-    for name in sorted(os.listdir(root)):
-        package_path = os.path.join(root, name)
-        if not name.endswith(".sdmlx") or not os.path.isdir(package_path):
-            continue
+    for package_path in iter_sdmlx_package_dirs(root):
         if exclude and os.path.realpath(package_path) == exclude:
             continue
         manifest = read_cache_manifest(package_path) or {}
@@ -4279,18 +4591,54 @@ def sdmlx_package_options():
     root = cache_dir()
     if not os.path.isdir(root):
         return []
-    packages = sorted(
-        name
-        for name in os.listdir(root)
-        if name.endswith(".sdmlx") and os.path.isdir(os.path.join(root, name))
-    )
+    packages = []
+    for package_path in iter_sdmlx_package_dirs(root):
+        rel_path = os.path.relpath(package_path, root)
+        packages.append(rel_path.replace(os.sep, "/"))
+    packages = sorted(packages, key=str.lower)
     for name in packages:
         mark_macos_package(os.path.join(root, name))
     return packages
 
 
+def manifest_is_qwen_package(manifest):
+    if not isinstance(manifest, dict):
+        return False
+    family = str(manifest.get("model_family") or manifest.get("base_model_family") or "").strip().lower()
+    package_format = str(manifest.get("package_format") or manifest.get("format") or "").strip().lower()
+    return family in {"qwen", "qwen-image", "qwen-image-2512", "qwen-image-edit", "qwen-image-edit-2511"} or package_format == "sdmlx-qwen-package-v1"
+
+
+def manifest_is_flux2_package(manifest):
+    if not isinstance(manifest, dict):
+        return False
+    family = str(manifest.get("model_family") or manifest.get("base_model_family") or "").strip().lower()
+    package_format = str(manifest.get("package_format") or manifest.get("format") or "").strip().lower()
+    return family == "flux2-klein" or package_format == "sdmlx-flux2-klein-package-v1"
+
+
 def load_sdmlx_package(package_path, preload=False):
     manifest = read_cache_manifest(package_path)
+    if manifest_is_qwen_package(manifest):
+        try:
+            from .qwen_nodes import qwen_model_from_manifest
+            mark_macos_package(package_path)
+            return qwen_model_from_manifest(package_path, manifest, preload=preload)
+        except ImportError:
+            raise
+        except Exception as exc:
+            package_name = os.path.basename(package_path)
+            raise RuntimeError(f"SDMLX: Qwen package {package_name} could not be loaded: {exc}") from exc
+    if manifest_is_flux2_package(manifest):
+        try:
+            from .flux2_nodes import flux2_model_from_manifest
+            mark_macos_package(package_path)
+            return flux2_model_from_manifest(package_path, manifest, preload=preload)
+        except ImportError:
+            raise
+        except Exception as exc:
+            package_name = os.path.basename(package_path)
+            raise RuntimeError(f"SDMLX: FLUX.2 Klein package {package_name} could not be loaded: {exc}") from exc
     if manifest and manifest.get("cache_version") != SDMLX_CACHE_VERSION:
         package_name = os.path.basename(package_path)
         raise FileNotFoundError(
@@ -5218,6 +5566,46 @@ def scheduler_step_plan_for_denoise(sampler, steps, scheduler_name, sampler_name
     return plan[-steps:]
 
 
+def force_step_plan_final_zero(step, sampler_name):
+    t, _next_t, step_scale, _step_dt, _step_noise_scale, _step_out_scale, step_sigma, _next_sigma = step
+    zero = mx.array(0.0, dtype=mx.float32)
+    if sampler_name == "lcm":
+        noise_scale = zero
+        out_scale = mx.array(1.0, dtype=mx.float32)
+    else:
+        noise_scale = None
+        out_scale = mx.array(1.0, dtype=mx.float32)
+    return (
+        t,
+        zero,
+        step_scale,
+        -step_sigma,
+        noise_scale,
+        out_scale,
+        step_sigma,
+        zero,
+    )
+
+
+def scheduler_step_plan_for_range(
+    sampler,
+    steps,
+    scheduler_name,
+    sampler_name,
+    start_at_step=0,
+    end_at_step=None,
+    force_full_denoise=True,
+):
+    steps = max(1, int(steps))
+    full_plan = scheduler_step_plan(sampler, steps, scheduler_name, sampler_name)
+    start = max(0, min(int(start_at_step), steps))
+    end = steps if end_at_step is None else max(start, min(int(end_at_step), steps))
+    plan = list(full_plan[start:end])
+    if plan and bool(force_full_denoise) and end < steps:
+        plan[-1] = force_step_plan_final_zero(plan[-1], sampler_name)
+    return plan
+
+
 def apply_sampler_step(noise_pred, latents, scale, dt, noise_scale, out_scale):
     latents = latents * (scale * out_scale) + noise_pred * (dt * out_scale)
     if noise_scale is not None:
@@ -5327,6 +5715,8 @@ def controlnet_residuals_for_step(
             conditioning_scale=mx.array(strength, dtype=dtype),
             text_time=(pooled, time_ids),
         )
+        down = [mx.nan_to_num(item, nan=0.0, posinf=0.0, neginf=0.0) for item in down]
+        mid = mx.nan_to_num(mid, nan=0.0, posinf=0.0, neginf=0.0)
         if down_sum is None:
             down_sum = down
             mid_sum = mid
@@ -6190,6 +6580,10 @@ def sample_latents(
     sdxl_time_ids=None,
     differential_mask=False,
     differential_mask_strength=1.0,
+    start_at_step=None,
+    end_at_step=None,
+    add_noise=True,
+    force_full_denoise=True,
 ):
     from .mlx_sd.config import DiffusionConfig
     from .mlx_sd.sampler import SimpleEulerAncestralSampler, SimpleEulerSampler
@@ -6331,8 +6725,22 @@ def sample_latents(
     t_ids = t_ids.astype(dtype)
     cfg_value = mx.array(cfg, dtype=mx.float32)
     denoise = max(0.0, min(1.0, float(denoise)))
-    step_plan = scheduler_step_plan_for_denoise(sampler, steps, scheduler, sampler_name, denoise)
+    advanced_step_range = start_at_step is not None or end_at_step is not None
+    if advanced_step_range:
+        step_plan = scheduler_step_plan_for_range(
+            sampler,
+            steps,
+            scheduler,
+            sampler_name,
+            0 if start_at_step is None else start_at_step,
+            end_at_step,
+            force_full_denoise=force_full_denoise,
+        )
+    else:
+        step_plan = scheduler_step_plan_for_denoise(sampler, steps, scheduler, sampler_name, denoise)
     progress_steps = len(step_plan)
+    nan_diagnostics = SDMLX_NAN_DIAGNOSTICS and bool(advanced_step_range or controlnets)
+    advanced_start_index = 0 if start_at_step is None else int(start_at_step)
     dynamic_step_context = bool(ip_adapters or scheduled_loras)
     control_active_by_step = [
         controlnets_active_at_percent(controlnets, i / max(progress_steps - 1, 1))
@@ -6432,6 +6840,11 @@ def sample_latents(
             f"DType {compute_dtype})..."
         )
 
+    if not step_plan and initial_latents is not None:
+        print("SDMLX: no sampling steps selected, Initial latents are returned unchanged.")
+        mx.eval(initial_latents)
+        return initial_latents
+
     if denoise == 0.0 and initial_latents is not None:
         print("SDMLX: denoise=0, Initial latents are returned unchanged.")
         mx.eval(initial_latents)
@@ -6439,10 +6852,17 @@ def sample_latents(
 
     if initial_latents is not None:
         init_noise = mx.random.normal(initial_latents.shape).astype(mx.float32)
-        start_sigma = step_plan[0][6]
-        latents = noise_latents_at_sigma(initial_latents, init_noise, start_sigma)
+        if add_noise:
+            start_sigma = step_plan[0][6]
+            latents = noise_latents_at_sigma(initial_latents, init_noise, start_sigma)
+        else:
+            latents = initial_latents
+        if nan_diagnostics:
+            warn_if_nonfinite_mx_array("initial advanced latent", latents)
     else:
         latents = sampler.sample_prior((1, latent_height, latent_width, 4), dtype=mx.float32)
+        if nan_diagnostics:
+            warn_if_nonfinite_mx_array("initial prior latent", latents)
 
     mask = None
     if noise_mask is not None:
@@ -6550,6 +6970,8 @@ def sample_latents(
     previewer, preview_device = get_sdxl_system_previewer() if preview else (None, None)
 
     def run_denoiser(latents_in, timestep, step_percent, step_has_control):
+        if nan_diagnostics:
+            warn_if_nonfinite_mx_array("denoiser input latent", latents_in)
         if dynamic_step_context:
             if ip_adapters:
                 SDMLX_IPADAPTER_CONTEXT["adapters"] = ip_adapters
@@ -6582,6 +7004,9 @@ def sample_latents(
             if step_has_control
             else (None, None)
         )
+        if nan_diagnostics and step_has_control:
+            warn_if_nonfinite_mx_tree("ControlNet down residual", control_down)
+            warn_if_nonfinite_mx_array("ControlNet mid residual", control_mid)
         if profile_unet:
             noise_pred_local = profiled_unet_forward(unet, x_model, t_in, context, pooled, t_ids, profile)
         else:
@@ -6594,10 +7019,14 @@ def sample_latents(
                 control_mid_residual=control_mid,
             )
         noise_pred_local = noise_pred_local.astype(mx.float32)
+        if nan_diagnostics:
+            warn_if_nonfinite_mx_array("UNet noise prediction", noise_pred_local)
 
         if use_cfg:
             eps_pos, eps_neg = mx.split(noise_pred_local, 2)
             noise_pred_local = eps_neg + cfg_value * (eps_pos - eps_neg)
+            if nan_diagnostics:
+                warn_if_nonfinite_mx_array("CFG noise prediction", noise_pred_local)
         return noise_pred_local
 
     old_dpmpp_denoised = None
@@ -6606,6 +7035,7 @@ def sample_latents(
         for i, (t, next_t, step_scale, step_dt, step_noise_scale, step_out_scale, step_sigma, next_sigma) in enumerate(step_plan):
             step_percent = i / max(progress_steps - 1, 1)
             step_has_control = control_active_by_step[i] if control_active_by_step else False
+            global_step = advanced_start_index + i
             if mask is not None:
                 step_mask = active_mask_for_t(t)
                 preserved = noise_latents_at_sigma(initial_latents, init_noise, step_sigma)
@@ -6615,6 +7045,8 @@ def sample_latents(
                 guard_first_noise_pred = None
             else:
                 noise_pred = run_denoiser(latents, t, step_percent, step_has_control)
+            if nan_diagnostics:
+                warn_if_nonfinite_mx_array(f"step {global_step} noise prediction", noise_pred)
 
             denoised_latents = None
             if mask is not None or preview or sampler_name == "dpmpp_2m":
@@ -6651,6 +7083,8 @@ def sample_latents(
                 old_dpmpp_sigma = mx_scalar_float(step_sigma)
             else:
                 latents = apply_sampler_step(noise_pred, latents, step_scale, step_dt, step_noise_scale, step_out_scale)
+            if nan_diagnostics:
+                warn_if_nonfinite_mx_array(f"step {global_step} output latent", latents)
             if mask is not None:
                 step_mask = active_mask_for_t(next_t)
                 preserved = noise_latents_at_sigma(initial_latents, init_noise, next_sigma)
@@ -6716,6 +7150,7 @@ def sample_latents(
 
     if not sync_each_step and not progress_sync_interval:
         mx.eval(latents)
+    warn_if_nonfinite_mx_array("latent", latents)
     release_mlx_cache_memory_after_sampling()
     if terminal_progress or debug_timing:
         print(f"SDMLX: Fast Sampling finished in {time.perf_counter() - start_time:.2f}s.")
@@ -6739,6 +7174,40 @@ def get_vae_decoder(cache_key, vae, compute_dtype, use_compiled):
         log_timing("SDMLX: Compiled VAE decoder created.")
 
     return COMPILED_VAE_DECODERS[key]
+
+
+def sanitize_comfy_image(image):
+    if image.dtype != torch.float32:
+        image = image.float()
+    finite = torch.isfinite(image)
+    if not bool(finite.all()):
+        bad = int((~finite).sum().item())
+        total = int(image.numel())
+        print(f"SDMLX: Decode warning: non-finite IMAGE values sanitized ({bad}/{total}).")
+    image.nan_to_num_(nan=0.0, posinf=1.0, neginf=0.0)
+    image.clamp_(0.0, 1.0)
+    return image
+
+
+def warn_if_nonfinite_mx_array(label, value):
+    finite = mx.isfinite(value)
+    if bool(np.array(mx.all(finite))):
+        return False
+    bad = int(np.array(mx.sum(mx.logical_not(finite))).item())
+    total = int(np.prod(value.shape))
+    print(f"SDMLX: Sampling warning: non-finite {label} values detected ({bad}/{total}).")
+    return True
+
+
+def warn_if_nonfinite_mx_tree(label, values):
+    if values is None:
+        return False
+    if isinstance(values, (list, tuple)):
+        found = False
+        for index, item in enumerate(values):
+            found = warn_if_nonfinite_mx_tree(f"{label}[{index}]", item) or found
+        return found
+    return warn_if_nonfinite_mx_array(label, values)
 
 
 def decode_latents(mlx_vae, latents, compile_vae=False, vae_dtype="float32", debug_timing=False):
@@ -6766,6 +7235,7 @@ def decode_latents(mlx_vae, latents, compile_vae=False, vae_dtype="float32", deb
 
         torch_start = time.perf_counter()
         image = torch.from_numpy(pixels_np)
+        image = sanitize_comfy_image(image)
         torch_elapsed = time.perf_counter() - torch_start
         release_mlx_cache_memory_after_decode()
 
@@ -6788,6 +7258,7 @@ def decode_latents(mlx_vae, latents, compile_vae=False, vae_dtype="float32", deb
         pixels = pixels[0]
     pixels = mx.clip((pixels + 1.0) / 2.0, 0.0, 1.0)
     image = torch.from_numpy(np.array(pixels).astype(np.float32))
+    image = sanitize_comfy_image(image)
     release_mlx_cache_memory_after_decode()
     log_timing(
         f"SDMLX: Fast Decode finished in {time.perf_counter() - start_time:.2f}s "
@@ -6867,6 +7338,7 @@ def decode_latents_tiled(
             pixels = mx.clip((pixels + 1.0) / 2.0, 0.0, 1.0)
             tile_np = np.array(pixels).astype(np.float32)
             tile_t = torch.from_numpy(tile_np)
+            tile_t = sanitize_comfy_image(tile_t)
             py0 = y0 * 8
             py1 = y1 * 8
             px0 = x0 * 8
@@ -6892,7 +7364,7 @@ def decode_latents_tiled(
         f"(tiles={decoded_tiles}, tile={tile_latents * 8}px, overlap={overlap_latents * 8}px, "
         f"compile_vae={compile_vae}, vae_dtype={vae_dtype})."
     )
-    return torch.clamp(out, 0.0, 1.0)
+    return sanitize_comfy_image(out)
 
 
 def decode_latents_quiet(mlx_vae, latents, compile_vae=True, vae_dtype="float32"):
@@ -6903,6 +7375,7 @@ def decode_latents_quiet(mlx_vae, latents, compile_vae=True, vae_dtype="float32"
         pixels = pixels[0]
     pixels = mx.clip((pixels + 1.0) / 2.0, 0.0, 1.0)
     image = torch.from_numpy(np.array(pixels).astype(np.float32))
+    image = sanitize_comfy_image(image)
     release_mlx_cache_memory_after_decode()
     return image
 
@@ -7282,6 +7755,282 @@ def precision_dtype(name):
 # --- NODES ---
 
 
+class SDMLX_LoadImageAdvanced:
+    upscale_methods = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"]
+    scale_modes = ["original", "megapixels", "max_side", "fixed", "scale_by"]
+
+    @classmethod
+    def INPUT_TYPES(s):
+        import folder_paths
+
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+        files = folder_paths.filter_files_content_types(files, ["image"])
+        return {"required": {
+            "image": (sorted(files), {"image_upload": True}),
+            "scale_mode": (s.scale_modes, {"default": "original"}),
+            "upscale_method": (s.upscale_methods, {"default": "lanczos"}),
+            "mask_method": (s.upscale_methods, {"default": "nearest-exact"}),
+            "megapixels": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 64.0, "step": 0.01}),
+            "max_side": ("INT", {"default": 1024, "min": 1, "max": 8192, "step": 1}),
+            "allow_upscale": ("BOOLEAN", {"default": False}),
+            "width": ("INT", {"default": 1024, "min": 1, "max": 8192, "step": 1}),
+            "height": ("INT", {"default": 1024, "min": 1, "max": 8192, "step": 1}),
+            "scale_by": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 8.0, "step": 0.01}),
+            "multiple": ("INT", {"default": 1, "min": 1, "max": 128, "step": 1}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT")
+    RETURN_NAMES = ("image", "mask", "width", "height")
+    FUNCTION = "load_image"
+    CATEGORY = "SDMLX/Image"
+
+    @staticmethod
+    def _align_dimension(value, multiple):
+        value = max(1, int(round(value)))
+        multiple = max(1, int(multiple))
+        if multiple <= 1:
+            return value
+        return max(multiple, value - (value % multiple))
+
+    @classmethod
+    def _target_size(cls, original_width, original_height, scale_mode, megapixels,
+                     max_side, allow_upscale, width, height, scale_by, multiple):
+        original_width = max(1, int(original_width))
+        original_height = max(1, int(original_height))
+        if scale_mode == "original":
+            target_width, target_height = original_width, original_height
+        elif scale_mode == "megapixels":
+            target_pixels = max(1.0, float(megapixels) * 1024.0 * 1024.0)
+            factor = math.sqrt(target_pixels / float(original_width * original_height))
+            if not allow_upscale:
+                factor = min(1.0, factor)
+            if factor == 1.0:
+                return original_width, original_height
+            target_width = original_width * factor
+            target_height = original_height * factor
+        elif scale_mode == "max_side":
+            side = max(1, int(max_side))
+            current_side = max(original_width, original_height)
+            factor = side / float(current_side)
+            if not allow_upscale:
+                factor = min(1.0, factor)
+            if factor == 1.0:
+                return original_width, original_height
+            target_width = original_width * factor
+            target_height = original_height * factor
+        elif scale_mode == "fixed":
+            target_width, target_height = int(width), int(height)
+        elif scale_mode == "scale_by":
+            factor = max(0.01, float(scale_by))
+            if not allow_upscale:
+                factor = min(1.0, factor)
+            if factor == 1.0:
+                return original_width, original_height
+            target_width = original_width * factor
+            target_height = original_height * factor
+        else:
+            target_width, target_height = original_width, original_height
+
+        if scale_mode == "original":
+            return original_width, original_height
+        return (
+            cls._align_dimension(target_width, multiple),
+            cls._align_dimension(target_height, multiple),
+        )
+
+    @staticmethod
+    def _load_like_comfy(image):
+        import comfy.model_management
+        import folder_paths
+        import node_helpers
+        from PIL import ImageOps, ImageSequence
+
+        image_path = folder_paths.get_annotated_filepath(image)
+        dtype = comfy.model_management.intermediate_dtype()
+        device = comfy.model_management.intermediate_device()
+
+        img = node_helpers.pillow(Image.open, image_path)
+        output_images = []
+        output_masks = []
+        w, h = None, None
+
+        for frame in ImageSequence.Iterator(img):
+            frame = node_helpers.pillow(ImageOps.exif_transpose, frame)
+            rgb = frame.convert("RGB")
+
+            if len(output_images) == 0:
+                w, h = rgb.size
+            if rgb.size[0] != w or rgb.size[1] != h:
+                continue
+
+            image_np = np.array(rgb).astype(np.float32) / 255.0
+            image_tensor = torch.from_numpy(image_np)[None,]
+            if "A" in frame.getbands():
+                mask_np = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
+                mask_tensor = 1.0 - torch.from_numpy(mask_np)
+            else:
+                mask_tensor = torch.zeros((h, w), dtype=torch.float32, device="cpu")
+
+            output_images.append(image_tensor.to(dtype=dtype))
+            output_masks.append(mask_tensor.unsqueeze(0).to(dtype=dtype))
+
+        if not output_images:
+            raise ValueError(f"SDMLX Load Image Advanced: no readable image frames in {image_path}")
+
+        output_image = torch.cat(output_images, dim=0).to(device=device, dtype=dtype)
+        output_mask = torch.cat(output_masks, dim=0).to(device=device, dtype=dtype)
+        return output_image, output_mask
+
+    @staticmethod
+    def _scale_image_and_mask(image, mask, width, height, upscale_method, mask_method):
+        import comfy.utils
+
+        current_height = int(image.shape[1])
+        current_width = int(image.shape[2])
+        if current_width != width or current_height != height:
+            image = comfy.utils.common_upscale(
+                image.movedim(-1, 1),
+                width,
+                height,
+                upscale_method,
+                "disabled",
+            ).movedim(1, -1)
+
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        mask_height = int(mask.shape[-2])
+        mask_width = int(mask.shape[-1])
+        if mask_width != width or mask_height != height:
+            mask = comfy.utils.common_upscale(
+                mask.unsqueeze(1),
+                width,
+                height,
+                mask_method,
+                "disabled",
+            ).squeeze(1)
+        mask = torch.clamp(mask, 0.0, 1.0)
+        return image, mask
+
+    def load_image(self, image, scale_mode="original", upscale_method="lanczos",
+                   mask_method="nearest-exact", megapixels=1.0, max_side=1024,
+                   allow_upscale=False, width=1024, height=1024, scale_by=1.0,
+                   multiple=1):
+        image_tensor, mask_tensor = self._load_like_comfy(image)
+        original_height = int(image_tensor.shape[1])
+        original_width = int(image_tensor.shape[2])
+        target_width, target_height = self._target_size(
+            original_width,
+            original_height,
+            scale_mode,
+            megapixels,
+            max_side,
+            allow_upscale,
+            width,
+            height,
+            scale_by,
+            multiple,
+        )
+        image_tensor, mask_tensor = self._scale_image_and_mask(
+            image_tensor,
+            mask_tensor,
+            target_width,
+            target_height,
+            upscale_method,
+            mask_method,
+        )
+        return (image_tensor, mask_tensor, target_width, target_height)
+
+    @classmethod
+    def IS_CHANGED(s, image, scale_mode="original", upscale_method="lanczos",
+                   mask_method="nearest-exact", megapixels=1.0, max_side=1024,
+                   allow_upscale=False, width=1024, height=1024, scale_by=1.0,
+                   multiple=1):
+        import folder_paths
+
+        image_path = folder_paths.get_annotated_filepath(image)
+        m = hashlib.sha256()
+        with open(image_path, "rb") as f:
+            m.update(f.read())
+        params = json.dumps({
+            "scale_mode": scale_mode,
+            "upscale_method": upscale_method,
+            "mask_method": mask_method,
+            "megapixels": float(megapixels),
+            "max_side": int(max_side),
+            "allow_upscale": bool(allow_upscale),
+            "width": int(width),
+            "height": int(height),
+            "scale_by": float(scale_by),
+            "multiple": int(multiple),
+        }, sort_keys=True).encode("utf-8")
+        m.update(params)
+        return m.digest().hex()
+
+    @classmethod
+    def VALIDATE_INPUTS(s, image, **kwargs):
+        import folder_paths
+
+        if not folder_paths.exists_annotated_filepath(image):
+            return "Invalid image file: {}".format(image)
+        return True
+
+
+class SDMLX_LoadImageScale:
+    @classmethod
+    def INPUT_TYPES(s):
+        import folder_paths
+
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+        files = folder_paths.filter_files_content_types(files, ["image"])
+        return {"required": {
+            "image": (sorted(files), {"image_upload": True}),
+            "scale_to_mp": ("FLOAT", {"default": 1.00, "min": 0.01, "max": 64.0, "step": 0.01}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "load_image"
+    CATEGORY = "SDMLX/Image"
+
+    def load_image(self, image, scale_to_mp=1.0):
+        image_tensor, mask_tensor, _width, _height = SDMLX_LoadImageAdvanced().load_image(
+            image=image,
+            scale_mode="megapixels",
+            upscale_method="lanczos",
+            mask_method="nearest-exact",
+            megapixels=scale_to_mp,
+            max_side=1024,
+            allow_upscale=True,
+            width=1024,
+            height=1024,
+            scale_by=1.0,
+            multiple=16,
+        )
+        return image_tensor, mask_tensor
+
+    @classmethod
+    def IS_CHANGED(s, image, scale_to_mp=1.0):
+        return SDMLX_LoadImageAdvanced.IS_CHANGED(
+            image=image,
+            scale_mode="megapixels",
+            upscale_method="lanczos",
+            mask_method="nearest-exact",
+            megapixels=scale_to_mp,
+            max_side=1024,
+            allow_upscale=True,
+            width=1024,
+            height=1024,
+            scale_by=1.0,
+            multiple=16,
+        )
+
+    @classmethod
+    def VALIDATE_INPUTS(s, image, **kwargs):
+        return SDMLX_LoadImageAdvanced.VALIDATE_INPUTS(image=image, **kwargs)
+
+
 class SDMLX_GaussianBlurMask:
     @classmethod
     def INPUT_TYPES(s):
@@ -7306,37 +8055,101 @@ class SDMLX_GaussianBlurMask:
 class SDMLX_LoaderUniversal:
     @classmethod
     def INPUT_TYPES(s):
+        global SDMLX_CHECKPOINT_DISPLAY_TO_PATH
         try:
-            import folder_paths
-            checkpoint_names = [SDMLX_SELECT_CHECKPOINT] + list(folder_paths.get_filename_list("checkpoints"))
+            checkpoint_names, SDMLX_CHECKPOINT_DISPLAY_TO_PATH = sdmlx_checkpoint_display_options()
         except Exception:
             checkpoint_names = [SDMLX_SELECT_CHECKPOINT]
+            SDMLX_CHECKPOINT_DISPLAY_TO_PATH = {}
         return {"required": {
             "ckpt_name": (checkpoint_names,),
             "memory_assist": (MEMORY_ASSIST_OPTIONS, {"default": "auto"}),
         }}
 
-    RETURN_TYPES = ("MLX_MODEL", "MLX_CLIP", "MLX_VAE")
+    RETURN_TYPES = ("sdmlx_model", "mlx_clip", "mlx_vae")
+    RETURN_NAMES = ("sdmlx_model", "mlx_clip", "mlx_vae")
     FUNCTION = "load_ckpt"
     CATEGORY = "SDMLX/Loaders"
 
-    def load_ckpt(self, ckpt_name, memory_assist="auto"):
-        if not ckpt_name or ckpt_name == SDMLX_SELECT_CHECKPOINT:
-            raise ValueError("SDMLX: Please select an SDXL checkpoint first.")
+    def load_ckpt(self, ckpt_name, memory_assist="auto", sdmlx_package=SDMLX_SELECT_PACKAGE):
         import folder_paths
         from comfy.utils import load_torch_file
 
         total_start = time.perf_counter()
+        if memory_assist not in MEMORY_ASSIST_OPTIONS and sdmlx_package in MEMORY_ASSIST_OPTIONS:
+            memory_assist, sdmlx_package = sdmlx_package, memory_assist
         memory_assist = set_memory_assist(memory_assist)
         preload = memory_assist == "max_performance"
-        path = folder_paths.get_full_path("checkpoints", ckpt_name)
+        if sdmlx_package and sdmlx_package not in {SDMLX_SELECT_PACKAGE, "<no .sdmlx packages found>"}:
+            if str(sdmlx_package).startswith(f"{SDMLX_PACKAGE_MENU_PREFIX}/"):
+                sdmlx_package = str(sdmlx_package)[len(f"{SDMLX_PACKAGE_MENU_PREFIX}/"):]
+            package_path = os.path.join(cache_dir(), sdmlx_package)
+            if not os.path.isdir(package_path):
+                raise FileNotFoundError(f"SDMLX: Package not found: {sdmlx_package}")
+            return load_sdmlx_package(package_path, preload=preload)
+
+        if not ckpt_name or ckpt_name == SDMLX_SELECT_CHECKPOINT:
+            raise ValueError("SDMLX: Please select a checkpoint or .sdmlx package first.")
+        selected_package = sdmlx_package_from_model_selection(ckpt_name)
+        if selected_package:
+            package_path = os.path.join(cache_dir(), selected_package)
+            if not os.path.isdir(package_path):
+                raise FileNotFoundError(f"SDMLX: Package not found: {selected_package}")
+            return load_sdmlx_package(package_path, preload=preload)
+        checkpoint_path_name = SDMLX_CHECKPOINT_DISPLAY_TO_PATH.get(ckpt_name, ckpt_name)
+        is_diffusion_model_selection = str(checkpoint_path_name or "").startswith("diffusion_models/")
+        path = sdmlx_resolve_checkpoint_path(checkpoint_path_name)
+        if path is None:
+            raise FileNotFoundError(f"SDMLX: checkpoint not found: {checkpoint_path_name}")
+        try:
+            from .flux2_nodes import (
+                flux2_model_from_checkpoint,
+                flux2_placeholders_from_model_root,
+                is_flux2_checkpoint_file,
+            )
+
+            if path and is_flux2_checkpoint_file(path):
+                model = flux2_model_from_checkpoint(path, preload=preload, name=checkpoint_path_name)
+                log_timing(
+                    "SDMLX Loader Universal: FLUX.2 Klein checkpoint "
+                    f"{os.path.basename(checkpoint_path_name)} -> package {os.path.basename(model['model_path'])}"
+                )
+                mlx_clip, mlx_vae = flux2_placeholders_from_model_root(model["model_path"])
+                return (model, mlx_clip, mlx_vae)
+        except Exception as exc:
+            lowered = f"{checkpoint_path_name} {path}".lower()
+            if "flux2" in lowered or "flux.2" in lowered or "klein" in lowered:
+                raise RuntimeError(f"SDMLX FLUX.2 Klein: checkpoint could not be prepared: {checkpoint_path_name}") from exc
+        try:
+            from .qwen_nodes import (
+                is_qwen_checkpoint_file,
+                qwen_model_from_checkpoint,
+                qwen_placeholders_from_model_root,
+            )
+
+            if path and is_qwen_checkpoint_file(path):
+                model = qwen_model_from_checkpoint(path, preload=preload, name=checkpoint_path_name)
+                mlx_clip, mlx_vae = qwen_placeholders_from_model_root(model["model_path"])
+                log_timing(
+                    "SDMLX Loader Universal: Qwen checkpoint "
+                    f"{os.path.basename(checkpoint_path_name)} -> runtime root {os.path.basename(model['model_path'])}"
+                )
+                return (model, mlx_clip, mlx_vae)
+        except Exception as exc:
+            if path and ("qwen" in str(checkpoint_path_name).lower() or "qwen" in str(path).lower()):
+                raise RuntimeError(f"SDMLX Qwen: checkpoint could not be prepared: {checkpoint_path_name}") from exc
+        if is_diffusion_model_selection:
+            raise RuntimeError(
+                "SDMLX Loader Universal: this diffusion model is not yet supported by the universal MLX package path. "
+                "FLUX.2 Klein and Qwen diffusion checkpoints are supported here; use SDMLX Load Diffusion Model for FLUX.1."
+            )
         package_path, identity = checkpoint_cache_package(path)
         try:
             return load_sdmlx_package(package_path, preload=preload)
         except FileNotFoundError:
             pass
 
-        print(f"SDMLX: Analyzing and converting weights from {ckpt_name}...")
+        print(f"SDMLX: Analyzing and converting weights from {os.path.basename(checkpoint_path_name)}...")
         load_start = time.perf_counter()
         torch_sd = load_torch_file(path)
         load_time = time.perf_counter() - load_start
@@ -7344,7 +8157,7 @@ class SDMLX_LoaderUniversal:
         split_start = time.perf_counter()
         validate_sdxl_checkpoint_keys(torch_sd)
         groups = split_sdxl_checkpoint(torch_sd)
-        validate_text_encoder_weight_groups(groups, ckpt_name)
+        validate_text_encoder_weight_groups(groups, checkpoint_path_name)
         split_time = time.perf_counter() - split_start
 
         os.makedirs(package_path, exist_ok=True)
@@ -7391,7 +8204,8 @@ class SDMLX_Loader:
             "memory_assist": (MEMORY_ASSIST_OPTIONS, {"default": "auto"}),
         }}
 
-    RETURN_TYPES = ("MLX_MODEL", "MLX_CLIP", "MLX_VAE")
+    RETURN_TYPES = ("sdmlx_model", "mlx_clip", "mlx_vae")
+    RETURN_NAMES = ("sdmlx_model", "mlx_clip", "mlx_vae")
     FUNCTION = "load_package"
     CATEGORY = "SDMLX/Loaders"
 
@@ -7406,21 +8220,187 @@ class SDMLX_Loader:
         return load_sdmlx_package(package_path, preload=preload)
 
 
+class SDMLX_CLIPLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        global SDMLX_TEXT_ENCODER_DISPLAY_TO_PATH
+        try:
+            text_encoder_names, SDMLX_TEXT_ENCODER_DISPLAY_TO_PATH = sdmlx_text_encoder_display_options()
+        except Exception:
+            text_encoder_names = []
+            SDMLX_TEXT_ENCODER_DISPLAY_TO_PATH = {}
+        if not text_encoder_names:
+            text_encoder_names = ["<no text encoder files found>"]
+        return {"required": {
+            "text_encoder_name": (text_encoder_names,),
+            "type": (["qwen_image", "flux2"],),
+        }}
+
+    RETURN_TYPES = ("mlx_clip",)
+    RETURN_NAMES = ("mlx_clip",)
+    FUNCTION = "load_clip"
+    CATEGORY = "SDMLX/Loaders"
+
+    def load_clip(self, text_encoder_name, type="qwen_image"):
+        if not text_encoder_name or str(text_encoder_name).startswith("<"):
+            raise FileNotFoundError("SDMLX CLIP Loader: No text encoder selected.")
+        path, _folder_name, resolved_name = sdmlx_text_encoder_path(text_encoder_name)
+
+        clip_type = str(type or "").strip().lower()
+        if clip_type == "flux2":
+            from .flux2_nodes import flux2_clip_from_text_encoder, is_flux2_text_encoder_file
+
+            if is_flux2_text_encoder_file(path):
+                return (flux2_clip_from_text_encoder(path, name=resolved_name),)
+            raise RuntimeError(
+                "SDMLX CLIP Loader: selected text encoder does not match type=flux2. "
+                "Choose a FLUX.2 Klein Qwen3 text encoder or switch the loader type."
+            )
+
+        if clip_type == "qwen_image":
+            if not is_qwen_text_encoder_file(path):
+                raise RuntimeError(
+                    "SDMLX CLIP Loader: selected text encoder does not match type=qwen_image. "
+                    "Choose a Qwen Image/Edit text encoder or switch the loader type."
+                )
+            from .qwen_nodes import qwen_clip_from_text_encoder
+
+            log_timing(f"SDMLX CLIP Loader: Qwen text encoder {resolved_name}")
+            return (qwen_clip_from_text_encoder(path, name=resolved_name),)
+
+        raise RuntimeError(
+            f"SDMLX CLIP Loader: unsupported type={type!r}. Supported single-encoder types are qwen_image and flux2."
+        )
+
+
+def _sdmlx_file_identity_token(path):
+    try:
+        stat = os.stat(path)
+        return f"{os.path.realpath(path)}:{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        return str(path)
+
+
+def _sdmlx_sdxl_clip_role(weights, label):
+    keys = set(weights.keys())
+    if (
+        "text_model.encoder.layers.30.mlp.fc1.weight" in keys
+        or "transformer.resblocks.30.mlp.c_fc.weight" in keys
+        or "text_projection.weight" in keys
+        or "text_projection" in keys
+    ):
+        return "clip_g"
+    if (
+        "text_model.encoder.layers.11.mlp.fc1.weight" in keys
+        or "transformer.resblocks.11.mlp.c_fc.weight" in keys
+    ) and (
+        "text_model.embeddings.token_embedding.weight" in keys
+        or "token_embedding.weight" in keys
+    ):
+        return "clip_l"
+    raise RuntimeError(
+        "SDMLX Dual CLIP Loader: could not identify SDXL text encoder role "
+        f"for {label}. Select one CLIP-L file and one CLIP-G file."
+    )
+
+
+def _sdmlx_load_sdxl_clip_raw(path):
+    from comfy.utils import load_torch_file
+
+    return load_torch_file(path, safe_load=True)
+
+
+def _sdmlx_convert_sdxl_clip_weights(weights, label):
+    try:
+        return {key: to_mlx(value, dtype=mx.float16) for key, value in weights.items()}
+    except Exception as exc:
+        raise RuntimeError(f"SDMLX Dual CLIP Loader: could not convert SDXL text encoder {label}: {exc}") from exc
+
+
+class SDMLX_DualCLIPLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        global SDMLX_TEXT_ENCODER_DISPLAY_TO_PATH
+        try:
+            text_encoder_names, SDMLX_TEXT_ENCODER_DISPLAY_TO_PATH = sdmlx_text_encoder_display_options()
+        except Exception:
+            text_encoder_names = []
+            SDMLX_TEXT_ENCODER_DISPLAY_TO_PATH = {}
+        if not text_encoder_names:
+            text_encoder_names = ["<no text encoder files found>"]
+        return {"required": {
+            "clip_name1": (text_encoder_names,),
+            "clip_name2": (text_encoder_names,),
+            "type": (["sdxl", "flux"],),
+        }}
+
+    RETURN_TYPES = ("mlx_clip",)
+    RETURN_NAMES = ("mlx_clip",)
+    FUNCTION = "load_clip"
+    CATEGORY = "SDMLX/Loaders"
+
+    def load_clip(self, clip_name1, clip_name2, type="sdxl"):
+        if not clip_name1 or str(clip_name1).startswith("<") or not clip_name2 or str(clip_name2).startswith("<"):
+            raise FileNotFoundError("SDMLX Dual CLIP Loader: select two text encoders.")
+
+        clip_type = str(type or "").strip().lower()
+        if clip_type == "flux":
+            from .flux_nodes import _SDMLXFluxDualCLIPLoaderImpl
+
+            return _SDMLXFluxDualCLIPLoaderImpl().load_clip(clip_name1, clip_name2)
+
+        if clip_type != "sdxl":
+            raise RuntimeError(
+                f"SDMLX Dual CLIP Loader: unsupported type={type!r}. Supported dual-encoder types are sdxl and flux."
+            )
+
+        path1, _folder1, resolved1 = sdmlx_text_encoder_path(clip_name1)
+        path2, _folder2, resolved2 = sdmlx_text_encoder_path(clip_name2)
+        raw1 = _sdmlx_load_sdxl_clip_raw(path1)
+        raw2 = _sdmlx_load_sdxl_clip_raw(path2)
+        role1 = _sdmlx_sdxl_clip_role(raw1, resolved1)
+        role2 = _sdmlx_sdxl_clip_role(raw2, resolved2)
+        if role1 == role2:
+            raise RuntimeError(
+                "SDMLX Dual CLIP Loader: SDXL requires one CLIP-L and one CLIP-G text encoder; "
+                f"both selected files look like {role1}."
+            )
+        groups = {
+            role1: _sdmlx_convert_sdxl_clip_weights(raw1, resolved1),
+            role2: _sdmlx_convert_sdxl_clip_weights(raw2, resolved2),
+        }
+        validate_text_encoder_weight_groups(groups, f"{resolved1} + {resolved2}")
+        cache_key = (
+            "sdxl-dual",
+            _sdmlx_file_identity_token(path1),
+            _sdmlx_file_identity_token(path2),
+        )
+        return ({
+            "type": "sdxl",
+            "clip_l": groups["clip_l"],
+            "clip_g": groups["clip_g"],
+            "clip_name1": str(resolved1),
+            "clip_name2": str(resolved2),
+            "cache_key": cache_key,
+        },)
+
+
 class SDMLX_VAELoader:
     @classmethod
     def INPUT_TYPES(s):
+        global SDMLX_VAE_DISPLAY_TO_PATH
         try:
-            import folder_paths
-            vae_names = list(folder_paths.get_filename_list("vae"))
+            vae_names, SDMLX_VAE_DISPLAY_TO_PATH = sdmlx_vae_display_options()
         except Exception:
             vae_names = []
+            SDMLX_VAE_DISPLAY_TO_PATH = {}
         if not vae_names:
             vae_names = ["<no VAE files found>"]
         return {"required": {
             "vae_name": (vae_names,),
         }}
 
-    RETURN_TYPES = ("MLX_VAE",)
+    RETURN_TYPES = ("mlx_vae",)
     RETURN_NAMES = ("mlx_vae",)
     FUNCTION = "load_vae"
     CATEGORY = "SDMLX/Loaders"
@@ -7428,11 +8408,35 @@ class SDMLX_VAELoader:
     def load_vae(self, vae_name):
         if not vae_name or str(vae_name).startswith("<"):
             raise FileNotFoundError("SDMLX: No VAE file selected.")
-        import folder_paths
+        path, _folder_name, resolved_name = sdmlx_vae_path(vae_name)
+        try:
+            from .flux2_nodes import flux2_vae_from_file, is_flux2_vae_file
 
-        path = folder_paths.get_full_path_or_raise("vae", vae_name)
+            if is_flux2_vae_file(path):
+                return (flux2_vae_from_file(path, name=resolved_name),)
+        except Exception as exc:
+            if "flux2" in str(vae_name).lower() or "flux.2" in str(vae_name).lower() or "klein" in str(vae_name).lower():
+                raise RuntimeError(f"SDMLX FLUX.2 Klein VAE: could not load selected VAE: {vae_name}") from exc
+        if is_flux_vae_file(path):
+            from .flux_nodes import VAE_DTYPE, _load_flux_vae
+
+            return ({
+                "type": "flux",
+                "name": vae_name,
+                "cache_key": path,
+                "dtype": VAE_DTYPE,
+                "flux_vae": _load_flux_vae(vae_name, VAE_DTYPE),
+            },)
+        try:
+            from .qwen_nodes import is_qwen_vae_file, qwen_vae_from_file
+
+            if is_qwen_vae_file(path):
+                return (qwen_vae_from_file(path, name=vae_name),)
+        except Exception as exc:
+            if "qwen" in str(vae_name).lower() or "qwen" in str(path).lower():
+                raise RuntimeError(f"SDMLX Qwen VAE: could not load selected VAE: {vae_name}") from exc
         weights = load_external_vae_weights(path, dtype=mx.float16)
-        return ({"weights": weights, "cache_key": path},)
+        return ({"type": "sdxl", "weights": weights, "cache_key": path},)
 
 
 class SDMLX_ControlNetUnionLoader:
@@ -7443,7 +8447,7 @@ class SDMLX_ControlNetUnionLoader:
             "control_net_name": (models,),
         }}
 
-    RETURN_TYPES = ("MLX_CONTROLNET",)
+    RETURN_TYPES = ("mlx_controlnet",)
     RETURN_NAMES = ("mlx_controlnet",)
     FUNCTION = "load_controlnet"
     CATEGORY = "SDMLX/ControlNet"
@@ -7475,9 +8479,9 @@ class SDMLX_ApplyControlNet:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "positive": ("MLX_CONDITIONING",),
-            "negative": ("MLX_CONDITIONING",),
-            "mlx_controlnet": ("MLX_CONTROLNET",),
+            "positive": ("mlx_conditioning",),
+            "negative": ("mlx_conditioning",),
+            "mlx_controlnet": ("mlx_controlnet",),
             "control_image": ("IMAGE",),
             "control_type": (list(UNION_CONTROL_TYPES.keys()), {"default": "line to canny"}),
             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.01}),
@@ -7485,10 +8489,10 @@ class SDMLX_ApplyControlNet:
             "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
             "resize_mode": (["crop center", "crop top", "fit pad", "stretch"], {"default": "crop center"}),
         }, "optional": {
-            "controlnet_scheduler": ("SDMLX_SCHEDULE",),
+            "controlnet_scheduler": ("sdmlx_schedule",),
         }}
 
-    RETURN_TYPES = ("MLX_CONDITIONING", "MLX_CONDITIONING")
+    RETURN_TYPES = ("mlx_conditioning", "mlx_conditioning")
     RETURN_NAMES = ("positive", "negative")
     FUNCTION = "apply_controlnet"
     CATEGORY = "SDMLX/ControlNet"
@@ -7543,31 +8547,27 @@ class SDMLX_ApplyControlNet:
 class SDMLX_LoraLoader:
     @classmethod
     def INPUT_TYPES(s):
-        try:
-            import folder_paths
-            lora_names = [MULTI_LORA_NONE] + list(folder_paths.get_filename_list("loras"))
-        except Exception:
-            lora_names = [MULTI_LORA_NONE]
+        lora_names = lora_file_options_with_none()
         return {
             "required": {
-                "mlx_model": (SDMLX_MODEL_TYPE,),
+                "sdmlx_model": (SDMLX_MODEL_TYPE,),
                 "lora_name": (lora_names,),
                 "strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05}),
                 "enabled": ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "lora_scheduler": ("SDMLX_SCHEDULE",),
+                "lora_scheduler": ("sdmlx_schedule",),
             },
         }
 
     RETURN_TYPES = (SDMLX_MODEL_TYPE,)
     RETURN_NAMES = ("sdmlx_model",)
     FUNCTION = "load_lora"
-    CATEGORY = "SDMLX"
+    CATEGORY = "SDMLX/LoRA"
 
     def load_lora(
         self,
-        mlx_model,
+        sdmlx_model,
         lora_name=None,
         strength=1.0,
         enabled=True,
@@ -7575,6 +8575,7 @@ class SDMLX_LoraLoader:
     ):
         import folder_paths
 
+        mlx_model = sdmlx_model
         if not enabled or not lora_name or lora_name == MULTI_LORA_NONE:
             log_timing(f"SDMLX: LoRA disabled: {lora_name}")
             return (mlx_model,)
@@ -7595,6 +8596,61 @@ class SDMLX_LoraLoader:
             path = folder_paths.get_full_path("loras", lora_name)
             if path is None:
                 raise FileNotFoundError(f"SDMLX: LoRA not found: {lora_name}")
+
+        try:
+            from .flux2_nodes import is_flux2_sdmlx_model
+        except Exception:
+            is_flux2_sdmlx_model = None
+
+        if is_flux2_sdmlx_model is not None and is_flux2_sdmlx_model(mlx_model):
+            if schedule is not None:
+                log_timing("SDMLX: LoRA schedule is not supported for FLUX.2; using the current effective strength.")
+            model_loras = list(mlx_model.get("loras", []))
+            if effective_strength_model != 0.0:
+                model_loras.append(
+                    {
+                        "name": lora_name,
+                        "path": os.path.abspath(path),
+                        "strength_model": effective_strength_model,
+                        "identity": lora_file_identity(path),
+                    }
+                )
+            patched_model = {**mlx_model, "loras": model_loras}
+            log_timing(
+                f"SDMLX: FLUX.2 LoRA stack extended: {lora_name} "
+                f"(strength={effective_strength_model:g}, total={len(model_loras)})."
+            )
+            return (patched_model,)
+
+        try:
+            from .qwen_nodes import is_qwen_sdmlx_model
+        except Exception:
+            is_qwen_sdmlx_model = None
+
+        if is_qwen_sdmlx_model is not None and is_qwen_sdmlx_model(mlx_model):
+            if schedule is not None:
+                log_timing("SDMLX: LoRA schedule is not supported for Qwen; using the current effective strength.")
+            model_loras = list(mlx_model.get("loras", []))
+            if str(mlx_model.get("qwen_variant") or "").strip().lower() == "qwen-image" and not mlx_model.get("qwen_lora_policy"):
+                mod_lora_scale = 1.0
+            else:
+                mod_lora_scale = float(mlx_model.get("mod_lora_scale") or 0.0)
+            if effective_strength_model != 0.0:
+                model_loras.append(
+                    {
+                        "name": lora_name,
+                        "path": os.path.abspath(path),
+                        "strength_model": effective_strength_model,
+                        "mod_lora_scale": mod_lora_scale,
+                        "identity": lora_file_identity(path),
+                    }
+                )
+            patched_model = {**mlx_model, "loras": model_loras}
+            log_timing(
+                f"SDMLX: Qwen LoRA stack extended: {lora_name} "
+                f"(strength={effective_strength_model:g}, mod={mod_lora_scale:g}, total={len(model_loras)})."
+            )
+            return (patched_model,)
 
         model_loras = list(mlx_model.get("loras", []))
         if effective_strength_model != 0.0:
@@ -7631,6 +8687,7 @@ MULTI_LORA_NONE = ""
 def lora_file_options_with_none():
     try:
         import folder_paths
+        refresh_folder_path_cache("loras")
         return [MULTI_LORA_NONE] + list(folder_paths.get_filename_list("loras"))
     except Exception:
         return [MULTI_LORA_NONE]
@@ -7650,7 +8707,7 @@ class SDMLX_MultiLoraLoader:
     @classmethod
     def INPUT_TYPES(s):
         required = {
-            "mlx_model": (SDMLX_MODEL_TYPE,),
+            "sdmlx_model": (SDMLX_MODEL_TYPE,),
         }
         loras = lora_file_options_with_none()
         required["slot_count"] = ("INT", {"default": 1, "min": 1, "max": MULTI_LORA_SLOT_COUNT, "socketless": True})
@@ -7663,11 +8720,12 @@ class SDMLX_MultiLoraLoader:
     RETURN_TYPES = (SDMLX_MODEL_TYPE,)
     RETURN_NAMES = ("sdmlx_model",)
     FUNCTION = "load_loras"
-    CATEGORY = "SDMLX"
+    CATEGORY = "SDMLX/LoRA"
 
-    def load_loras(self, mlx_model, **kwargs):
+    def load_loras(self, sdmlx_model, **kwargs):
         from .flux_nodes import SDMLXFluxNativeModel, _apply_flux_lora
 
+        mlx_model = sdmlx_model
         if isinstance(mlx_model, SDMLXFluxNativeModel):
             patched_model = mlx_model
             added = []
@@ -7686,6 +8744,83 @@ class SDMLX_MultiLoraLoader:
                 added.append(f"#{index} {lora_name} strength={strength_model:g}")
             if added:
                 log_timing(f"SDMLX: Multi LoRA FLUX stack extended ({len(added)} LoRAs): " + "; ".join(added))
+            else:
+                log_timing("SDMLX: Multi LoRA Loader: no active LoRA selected.")
+            return (patched_model,)
+
+        try:
+            from .flux2_nodes import is_flux2_sdmlx_model
+        except Exception:
+            is_flux2_sdmlx_model = None
+
+        if is_flux2_sdmlx_model is not None and is_flux2_sdmlx_model(mlx_model):
+            model_loras = list(mlx_model.get("loras", []))
+            added = []
+            slot_count = int(kwargs.get("slot_count", 1))
+            slot_count = max(1, min(MULTI_LORA_SLOT_COUNT, slot_count))
+            for index in range(1, slot_count + 1):
+                if not bool(kwargs.get(f"enabled_{index}", True)):
+                    continue
+                lora_name = kwargs.get(f"lora_{index}", MULTI_LORA_NONE)
+                if not lora_name or lora_name == MULTI_LORA_NONE:
+                    continue
+                strength_model = float(kwargs.get(f"strength_{index}", 1.0))
+                if strength_model == 0.0:
+                    continue
+                path = resolve_lora_path_or_raise(lora_name)
+                model_loras.append(
+                    {
+                        "name": lora_name,
+                        "path": os.path.abspath(path),
+                        "strength_model": strength_model,
+                        "identity": lora_file_identity(path),
+                    }
+                )
+                added.append(f"#{index} {lora_name} strength={strength_model:g}")
+            patched_model = {**mlx_model, "loras": model_loras}
+            if added:
+                log_timing(f"SDMLX: Multi LoRA FLUX.2 stack extended ({len(added)} LoRAs): " + "; ".join(added))
+            else:
+                log_timing("SDMLX: Multi LoRA Loader: no active LoRA selected.")
+            return (patched_model,)
+
+        try:
+            from .qwen_nodes import is_qwen_sdmlx_model
+        except Exception:
+            is_qwen_sdmlx_model = None
+
+        if is_qwen_sdmlx_model is not None and is_qwen_sdmlx_model(mlx_model):
+            model_loras = list(mlx_model.get("loras", []))
+            if str(mlx_model.get("qwen_variant") or "").strip().lower() == "qwen-image" and not mlx_model.get("qwen_lora_policy"):
+                mod_lora_scale = 1.0
+            else:
+                mod_lora_scale = float(mlx_model.get("mod_lora_scale") or 0.0)
+            added = []
+            slot_count = int(kwargs.get("slot_count", 1))
+            slot_count = max(1, min(MULTI_LORA_SLOT_COUNT, slot_count))
+            for index in range(1, slot_count + 1):
+                if not bool(kwargs.get(f"enabled_{index}", True)):
+                    continue
+                lora_name = kwargs.get(f"lora_{index}", MULTI_LORA_NONE)
+                if not lora_name or lora_name == MULTI_LORA_NONE:
+                    continue
+                strength_model = float(kwargs.get(f"strength_{index}", 1.0))
+                if strength_model == 0.0:
+                    continue
+                path = resolve_lora_path_or_raise(lora_name)
+                model_loras.append(
+                    {
+                        "name": lora_name,
+                        "path": os.path.abspath(path),
+                        "strength_model": strength_model,
+                        "mod_lora_scale": mod_lora_scale,
+                        "identity": lora_file_identity(path),
+                    }
+                )
+                added.append(f"#{index} {lora_name} strength={strength_model:g} mod={mod_lora_scale:g}")
+            patched_model = {**mlx_model, "loras": model_loras}
+            if added:
+                log_timing(f"SDMLX: Multi LoRA Qwen stack extended ({len(added)} LoRAs): " + "; ".join(added))
             else:
                 log_timing("SDMLX: Multi LoRA Loader: no active LoRA selected.")
             return (patched_model,)
@@ -7746,10 +8881,10 @@ class SDMLX_SpeedPatchConverter:
             "force_rebuild": ("BOOLEAN", {"default": False}),
         }}
 
-    RETURN_TYPES = ("SDMLX_SPEED_PATCH", "STRING")
+    RETURN_TYPES = ("sdmlx_speed_patch", "STRING")
     RETURN_NAMES = ("speed_patch", "message")
     FUNCTION = "convert"
-    CATEGORY = "SDMLX/Loaders"
+    CATEGORY = "SDMLX/Utilities"
 
     def convert(self, speed_lora, force_rebuild=False):
         if not speed_lora or speed_lora == SUPPORTED_SPEED_LORA_PLACEHOLDER:
@@ -7791,10 +8926,10 @@ class SDMLX_SpectrumBoost:
             "final_real_steps": ("INT", {"default": 0, "min": 0, "max": 10, "step": 1}),
         }}
 
-    RETURN_TYPES = ("SDMLX_SPECTRUM_ACCELERATION",)
+    RETURN_TYPES = ("sdmlx_spectrum_acceleration",)
     RETURN_NAMES = ("spectrum_acceleration",)
     FUNCTION = "build"
-    CATEGORY = "SDMLX/Sampling"
+    CATEGORY = "SDMLX/Advanced"
 
     def build(
         self,
@@ -7832,10 +8967,10 @@ class SDMLX_LoraSchedule:
             "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
         }}
 
-    RETURN_TYPES = ("SDMLX_SCHEDULE",)
+    RETURN_TYPES = ("sdmlx_schedule",)
     RETURN_NAMES = ("scheduler",)
     FUNCTION = "create"
-    CATEGORY = "SDMLX"
+    CATEGORY = "SDMLX/Advanced"
 
     def create(
         self,
@@ -7873,7 +9008,7 @@ class SDMLX_IPAdapterLoader:
             "ipadapter_name": (ipadapter_model_options(),),
         }}
 
-    RETURN_TYPES = ("SDMLX_IPADAPTER",)
+    RETURN_TYPES = ("sdmlx_ipadapter",)
     RETURN_NAMES = ("ipadapter",)
     FUNCTION = "load"
     CATEGORY = "SDMLX/IPAdapter"
@@ -7894,7 +9029,7 @@ class SDMLX_CLIPVisionLoader:
             "compute_dtype": (["float16", "float32"], {"default": "float16"}),
         }}
 
-    RETURN_TYPES = ("SDMLX_CLIP_VISION",)
+    RETURN_TYPES = ("sdmlx_clip_vision",)
     RETURN_NAMES = ("sdmlx_clip_vision",)
     FUNCTION = "load"
     CATEGORY = "SDMLX/IPAdapter"
@@ -7911,7 +9046,7 @@ class SDMLX_IPAdapterMLXCLIPVisionEncode:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "sdmlx_clip_vision": ("SDMLX_CLIP_VISION",),
+            "sdmlx_clip_vision": ("sdmlx_clip_vision",),
             "image": ("IMAGE",),
             "resize_mode": (["crop center", "crop top", "fit pad", "stretch"], {"default": "crop center"}),
         }}
@@ -7932,7 +9067,7 @@ class SDMLX_InsightFaceLoader:
             "provider": (["CPU", "CoreML"], {"default": "CPU"}),
         }}
 
-    RETURN_TYPES = ("SDMLX_INSIGHTFACE",)
+    RETURN_TYPES = ("sdmlx_insightface",)
     RETURN_NAMES = ("insightface",)
     FUNCTION = "load"
     CATEGORY = "SDMLX/IPAdapter"
@@ -7945,7 +9080,7 @@ class SDMLX_InsightFaceAlignCrop:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "insightface": ("SDMLX_INSIGHTFACE",),
+            "insightface": ("sdmlx_insightface",),
             "image": ("IMAGE",),
             "size": ("INT", {"default": 256, "min": 128, "max": 512, "step": 16}),
         }}
@@ -7972,8 +9107,8 @@ class SDMLX_ApplyIPAdapter:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "mlx_model": ("MLX_MODEL",),
-                "ipadapter": ("SDMLX_IPADAPTER",),
+                "mlx_model": ("sdmlx_model",),
+                "ipadapter": ("sdmlx_ipadapter",),
                 "clip_vision_output": ("CLIP_VISION_OUTPUT",),
                 "weight": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 3.0, "step": 0.05}),
                 "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -7984,12 +9119,12 @@ class SDMLX_ApplyIPAdapter:
             },
             "optional": {
                 "negative_clip_vision_output": ("CLIP_VISION_OUTPUT",),
-                "ipadapter_scheduler": ("SDMLX_SCHEDULE",),
+                "ipadapter_scheduler": ("sdmlx_schedule",),
             },
         }
 
-    RETURN_TYPES = ("MLX_MODEL",)
-    RETURN_NAMES = ("mlx_model",)
+    RETURN_TYPES = ("sdmlx_model",)
+    RETURN_NAMES = ("sdmlx_model",)
     FUNCTION = "apply"
     CATEGORY = "SDMLX/IPAdapter"
 
@@ -8054,9 +9189,9 @@ class SDMLX_ApplyIPAdapterFaceID:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "mlx_model": ("MLX_MODEL",),
-                "ipadapter": ("SDMLX_IPADAPTER",),
-                "insightface": ("SDMLX_INSIGHTFACE",),
+                "mlx_model": ("sdmlx_model",),
+                "ipadapter": ("sdmlx_ipadapter",),
+                "insightface": ("sdmlx_insightface",),
                 "image": ("IMAGE",),
                 "identity_bias": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05}),
                 "img_details_v2_only": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 5.0, "step": 0.05}),
@@ -8069,14 +9204,14 @@ class SDMLX_ApplyIPAdapterFaceID:
                 "enabled": ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "sdmlx_clip_vision": ("SDMLX_CLIP_VISION",),
-                "ipadapter_scheduler": ("SDMLX_SCHEDULE",),
-                "lora_scheduler": ("SDMLX_SCHEDULE",),
+                "sdmlx_clip_vision": ("sdmlx_clip_vision",),
+                "ipadapter_scheduler": ("sdmlx_schedule",),
+                "lora_scheduler": ("sdmlx_schedule",),
             },
         }
 
-    RETURN_TYPES = ("MLX_MODEL", "IMAGE")
-    RETURN_NAMES = ("mlx_model", "face_image")
+    RETURN_TYPES = ("sdmlx_model", "IMAGE")
+    RETURN_NAMES = ("sdmlx_model", "face_image")
     FUNCTION = "apply"
     CATEGORY = "SDMLX/IPAdapter"
 
@@ -8225,7 +9360,7 @@ class SDMLX_ApplyIPAdapterFaceIDAIO:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "mlx_model": ("MLX_MODEL",),
+            "mlx_model": ("sdmlx_model",),
             "image": ("IMAGE",),
             "ipadapter_name": (faceid_ipadapter_model_options(),),
             "clip_vision_name": (faceid_clip_vision_model_options(), {"default": AUTO_CLIP_VISION_OPTION}),
@@ -8240,12 +9375,12 @@ class SDMLX_ApplyIPAdapterFaceIDAIO:
             "lora_strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.5, "step": 0.05}),
             "enabled": ("BOOLEAN", {"default": True}),
         }, "optional": {
-            "ipadapter_scheduler": ("SDMLX_SCHEDULE",),
-            "lora_scheduler": ("SDMLX_SCHEDULE",),
+            "ipadapter_scheduler": ("sdmlx_schedule",),
+            "lora_scheduler": ("sdmlx_schedule",),
         }}
 
-    RETURN_TYPES = ("MLX_MODEL", "IMAGE")
-    RETURN_NAMES = ("mlx_model", "face_image")
+    RETURN_TYPES = ("sdmlx_model", "IMAGE")
+    RETURN_NAMES = ("sdmlx_model", "face_image")
     FUNCTION = "apply"
     CATEGORY = "SDMLX/IPAdapter"
 
@@ -8339,13 +9474,13 @@ class SDMLX_DifferentialDiffusion:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "mlx_model": ("MLX_MODEL",),
+            "mlx_model": ("sdmlx_model",),
             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
             "enabled": ("BOOLEAN", {"default": True}),
         }}
 
-    RETURN_TYPES = ("MLX_MODEL",)
-    RETURN_NAMES = ("mlx_model",)
+    RETURN_TYPES = ("sdmlx_model",)
+    RETURN_NAMES = ("sdmlx_model",)
     FUNCTION = "apply"
     CATEGORY = "SDMLX/Inpaint"
 
@@ -8367,12 +9502,66 @@ class SDMLX_DifferentialDiffusion:
 class SDMLX_CLIPTextEncode:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"mlx_clip": ("MLX_CLIP", ), "text": ("STRING", {"multiline": True, "default": ""})}}
-    RETURN_TYPES = ("MLX_CONDITIONING",)
+        return {
+            "required": {
+                "mlx_clip": ("mlx_clip", ),
+                "text": ("STRING", {"multiline": True, "default": ""}),
+            },
+        }
+    RETURN_TYPES = ("mlx_conditioning",)
     FUNCTION = "encode"
-    CATEGORY = "SDMLX"
+    CATEGORY = "SDMLX/Conditioning"
 
     def encode(self, mlx_clip, text):
+        if isinstance(mlx_clip, dict) and mlx_clip.get("type") == "flux1":
+            clip = mlx_clip.get("clip")
+            if clip is None:
+                raise RuntimeError("SDMLX FLUX.1 CLIP Text Encode: missing FLUX CLIP runtime.")
+            cache_key = (
+                CONDITIONING_CACHE_VERSION,
+                mlx_clip.get("cache_key"),
+                "flux1",
+                text,
+            )
+            if cache_key in CONDITIONING_CACHE:
+                cached = CONDITIONING_CACHE[cache_key]
+                log_timing("SDMLX FLUX.1 conditioning loaded from RAM cache.")
+                return (cached,)
+
+            start_time = time.perf_counter()
+            tokens = clip.tokenize(text)
+            conditioning = clip.encode_from_tokens_scheduled(tokens)
+            out = {
+                "type": "flux1",
+                "conditioning": conditioning,
+                "text": text,
+            }
+            CONDITIONING_CACHE[cache_key] = out
+            log_timing(f"SDMLX FLUX.1 CLIP encode finished in {time.perf_counter() - start_time:.2f}s.")
+            return (out,)
+
+        if isinstance(mlx_clip, dict) and mlx_clip.get("type") == "flux2-klein":
+            try:
+                from .flux2_nodes import flux2_conditioning_from_text
+            except Exception as exc:
+                raise RuntimeError(f"SDMLX FLUX.2 Klein: conditioning runtime could not be loaded: {exc}") from exc
+            return (flux2_conditioning_from_text(text, mlx_clip),)
+
+        if isinstance(mlx_clip, dict) and mlx_clip.get("type") == "qwen-image-edit":
+            try:
+                from .qwen_nodes import _qwen_conditioning_entry
+            except Exception as exc:
+                raise RuntimeError(f"SDMLX Qwen: conditioning runtime could not be loaded: {exc}") from exc
+            return (
+                _qwen_conditioning_entry(
+                    text,
+                    [],
+                    conditioning_mode="qwen_image",
+                    use_picture_prefix=False,
+                    clip=mlx_clip,
+                ),
+            )
+
         start_time = time.perf_counter()
         conditioning_key = (CONDITIONING_CACHE_VERSION, mlx_clip["cache_key"], text)
         if conditioning_key in CONDITIONING_CACHE:
@@ -8406,19 +9595,157 @@ class SDMLX_CLIPTextEncode:
         return (conditioning,)
 
 
+def sdmlx_zero_like(value):
+    if value is None:
+        return None
+    try:
+        return mx.zeros_like(value)
+    except Exception:
+        pass
+    try:
+        if torch.is_tensor(value):
+            return torch.zeros_like(value)
+    except Exception:
+        pass
+    try:
+        return value * 0
+    except Exception:
+        return value
+
+
+def sdmlx_zero_conditioning_entry(entry):
+    if isinstance(entry, dict):
+        zeroed = dict(entry)
+        if zeroed.get("type") == "flux1" and "conditioning" in zeroed:
+            inner = zeroed.get("conditioning")
+            if isinstance(inner, list):
+                zeroed["conditioning"] = [sdmlx_zero_conditioning_entry(item) for item in inner]
+            elif isinstance(inner, tuple):
+                zeroed["conditioning"] = tuple(sdmlx_zero_conditioning_entry(item) for item in inner)
+            else:
+                zeroed["conditioning"] = sdmlx_zero_conditioning_entry(inner)
+            return zeroed
+        for key in (
+            "cond",
+            "pooled",
+            "pooled_output",
+            "conditioning_lyrics",
+            "text_embeds",
+            "prompt_embeds",
+            "negative_prompt_embeds",
+        ):
+            if key in zeroed and zeroed[key] is not None:
+                zeroed[key] = sdmlx_zero_like(zeroed[key])
+        if zeroed.get("model_family") == "qwen-image-edit":
+            zeroed["prompt"] = ""
+            zeroed["negative_prompt"] = ""
+        return zeroed
+
+    if isinstance(entry, (list, tuple)) and len(entry) == 2:
+        metadata = entry[1].copy() if isinstance(entry[1], dict) else entry[1]
+        if isinstance(metadata, dict):
+            for key in ("pooled_output", "conditioning_lyrics"):
+                if key in metadata and metadata[key] is not None:
+                    metadata[key] = sdmlx_zero_like(metadata[key])
+        zeroed = [sdmlx_zero_like(entry[0]), metadata]
+        return tuple(zeroed) if isinstance(entry, tuple) else zeroed
+
+    return entry
+
+
+def sdmlx_conditioning_set_values(conditioning, values):
+    values = dict(values)
+    if isinstance(conditioning, dict):
+        out = dict(conditioning)
+        if out.get("type") == "flux1" and "conditioning" in out:
+            out["conditioning"] = sdmlx_conditioning_set_values(out.get("conditioning"), values)
+            out.update(values)
+            return out
+        if "cond" in out:
+            out.update(values)
+            return out
+        out.update(values)
+        return out
+
+    if isinstance(conditioning, list):
+        out = []
+        for entry in conditioning:
+            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                meta = dict(entry[1]) if isinstance(entry[1], dict) else {}
+                meta.update(values)
+                new_entry = list(entry)
+                new_entry[1] = meta
+                out.append(tuple(new_entry) if isinstance(entry, tuple) else new_entry)
+            else:
+                out.append(entry)
+        return out
+
+    if isinstance(conditioning, tuple):
+        out = []
+        for entry in conditioning:
+            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                meta = dict(entry[1]) if isinstance(entry[1], dict) else {}
+                meta.update(values)
+                new_entry = list(entry)
+                new_entry[1] = meta
+                out.append(tuple(new_entry) if isinstance(entry, tuple) else new_entry)
+            else:
+                out.append(entry)
+        return tuple(out)
+
+    return conditioning
+
+
+class SDMLX_ConditioningZeroOut:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"conditioning": ("mlx_conditioning",)}}
+
+    RETURN_TYPES = ("mlx_conditioning",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "zero_out"
+    CATEGORY = "SDMLX/Conditioning"
+
+    def zero_out(self, conditioning):
+        if isinstance(conditioning, list):
+            return ([sdmlx_zero_conditioning_entry(item) for item in conditioning],)
+        if isinstance(conditioning, tuple):
+            return (tuple(sdmlx_zero_conditioning_entry(item) for item in conditioning),)
+        return (sdmlx_zero_conditioning_entry(conditioning),)
+
+
+class SDMLX_FluxGuidance:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "conditioning": ("mlx_conditioning",),
+                "guidance": ("FLOAT", {"default": 3.5, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.001}),
+            }
+        }
+
+    RETURN_TYPES = ("mlx_conditioning",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "apply"
+    CATEGORY = "SDMLX/Conditioning"
+
+    def apply(self, conditioning, guidance):
+        return (sdmlx_conditioning_set_values(conditioning, {"guidance": float(guidance)}),)
+
+
 class SDMLX_InpaintConditioning:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "positive": ("MLX_CONDITIONING",),
-            "negative": ("MLX_CONDITIONING",),
+            "positive": ("mlx_conditioning",),
+            "negative": ("mlx_conditioning",),
             "pixels": ("IMAGE",),
-            "mlx_vae": ("MLX_VAE",),
+            "mlx_vae": ("mlx_vae",),
             "mask": ("MASK",),
             "noise_mask": ("BOOLEAN", {"default": True}),
         }}
 
-    RETURN_TYPES = ("MLX_CONDITIONING", "MLX_CONDITIONING", "LATENT")
+    RETURN_TYPES = ("mlx_conditioning", "mlx_conditioning", "LATENT")
     RETURN_NAMES = ("positive", "negative", "latent")
     FUNCTION = "encode"
     CATEGORY = "SDMLX/Inpaint"
@@ -8442,6 +9769,38 @@ class SDMLX_InpaintConditioning:
             pixel_shape = tuple(pixels_np.shape)
             pixel_height = int(pixels_np.shape[1])
             pixel_width = int(pixels_np.shape[2])
+
+        try:
+            from .qwen_nodes import qwen_conditioning_has_entry, qwen_conditioning_with_reference_image
+        except Exception:
+            qwen_conditioning_has_entry = None
+            qwen_conditioning_with_reference_image = None
+
+        if qwen_conditioning_has_entry is not None and qwen_conditioning_has_entry(positive):
+            qwen_pixels = pixels if hasattr(pixels, "detach") else torch.from_numpy(get_numpy_array(pixels).astype(np.float32))
+            qwen_mask = mask if hasattr(mask, "detach") else torch.from_numpy(get_numpy_array(mask).astype(np.float32))
+            positive, _changed, reference_added, image_count = qwen_conditioning_with_reference_image(
+                positive,
+                qwen_pixels,
+                qwen_mask,
+            )
+            target_width, target_height = inpaint_work_size(pixel_width, pixel_height, multiple=16)
+            latent_width = max(1, int(target_width) // 8)
+            latent_height = max(1, int(target_height) // 8)
+            out = {
+                "samples": torch.zeros(
+                    (1, 16, latent_height, latent_width),
+                    dtype=torch.float32,
+                )
+            }
+            print(
+                "SDMLX: Inpaint conditioning created "
+                f"(image={pixel_shape}, qwen_reference={'added' if reference_added else 'existing'}, "
+                f"qwen_images={image_count}, target_size={target_width}x{target_height}, "
+                "mode=qwen_image_edit, mask=composite, "
+                f"{time.perf_counter() - start_time:.2f}s)."
+            )
+            return (positive, negative, out)
 
         mask_chw = mask_to_chw(mask, pixel_height, pixel_width)
         target_width, target_height = inpaint_work_size(pixel_width, pixel_height, multiple=64)
@@ -8571,10 +9930,10 @@ class SDMLX_InpaintDetailer:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "mlx_model": ("MLX_MODEL",),
-            "mlx_vae": ("MLX_VAE",),
-            "positive": ("MLX_CONDITIONING",),
-            "negative": ("MLX_CONDITIONING",),
+            "mlx_model": ("sdmlx_model",),
+            "mlx_vae": ("mlx_vae",),
+            "positive": ("mlx_conditioning",),
+            "negative": ("mlx_conditioning",),
             "image": ("IMAGE",),
             "mask": ("MASK",),
             "crop": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 10.0, "step": 0.1}),
@@ -8598,8 +9957,8 @@ class SDMLX_InpaintDetailer:
             "max_megapixels": ("FLOAT", {"default": 4.5, "min": 1.0, "max": 16.0, "step": 0.5}),
             "preview": ("BOOLEAN", {"default": False}),
         }, "optional": {
-            "speed_patch_input": ("SDMLX_SPEED_PATCH",),
-            "spectrum_acceleration_advanced": ("SDMLX_SPECTRUM_ACCELERATION",),
+            "speed_patch_input": ("sdmlx_speed_patch",),
+            "spectrum_acceleration_advanced": ("sdmlx_spectrum_acceleration",),
         }}
 
     RETURN_TYPES = ("IMAGE",)
@@ -8959,10 +10318,10 @@ class SDMLX_HiresFix:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "mlx_model": ("MLX_MODEL",),
-            "mlx_vae": ("MLX_VAE",),
-            "positive": ("MLX_CONDITIONING",),
-            "negative": ("MLX_CONDITIONING",),
+            "mlx_model": ("sdmlx_model",),
+            "mlx_vae": ("mlx_vae",),
+            "positive": ("mlx_conditioning",),
+            "negative": ("mlx_conditioning",),
             "image": ("IMAGE",),
             "scale_factor": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 2.0, "step": 0.05}),
             "custom_size": ("BOOLEAN", {"default": False}),
@@ -8984,11 +10343,11 @@ class SDMLX_HiresFix:
             "decode_overlap": ("INT", {"default": 128, "min": 0, "max": 512, "step": 64}),
             "preview": ("BOOLEAN", {"default": False}),
         }, "optional": {
-            "speed_patch_input": ("SDMLX_SPEED_PATCH",),
-            "spectrum_acceleration_advanced": ("SDMLX_SPECTRUM_ACCELERATION",),
+            "speed_patch_input": ("sdmlx_speed_patch",),
+            "spectrum_acceleration_advanced": ("sdmlx_spectrum_acceleration",),
         }}
 
-    RETURN_TYPES = ("IMAGE", "MLX_LATENT")
+    RETURN_TYPES = ("IMAGE", "mlx_latent")
     RETURN_NAMES = ("image", "latent")
     FUNCTION = "upscale"
     CATEGORY = "SDMLX/Upscale"
@@ -9182,10 +10541,10 @@ class SDMLX_TiledUpscale:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "mlx_model": ("MLX_MODEL",),
-                "mlx_vae": ("MLX_VAE",),
-                "positive": ("MLX_CONDITIONING",),
-                "negative": ("MLX_CONDITIONING",),
+                "mlx_model": ("sdmlx_model",),
+                "mlx_vae": ("mlx_vae",),
+                "positive": ("mlx_conditioning",),
+                "negative": ("mlx_conditioning",),
                 "image": ("IMAGE",),
                 "scale": (TILED_UPSCALE_SCALE_OPTIONS, {"default": "2x"}),
                 "custom_width": ("INT", {"default": 3072, "min": 64, "max": 8192, "step": 64}),
@@ -9207,8 +10566,8 @@ class SDMLX_TiledUpscale:
                 "preview": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                "mlx_controlnet": ("MLX_CONTROLNET",),
-                "speed_patch_input": ("SDMLX_SPEED_PATCH",),
+                "mlx_controlnet": ("mlx_controlnet",),
+                "speed_patch_input": ("sdmlx_speed_patch",),
             },
         }
 
@@ -9400,10 +10759,10 @@ class SDMLX_KSampler:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "mlx_model": ("MLX_MODEL",),
-            "mlx_vae": ("MLX_VAE",),
-            "positive": ("MLX_CONDITIONING",),
-            "negative": ("MLX_CONDITIONING",),
+            "sdmlx_model": ("sdmlx_model",),
+            "mlx_vae": ("mlx_vae",),
+            "positive": ("mlx_conditioning",),
+            "negative": ("mlx_conditioning",),
             "latent_image": ("LATENT",),
             "seed": ("INT", {"default": 0, "min": 0, "max": SEED_MAX}),
             "steps": ("INT", {"default": 25, "min": 1, "max": 100}),
@@ -9417,21 +10776,21 @@ class SDMLX_KSampler:
             "spectrum_acceleration": (["off", "fast", "standard"], {"default": "off"}),
             "preview": ("BOOLEAN", {"default": False}),
         }, "optional": {
-            "speed_patch_input": ("SDMLX_SPEED_PATCH",),
-            "spectrum_acceleration_advanced": ("SDMLX_SPECTRUM_ACCELERATION",),
+            "speed_patch_input": ("sdmlx_speed_patch",),
+            "spectrum_acceleration_advanced": ("sdmlx_spectrum_acceleration",),
         }, "hidden": {
             "unique_id": "UNIQUE_ID",
             "prompt": "PROMPT",
         }}
 
-    RETURN_TYPES = ("IMAGE", "MLX_LATENT")
+    RETURN_TYPES = ("IMAGE", "mlx_latent")
     RETURN_NAMES = ("image", "latent")
     FUNCTION = "sample"
-    CATEGORY = "SDMLX"
+    CATEGORY = "SDMLX/Sampling"
 
     def sample(
         self,
-        mlx_model,
+        sdmlx_model,
         mlx_vae,
         positive,
         negative,
@@ -9452,6 +10811,7 @@ class SDMLX_KSampler:
         unique_id=None,
         prompt=None,
     ):
+        mlx_model = sdmlx_model
         global TIMING_LOGS_ENABLED
         TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
         fast_mode = True
@@ -9467,6 +10827,38 @@ class SDMLX_KSampler:
         differential_mask_strength = float(mlx_model.get("differential_mask_strength", 1.0))
         sdxl_time_ids = latent_image.get("sdxl_time_ids")
         effective_patch = speed_patch_override(speed_patch, speed_patch_input)
+        try:
+            from .qwen_nodes import is_qwen_sdmlx_model, sample_qwen_image_edit
+        except Exception as exc:
+            if isinstance(mlx_model, dict) and mlx_model.get("model_family") == "qwen-image-edit":
+                raise RuntimeError(f"SDMLX Qwen: runtime could not be loaded: {exc}") from exc
+            is_qwen_sdmlx_model = None
+            sample_qwen_image_edit = None
+        if is_qwen_sdmlx_model is not None and is_qwen_sdmlx_model(mlx_model):
+            if float(denoise) < 0.9999:
+                raise RuntimeError(
+                    "SDMLX Qwen: denoise below 1.0 is not Comfy-parity yet. "
+                    "The current Qwen path uses latent_image for canvas size; "
+                    "start-latent image content is not supported."
+                )
+            qwen_width, qwen_height = latent_pixel_size(latent_image["samples"], fallback_width=width, fallback_height=height)
+            image = sample_qwen_image_edit(
+                mlx_model,
+                positive,
+                negative,
+                qwen_width,
+                qwen_height,
+                seed,
+                steps,
+                cfg,
+                scheduler,
+                effective_patch,
+                patch_strength,
+            )
+            return (image, latent_image)
+        if is_qwen_speed_patch_selection(effective_patch):
+            print("SDMLX: acceleration-patch: off (not applicable)")
+            effective_patch = SPEED_PATCH_NONE
         spectrum_preset = None
         spectrum_label = "off"
         spectrum_reason = "disabled"
@@ -9575,6 +10967,234 @@ class SDMLX_KSampler:
         return (image, out)
 
 
+class SDMLX_KSamplerAdvanced:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "sdmlx_model": ("sdmlx_model",),
+            "mlx_vae": ("mlx_vae",),
+            "positive": ("mlx_conditioning",),
+            "negative": ("mlx_conditioning",),
+            "latent_image": ("LATENT,mlx_latent",),
+            "add_noise": ("BOOLEAN", {"default": True}),
+            "noise_seed": ("INT", {"default": 0, "min": 0, "max": SEED_MAX}),
+            "steps": ("INT", {"default": 25, "min": 1, "max": 10000}),
+            "cfg": ("FLOAT", {"default": 7.0}),
+            "sampler_name": (SAMPLERS, {"default": "euler"}),
+            "scheduler": (SCHEDULERS, {"default": "simple"}),
+            "force_no_cfg": ("BOOLEAN", {"default": False}),
+            "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000}),
+            "end_at_step": ("INT", {"default": 10000, "min": 0, "max": 10000}),
+            "speed_patch": (speed_patch_options(), {"default": SPEED_PATCH_NONE}),
+            "patch_strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05}),
+            "spectrum_acceleration": (["off", "fast", "standard"], {"default": "off"}),
+            "return_with_leftover_noise": (["disable", "enable"], {"default": "disable"}),
+            "preview": ("BOOLEAN", {"default": False}),
+        }, "optional": {
+            "speed_patch_input": ("sdmlx_speed_patch",),
+            "spectrum_acceleration_advanced": ("sdmlx_spectrum_acceleration",),
+        }, "hidden": {
+            "unique_id": "UNIQUE_ID",
+            "prompt": "PROMPT",
+        }}
+
+    RETURN_TYPES = ("IMAGE", "mlx_latent")
+    RETURN_NAMES = ("image", "latent")
+    FUNCTION = "sample"
+    CATEGORY = "SDMLX/Sampling"
+
+    def sample(
+        self,
+        sdmlx_model,
+        mlx_vae,
+        positive,
+        negative,
+        latent_image,
+        add_noise,
+        noise_seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        force_no_cfg,
+        start_at_step,
+        end_at_step,
+        speed_patch,
+        patch_strength,
+        spectrum_acceleration,
+        return_with_leftover_noise,
+        preview,
+        speed_patch_input=None,
+        spectrum_acceleration_advanced=None,
+        unique_id=None,
+        prompt=None,
+    ):
+        mlx_model = sdmlx_model
+        global TIMING_LOGS_ENABLED
+        TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
+        fast_mode = True
+        compute_dtype = "float16"
+        latents = get_mlx_array(latent_image["samples"])
+        if latents.shape[1] == 4:
+            latents = latents.transpose(0, 2, 3, 1)
+        height = int(latents.shape[1] * 8)
+        width = int(latents.shape[2] * 8)
+        noise_mask = get_mlx_array(latent_image["noise_mask"]) if "noise_mask" in latent_image else None
+        differential_mask = bool(mlx_model.get("differential_mask", False)) and noise_mask is not None
+        differential_mask_strength = float(mlx_model.get("differential_mask_strength", 1.0))
+        sdxl_time_ids = latent_image.get("sdxl_time_ids")
+        effective_patch = speed_patch_override(speed_patch, speed_patch_input)
+        try:
+            from .qwen_nodes import is_qwen_sdmlx_model, sample_qwen_image_edit
+        except Exception as exc:
+            if isinstance(mlx_model, dict) and mlx_model.get("model_family") == "qwen-image-edit":
+                raise RuntimeError(f"SDMLX Qwen: runtime could not be loaded: {exc}") from exc
+            is_qwen_sdmlx_model = None
+            sample_qwen_image_edit = None
+        if is_qwen_sdmlx_model is not None and is_qwen_sdmlx_model(mlx_model):
+            full_range = int(start_at_step) <= 0 and int(end_at_step) >= int(steps)
+            if not full_range or not bool(add_noise) or float(denoise) < 0.9999:
+                raise RuntimeError(
+                    "SDMLX Qwen: KSampler Advanced step ranges, disabled noise, "
+                    "and denoise below 1.0 are not supported yet. "
+                    "Use the normal SDMLX KSampler for Qwen."
+                )
+            qwen_width, qwen_height = latent_pixel_size(latent_image["samples"], fallback_width=width, fallback_height=height)
+            image = sample_qwen_image_edit(
+                mlx_model,
+                positive,
+                negative,
+                qwen_width,
+                qwen_height,
+                noise_seed,
+                steps,
+                cfg,
+                scheduler,
+                effective_patch,
+                patch_strength,
+            )
+            return (image, latent_image)
+        if is_qwen_speed_patch_selection(effective_patch):
+            print("SDMLX: acceleration-patch: off (not applicable)")
+            effective_patch = SPEED_PATCH_NONE
+        force_full_denoise = str(return_with_leftover_noise) != "enable"
+        spectrum_preset = None
+        spectrum_label = "off"
+        spectrum_reason = "disabled"
+        spectrum_choice = str(spectrum_acceleration or "off")
+        if isinstance(spectrum_acceleration, bool):
+            spectrum_choice = "standard" if spectrum_acceleration else "off"
+        use_spectrum = spectrum_choice != "off" or isinstance(spectrum_acceleration_advanced, dict)
+        if use_spectrum:
+            full_step_range = int(start_at_step) <= 0 and int(end_at_step) >= int(steps)
+            if not full_step_range:
+                spectrum_reason = "Advanced step range active"
+            elif not bool(add_noise):
+                spectrum_reason = "add_noise disabled"
+            else:
+                conditioning_controlnets = collect_conditioning_controlnets(mlx_model, positive, negative)
+                if any(controlnets_active_at_percent(conditioning_controlnets, i / 20.0) for i in range(21)):
+                    spectrum_reason = "ControlNet active"
+                else:
+                    from . import spectrum as spectrum_engine
+
+                    if isinstance(spectrum_acceleration_advanced, dict):
+                        spectrum_preset, spectrum_label, spectrum_reason = spectrum_engine.resolve_spectrum_config(
+                            spectrum_acceleration_advanced,
+                            effective_patch,
+                            steps,
+                            sampler_name,
+                        )
+                    else:
+                        spectrum_preset, spectrum_label, spectrum_reason = spectrum_engine.resolve_spectrum_auto(
+                            effective_patch,
+                            steps,
+                            sampler_name,
+                            mode=spectrum_choice,
+                        )
+        if spectrum_preset is None:
+            if use_spectrum:
+                print(f"SDMLX: Spectrum mode: off ({spectrum_reason}).")
+            samples = sample_latents(
+                mlx_model,
+                positive,
+                negative,
+                width,
+                height,
+                noise_seed,
+                steps,
+                cfg,
+                scheduler,
+                sampler_name,
+                force_no_cfg,
+                fast_mode,
+                False,
+                False,
+                preview,
+                False,
+                8,
+                64,
+                False,
+                fast_mode,
+                fast_mode,
+                fast_mode,
+                compute_dtype,
+                effective_patch,
+                patch_strength,
+                latents,
+                noise_mask,
+                1.0,
+                "crop",
+                None,
+                sdxl_time_ids=sdxl_time_ids,
+                differential_mask=differential_mask,
+                differential_mask_strength=differential_mask_strength,
+                start_at_step=start_at_step,
+                end_at_step=end_at_step,
+                add_noise=add_noise,
+                force_full_denoise=force_full_denoise,
+            )
+        else:
+            from . import spectrum as spectrum_engine
+
+            if isinstance(spectrum_acceleration_advanced, dict):
+                print("SDMLX: Spectrum mode: advanced.")
+            else:
+                terminal_label = spectrum_engine.terminal_profile_label(spectrum_label, spectrum_choice)
+                print(f"SDMLX: Spectrum mode: {terminal_label}.")
+            samples = spectrum_engine.sample_latents_spectrum(
+                mlx_model,
+                positive,
+                negative,
+                width,
+                height,
+                noise_seed,
+                steps,
+                float(cfg),
+                scheduler,
+                sampler_name,
+                force_no_cfg,
+                preview=preview,
+                compute_dtype=compute_dtype,
+                speed_patch=effective_patch,
+                speed_patch_strength=patch_strength,
+                initial_latents=latents,
+                noise_mask=noise_mask,
+                denoise=1.0,
+                sdxl_time_ids=sdxl_time_ids,
+                differential_mask=differential_mask,
+                differential_mask_strength=differential_mask_strength,
+                spectrum_verbose=False,
+                **spectrum_preset,
+            )
+        out = {"samples": samples}
+        for key in ("sdmlx_decode_crop", "sdmlx_original_size", "sdmlx_padded_size"):
+            if key in latent_image:
+                out[key] = latent_image[key]
+        image = decode_mlx_latent_to_image(out, mlx_vae) if output_is_connected(prompt, unique_id, 0) else None
+        return (image, out)
+
+
 def output_is_connected(prompt, unique_id, output_index):
     if prompt is None or unique_id is None:
         return True
@@ -9596,6 +11216,35 @@ def output_is_connected(prompt, unique_id, output_index):
 
 
 def decode_mlx_latent_to_image(mlx_latent, mlx_vae):
+    if (
+        isinstance(mlx_latent, dict)
+        and mlx_latent.get("type") == "flux2-klein"
+    ) or (
+        isinstance(mlx_vae, dict)
+        and mlx_vae.get("type") == "flux2-klein"
+    ):
+        from .flux2_nodes import decode_flux2_latent_with_vae
+
+        return decode_flux2_latent_with_vae(mlx_latent, mlx_vae)
+    if isinstance(mlx_vae, dict) and mlx_vae.get("type") == "qwen-image-edit":
+        from .qwen_nodes import decode_qwen_latent_with_vae
+
+        image = decode_qwen_latent_with_vae(mlx_latent, mlx_vae)
+        decode_crop = mlx_latent.get("sdmlx_decode_crop")
+        if decode_crop is not None:
+            left, top, width, height = [int(value) for value in decode_crop]
+            image = image[:, top:top + height, left:left + width, :].contiguous()
+            padded_size = mlx_latent.get("sdmlx_padded_size")
+            if padded_size is not None:
+                print(
+                    "SDMLX Qwen VAE Decode: crop to original size "
+                    f"({padded_size[0]}x{padded_size[1]} -> {width}x{height}, offset={left},{top})."
+                )
+        return image
+    if isinstance(mlx_vae, dict) and mlx_vae.get("type") == "flux":
+        from .flux_nodes import decode_flux_latent_with_vae
+
+        return decode_flux_latent_with_vae(mlx_latent, mlx_vae)
     latents = mlx_latent["samples"]
     if latents.shape[-1] != 4:
         latents = latents.transpose(0, 2, 3, 1)
@@ -9615,13 +11264,111 @@ def decode_mlx_latent_to_image(mlx_latent, mlx_vae):
 class SDMLX_VAEDecode:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"mlx_latent": ("MLX_LATENT",), "mlx_vae": ("MLX_VAE",)}}
+        return {"required": {"mlx_latent": ("mlx_latent,LATENT",), "mlx_vae": ("mlx_vae",)}}
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "decode"
-    CATEGORY = "SDMLX"
+    CATEGORY = "SDMLX/Latent"
 
     def decode(self, mlx_latent, mlx_vae):
         return (decode_mlx_latent_to_image(mlx_latent, mlx_vae),)
+
+
+class SDMLX_VAEEncode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"image": ("IMAGE",), "mlx_vae": ("mlx_vae",)}}
+
+    RETURN_TYPES = ("LATENT,mlx_latent",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "encode"
+    CATEGORY = "SDMLX/Latent"
+
+    def encode(self, image, mlx_vae):
+        if isinstance(mlx_vae, dict) and mlx_vae.get("type") == "flux2-klein":
+            from .flux2_nodes import encode_flux2_image_with_vae
+
+            return (encode_flux2_image_with_vae(image, mlx_vae),)
+        if isinstance(mlx_vae, dict) and mlx_vae.get("type") == "qwen-image-edit":
+            from .qwen_nodes import encode_qwen_image_with_vae
+
+            if hasattr(image, "shape"):
+                pixel_height = int(image.shape[1])
+                pixel_width = int(image.shape[2])
+            else:
+                image_np = get_numpy_array(image)
+                pixel_height = int(image_np.shape[1])
+                pixel_width = int(image_np.shape[2])
+
+            target_width, target_height = inpaint_work_size(pixel_width, pixel_height, multiple=16)
+            pixels, _, decode_crop = pad_inpaint_pixels_and_mask(
+                image,
+                None,
+                target_width=target_width,
+                target_height=target_height,
+            )
+            out = encode_qwen_image_with_vae(pixels, mlx_vae)
+            if target_width != pixel_width or target_height != pixel_height:
+                out["sdmlx_decode_crop"] = decode_crop
+                out["sdmlx_original_size"] = (pixel_width, pixel_height)
+                out["sdmlx_padded_size"] = (target_width, target_height)
+                print(
+                    "SDMLX Qwen VAE Encode: padded image to Qwen grid "
+                    f"({pixel_width}x{pixel_height} -> {target_width}x{target_height})."
+                )
+            return (out,)
+        if isinstance(mlx_vae, dict) and mlx_vae.get("type") == "flux":
+            from .flux_nodes import encode_flux_image_with_vae
+
+            return (encode_flux_image_with_vae(image, mlx_vae),)
+        if hasattr(image, "shape"):
+            pixel_height = int(image.shape[1])
+            pixel_width = int(image.shape[2])
+        else:
+            image_np = get_numpy_array(image)
+            pixel_height = int(image_np.shape[1])
+            pixel_width = int(image_np.shape[2])
+
+        target_width, target_height = inpaint_work_size(pixel_width, pixel_height, multiple=64)
+        pixels, _, decode_crop = pad_inpaint_pixels_and_mask(
+            image,
+            None,
+            target_width=target_width,
+            target_height=target_height,
+        )
+        latents = encode_pixels_to_latents(mlx_vae, pixels, "float32")
+        out = {"samples": latents}
+        if target_width != pixel_width or target_height != pixel_height:
+            out["sdmlx_decode_crop"] = decode_crop
+            out["sdmlx_original_size"] = (pixel_width, pixel_height)
+            out["sdmlx_padded_size"] = (target_width, target_height)
+            print(
+                "SDMLX VAE Encode: padded image to sampler grid "
+                f"({pixel_width}x{pixel_height} -> {target_width}x{target_height})."
+            )
+        return (out,)
+
+
+class SDMLX_PromptSlotSwitcher:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "slot": ("INT", {"default": 1, "min": 1, "max": 5, "step": 1}),
+            "prompt_1": ("STRING", {"multiline": True, "default": ""}),
+            "prompt_2": ("STRING", {"multiline": True, "default": ""}),
+            "prompt_3": ("STRING", {"multiline": True, "default": ""}),
+            "prompt_4": ("STRING", {"multiline": True, "default": ""}),
+            "prompt_5": ("STRING", {"multiline": True, "default": ""}),
+        }}
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "switch_prompt"
+    CATEGORY = "SDMLX/Utilities"
+
+    def switch_prompt(self, slot, prompt_1, prompt_2, prompt_3, prompt_4, prompt_5):
+        prompts = [prompt_1, prompt_2, prompt_3, prompt_4, prompt_5]
+        index = max(0, min(4, int(slot) - 1))
+        return (prompts[index],)
 
 
 class SDMLX_NumberPicker:
@@ -9678,11 +11425,17 @@ class SDMLX_NumberPicker:
 
 
 NODE_CLASS_MAPPINGS = {
+    "SDMLX_LoadImageScale": SDMLX_LoadImageScale,
+    "SDMLX_LoadImageAdvanced": SDMLX_LoadImageAdvanced,
     "SDMLX_GaussianBlurMask": SDMLX_GaussianBlurMask,
     "SDMLX_CheckpointLoader": SDMLX_LoaderUniversal,
     "SDMLX_Loader": SDMLX_Loader,
+    "SDMLX_CLIPLoader": SDMLX_CLIPLoader,
+    "SDMLX_DualCLIPLoader": SDMLX_DualCLIPLoader,
     "SDMLX_VAELoader": SDMLX_VAELoader,
     "SDMLX_CLIPTextEncode": SDMLX_CLIPTextEncode,
+    "SDMLX_ConditioningZeroOut": SDMLX_ConditioningZeroOut,
+    "SDMLX_FluxGuidance": SDMLX_FluxGuidance,
     "SDMLX_LoraLoader": SDMLX_LoraLoader,
     "SDMLX_MultiLoraLoader": SDMLX_MultiLoraLoader,
     "SDMLX_SpeedPatchConverter": SDMLX_SpeedPatchConverter,
@@ -9698,7 +11451,10 @@ NODE_CLASS_MAPPINGS = {
     "SDMLX_ApplyIPAdapterFaceIDAIO": SDMLX_ApplyIPAdapterFaceIDAIO,
     "SDMLX_DifferentialDiffusion": SDMLX_DifferentialDiffusion,
     "SDMLX_KSampler": SDMLX_KSampler,
+    "SDMLX_KSamplerAdvanced": SDMLX_KSamplerAdvanced,
     "SDMLX_VAEDecode": SDMLX_VAEDecode,
+    "SDMLX_VAEEncode": SDMLX_VAEEncode,
+    "SDMLX_PromptSlotSwitcher": SDMLX_PromptSlotSwitcher,
     "SDMLX_ControlNetUnionLoader": SDMLX_ControlNetUnionLoader,
     "SDMLX_ApplyControlNet": SDMLX_ApplyControlNet,
     "SDMLX_InpaintConditioning": SDMLX_InpaintConditioning,
@@ -9709,11 +11465,17 @@ NODE_CLASS_MAPPINGS = {
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     **{k: "🍏 " + k.replace("_", " ") for k in NODE_CLASS_MAPPINGS.keys()},
+    "SDMLX_LoadImageScale": "🍏 SDMLX LoadImage Scale",
+    "SDMLX_LoadImageAdvanced": "🍏 SDMLX Load Image Advanced",
     "SDMLX_GaussianBlurMask": "🍏 SDMLX Gaussian Blur Mask",
     "SDMLX_CheckpointLoader": "🍏 SDMLX Loader Universal",
     "SDMLX_Loader": "🍏 SDMLX Loader",
+    "SDMLX_CLIPLoader": "🍏 SDMLX CLIP Loader",
+    "SDMLX_DualCLIPLoader": "🍏 SDMLX Dual CLIP Loader",
     "SDMLX_VAELoader": "🍏 SDMLX VAE Loader",
     "SDMLX_CLIPTextEncode": "🍏 SDMLX CLIP Text Encode",
+    "SDMLX_ConditioningZeroOut": "🍏 SDMLX Conditioning Zero Out",
+    "SDMLX_FluxGuidance": "🍏 SDMLX FLUX Guidance",
     "SDMLX_LoraLoader": "🍏 SDMLX LoRA Loader",
     "SDMLX_MultiLoraLoader": "🍏 SDMLX Multi LoRA Loader",
     "SDMLX_SpeedPatchConverter": "🍏 SDMLX Speed Patch Converter",
@@ -9729,7 +11491,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SDMLX_ApplyIPAdapterFaceIDAIO": "🍏 SDMLX FaceID AIO",
     "SDMLX_DifferentialDiffusion": "🍏 SDMLX Differential Diffusion",
     "SDMLX_KSampler": "🍏 SDMLX KSampler",
+    "SDMLX_KSamplerAdvanced": "🍏 SDMLX KSampler Advanced",
     "SDMLX_VAEDecode": "🍏 SDMLX VAE Decode",
+    "SDMLX_VAEEncode": "🍏 SDMLX VAE Encode",
+    "SDMLX_PromptSlotSwitcher": "🍏 SDMLX Prompt Switcher",
     "SDMLX_ControlNetUnionLoader": "🍏 SDMLX ControlNet Union ProMax Loader",
     "SDMLX_ApplyControlNet": "🍏 SDMLX Apply ControlNet",
     "SDMLX_InpaintConditioning": "🍏 SDMLX Inpaint Conditioning",

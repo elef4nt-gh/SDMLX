@@ -44,13 +44,16 @@ from transformers import T5TokenizerFast  # noqa: E402
 
 import native_flux_core  # noqa: E402
 from native_flux_core import FluxNativeTransformer  # noqa: E402
+from lua_adapter import load_model as load_lua_model, upscale_latent as lua_upscale_latent  # noqa: E402
 
 
-MODEL_TYPE = "SDMLX_FLUX_MODEL"
-MODEL_INPUT_TYPE = f"MLX_MODEL,{MODEL_TYPE}"
-SEACACHE_ADVANCED_TYPE = "SDMLX_FLUX_SEACACHE_ADVANCED"
+MODEL_TYPE = "sdmlx_model"
+MODEL_INPUT_TYPE = MODEL_TYPE
+SEACACHE_ADVANCED_TYPE = "sdmlx_flux_seacache_advanced"
 VAE_CACHE: dict[tuple[str, str], VAE] = {}
 FLUX_PREVIEWER_CACHE: dict[str, Any] = {}
+FLUX_LUA_CACHE: dict[tuple[str, str, str], torch.nn.Module] = {}
+FLUX_TEXT_CONDITIONING_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 POST_DECODE_CACHE_LIMIT_GB = 2.0
 FLUX_KONTEXT_MAX_ENCODE_PIXELS = 2048 * 2048
 DEFAULT_FLUX_GUIDANCE = 3.5
@@ -59,7 +62,6 @@ FLUX_ACCEL_CACHE_VERSION = "v1"
 FLUX_ACCEL_NONE = "None"
 FLUX_ACCEL_PATCH_PACKAGE_DIR = "AccelerationPatches"
 FLUX_ACCEL_PATCH_REPO_ID = "elef4nt/sdmlx-acceleration-patches"
-T5XXL_SUPPORT_REPO_ID = "Kaoru8/" + "T5XXL-" + "Un" + "chained"
 KNOWN_FLUX_ACCEL_PATCHES = [
     "Hyper-Flux.1-Dev-4-step-Lora.sdmlxpatch",
 ]
@@ -87,7 +89,70 @@ FLUX_SEACACHE_GENERAL_START_AT = 3
 FLUX_SEACACHE_DEFAULT_END_FROM_TAIL_STEPS = 3
 FLUX_SEACACHE_DEFAULT_FINAL_GUARD = "last1"
 FLUX_SCHNELL_SEACACHE_STEP3_ENABLED = True
-KONTEXT_OFFSET_CACHE_FILL_STEP = 4
+KONTEXT_OFFSET_CACHE_FILL_STEP = 3
+FLUX_KONTEXT_BASE_RESOLUTIONS = [
+    (672, 1568),
+    (688, 1504),
+    (720, 1456),
+    (752, 1392),
+    (800, 1328),
+    (832, 1248),
+    (880, 1184),
+    (944, 1104),
+    (1024, 1024),
+    (1104, 944),
+    (1184, 880),
+    (1248, 832),
+    (1328, 800),
+    (1392, 752),
+    (1456, 720),
+    (1504, 688),
+    (1568, 672),
+]
+FLUX_KONTEXT_SCALE_PROFILES = {
+    "kontext": 1.0,
+    "balanced": 0.75,
+    "preview": 0.5,
+}
+
+
+def _round_to_multiple(value: float, multiple: int = 16) -> int:
+    return max(multiple, int(round(value / multiple)) * multiple)
+
+
+def _flux_kontext_dimensions_for_profile(profile: str) -> list[tuple[int, int]]:
+    scale = FLUX_KONTEXT_SCALE_PROFILES.get(profile, 1.0)
+    if scale == 1.0:
+        return list(FLUX_KONTEXT_BASE_RESOLUTIONS)
+    factor = scale ** 0.5
+    dims: list[tuple[int, int]] = []
+    for width, height in FLUX_KONTEXT_BASE_RESOLUTIONS:
+        dims.append((_round_to_multiple(width * factor), _round_to_multiple(height * factor)))
+    return dims
+
+
+def _flux_dimension_options() -> list[str]:
+    options = ["custom"]
+    for width, height in FLUX_KONTEXT_BASE_RESOLUTIONS:
+        options.append(f"{width} x {height}")
+    return options
+
+
+def _parse_flux_dimension_option(option: str, width: int, height: int) -> tuple[int, int]:
+    if not option or option == "custom":
+        return int(width), int(height)
+    parts = option.lower().replace(" ", "").split("x")
+    if len(parts) != 2:
+        return int(width), int(height)
+    return int(parts[0]), int(parts[1])
+
+
+def _closest_flux_dimensions(width: int, height: int, profile: str) -> tuple[int, int]:
+    aspect_ratio = float(width) / max(float(height), 1.0)
+    return min(
+        _flux_kontext_dimensions_for_profile(profile),
+        key=lambda item: abs(aspect_ratio - (item[0] / item[1])),
+    )
 
 
 class ModelConfig(Enum):
@@ -180,6 +245,83 @@ def _flux_log(message: str, *, debug: bool = False) -> None:
 
 def _flux_notice(message: str) -> None:
     print(message)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _flux_kontext_cache_fill_step(max_steps: int) -> int:
+    return max(1, min(int(max_steps), int(KONTEXT_OFFSET_CACHE_FILL_STEP)))
+
+
+def _parse_flux_profile_steps(raw: str | None, *, default_step: int, max_steps: int) -> set[int]:
+    if not raw:
+        return {max(1, min(int(max_steps), int(default_step)))}
+    steps: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        try:
+            step = int(item)
+        except ValueError:
+            continue
+        if 1 <= step <= int(max_steps):
+            steps.add(step)
+    return steps or {max(1, min(int(max_steps), int(default_step)))}
+
+
+def _flux_profile_output_dir() -> Path:
+    configured = os.environ.get("SDMLX_FLUX_PROFILE_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    try:
+        return Path(folder_paths.get_output_directory()) / "sdmlx_profiles"
+    except Exception:
+        return ROOT / "tmp" / "sdmlx_profiles"
+
+
+def _write_flux_profile_report(
+    transformer: FluxNativeTransformer,
+    *,
+    model_name: str,
+    width: int,
+    height: int,
+    steps: int,
+    seed: int,
+    profile_steps: set[int],
+    reference_tokens: int,
+    target_tokens: int,
+) -> Path | None:
+    report = transformer.profile_report()
+    if not report:
+        return None
+    out_dir = _flux_profile_output_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_model = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(model_name))[:80]
+    step_part = "-".join(str(step) for step in sorted(profile_steps))
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = out_dir / (
+        f"flux1_kontext_profile_{stamp}_{safe_model}_{width}x{height}_"
+        f"{steps}steps_seed{int(seed)}_profile_steps{step_part}.tsv"
+    )
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("# SDMLX FLUX.1 Kontext profile\n")
+        handle.write(f"# model\t{model_name}\n")
+        handle.write(f"# size\t{width}x{height}\n")
+        handle.write(f"# steps\t{steps}\n")
+        handle.write(f"# seed\t{seed}\n")
+        handle.write(f"# profiled_steps\t{','.join(str(step) for step in sorted(profile_steps))}\n")
+        handle.write(f"# reference_tokens\t{reference_tokens}\n")
+        handle.write(f"# target_tokens\t{target_tokens}\n")
+        handle.write("bucket\tcount\ttotal_s\tmean_s\n")
+        for label, count, total, mean in report:
+            handle.write(f"{label}\t{count}\t{total:.6f}\t{mean:.6f}\n")
+    return path
 
 
 def _seacache_final_guard_steps(value: Any) -> int:
@@ -320,6 +462,9 @@ def _diffusion_model_names() -> list[str]:
     for name in _scan_model_folder_extensions("diffusion_models", {".gguf"}):
         add_name(name)
 
+    for name in _scan_qwen_model_roots("diffusion_models"):
+        add_name(name)
+
     preferred = "flux1-schnell-fp16.safetensors"
     if preferred in names:
         names.remove(preferred)
@@ -345,6 +490,31 @@ def _scan_model_folder_extensions(folder_name: str, extensions: set[str]) -> lis
             except ValueError:
                 names.append(path.name)
     return sorted(names, key=str.lower)
+
+
+def _scan_qwen_model_roots(folder_name: str) -> list[str]:
+    names: list[str] = []
+    folder_info = getattr(folder_paths, "folder_names_and_paths", {}).get(folder_name)
+    if not folder_info:
+        return names
+    try:
+        from .qwen_nodes import is_qwen_model_root
+    except Exception:
+        return names
+
+    roots = folder_info[0]
+    for root in roots:
+        root_path = Path(root)
+        if not root_path.exists():
+            continue
+        for path in root_path.rglob("*"):
+            if not path.is_dir() or not is_qwen_model_root(path):
+                continue
+            try:
+                names.append(str(path.relative_to(root_path)))
+            except ValueError:
+                names.append(path.name)
+    return sorted(set(names), key=str.lower)
 
 
 def _model_config_from_family(model_family: str) -> ModelConfig:
@@ -425,8 +595,7 @@ def _lora_names() -> list[str]:
 
 def _flux_acceleration_patch_options() -> list[str]:
     names = set(KNOWN_FLUX_ACCEL_PATCHES)
-    package_dir = _sdmlx_acceleration_patch_package_dir(create=False)
-    if package_dir.exists():
+    for package_dir in _sdmlx_acceleration_patch_package_dirs(create=False):
         for path in package_dir.iterdir():
             if path.name in KNOWN_FLUX_ACCEL_PATCHES and path.is_dir() and path.name.endswith(".sdmlxpatch") and _is_flux_acceleration_patch_package(path):
                 names.add(path.name)
@@ -469,7 +638,9 @@ def _flux_acceleration_patch_source_stems(selection: str) -> set[str]:
     for alias in FLUX_ACCEL_PATCH_SOURCE_ALIASES.get(package_name, []):
         stems.add(_name_stem(alias))
 
-    package_dir = _sdmlx_acceleration_patch_package_dir(create=False) / package_name
+    package_dir = _find_flux_acceleration_patch_package_dir(package_name)
+    if package_dir is None:
+        return {stem for stem in stems if stem}
     for metadata_name in ("manifest.json", "source_metadata.json"):
         metadata_path = package_dir / metadata_name
         if not metadata_path.exists():
@@ -515,6 +686,27 @@ def _sdmlx_acceleration_patch_package_dir(*, create: bool = True) -> Path:
     return path
 
 
+def _sdmlx_acceleration_patch_package_dirs(*, create: bool = False) -> list[Path]:
+    dirs: list[Path] = []
+    for root in _sdmlx_model_roots(existing_only=not create):
+        dirs.append(root / FLUX_ACCEL_PATCH_PACKAGE_DIR)
+    if not dirs:
+        dirs.append(_sdmlx_models_dir() / FLUX_ACCEL_PATCH_PACKAGE_DIR)
+    if create:
+        dirs[0].mkdir(parents=True, exist_ok=True)
+    return [path for path in dirs if path.exists() or create]
+
+
+def _find_flux_acceleration_patch_package_dir(package_name: str) -> Path | None:
+    for package_root in _sdmlx_acceleration_patch_package_dirs(create=False):
+        package_dir = package_root / package_name
+        if package_dir.is_dir() and _is_flux_acceleration_patch_package(package_dir):
+            factors_path = package_dir / "patch.safetensors"
+            if factors_path.exists() and factors_path.stat().st_size > 0:
+                return package_dir
+    return None
+
+
 def _read_json_file(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         value = json.load(f)
@@ -541,11 +733,13 @@ def _ensure_flux_acceleration_patch_package(selection: str, *, debug: bool = Fal
     package_name = _normalized_flux_acceleration_patch_name(selection)
     if package_name is None:
         raise RuntimeError("SDMLX FLUX: acceleration patch is None.")
-    package_dir = _sdmlx_acceleration_patch_package_dir(create=True) / package_name
+    existing_package_dir = _find_flux_acceleration_patch_package_dir(package_name)
+    if existing_package_dir is not None:
+        return existing_package_dir / "patch.safetensors", package_name
+
+    package_dir = _sdmlx_acceleration_patch_package_dirs(create=True)[0] / package_name
     manifest_path = package_dir / "manifest.json"
     factors_path = package_dir / "patch.safetensors"
-    if manifest_path.exists() and factors_path.exists() and _is_flux_acceleration_patch_package(package_dir):
-        return factors_path, package_name
 
     try:
         from huggingface_hub import hf_hub_download
@@ -563,7 +757,7 @@ def _ensure_flux_acceleration_patch_package(selection: str, *, debug: bool = Fal
                 repo_id=FLUX_ACCEL_PATCH_REPO_ID,
                 repo_type="model",
                 filename=f"{package_name}/{filename}",
-                local_dir=str(_sdmlx_acceleration_patch_package_dir(create=True)),
+                local_dir=str(package_dir.parent),
             )
         except Exception:
             if filename != "source_metadata.json":
@@ -600,55 +794,79 @@ def _full_lora_path(lora_name: str) -> Path:
     return Path(path)
 
 
+def _sdmlx_model_roots(*, existing_only: bool = True) -> list[Path]:
+    roots: list[Path] = []
+    try:
+        folder_map = getattr(folder_paths, "folder_names_and_paths", {})
+        for key in ("sdmlx", "SDMLX"):
+            if key in folder_map:
+                roots.extend(Path(p).expanduser() for p in folder_paths.get_folder_paths(key))
+    except Exception:
+        pass
+
+    models_dir = Path(getattr(folder_paths, "models_dir", COMFY_ROOT / "models"))
+    roots.append(models_dir / "SDMLX")
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        if root.exists() or not existing_only:
+            unique.append(root)
+    return unique
+
+
 def _sdmlx_models_dir() -> Path:
+    roots = _sdmlx_model_roots(existing_only=True)
+    if roots:
+        roots[0].mkdir(parents=True, exist_ok=True)
+        return roots[0]
     models_dir = Path(getattr(folder_paths, "models_dir", COMFY_ROOT / "models"))
     path = models_dir / "SDMLX"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def _sdmlx_text_encoder_cache_dir() -> Path:
-    path = _sdmlx_models_dir() / "cache" / "text-encoders" / "flux-t5xxl"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+def _comfy_text_encoders_dir() -> Path:
+    return Path(comfy.text_encoders.t5.__file__).resolve().parent
 
 
-def _ensure_t5xxl_support_file(filename: str) -> Path:
-    cache_dir = _sdmlx_text_encoder_cache_dir()
-    path = cache_dir / filename
-    if path.exists() and path.stat().st_size > 0:
-        return path
-    try:
-        from huggingface_hub import hf_hub_download
-    except Exception as exc:
-        raise RuntimeError(
-            "SDMLX FLUX: huggingface_hub is not available; "
-            f"cannot download T5XXL support file {filename}."
-        ) from exc
-    hf_hub_download(
-        repo_id=T5XXL_SUPPORT_REPO_ID,
-        repo_type="model",
-        filename=filename,
-        local_dir=str(cache_dir),
-    )
-    if not path.exists() or path.stat().st_size <= 0:
-        raise RuntimeError(f"SDMLX FLUX: failed to download T5XXL support file {filename}.")
-    return path
+def _comfy_t5xxl_config_path() -> Path:
+    return _comfy_text_encoders_dir() / "t5_config_xxl.json"
 
 
-def _t5xxl_support_config_path() -> Path:
-    return _ensure_t5xxl_support_file("config.json")
-
-
-def _t5xxl_support_tokenizer_dir() -> Path:
-    _ensure_t5xxl_support_file("tokenizer.json")
-    return _sdmlx_text_encoder_cache_dir()
+def _comfy_t5xxl_tokenizer_dir() -> Path:
+    return _comfy_text_encoders_dir() / "t5_tokenizer"
 
 
 def _sdmlx_acceleration_cache_dir() -> Path:
     path = _sdmlx_models_dir() / "cache" / "acceleration-patches"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _sdmlx_acceleration_cache_dirs(*, create_primary: bool = False) -> list[Path]:
+    dirs = [root / "cache" / "acceleration-patches" for root in _sdmlx_model_roots(existing_only=True)]
+    if not dirs:
+        dirs.append(_sdmlx_acceleration_cache_dir())
+    if create_primary:
+        dirs[0].mkdir(parents=True, exist_ok=True)
+    return [path for path in dirs if path.exists() or create_primary]
+
+
+def _sdmlx_acceleration_cache_dir_for_patch(patch_path: Path) -> Path:
+    try:
+        if patch_path.parent.name.endswith(".sdmlxpatch") and patch_path.parent.parent.name == FLUX_ACCEL_PATCH_PACKAGE_DIR:
+            root = patch_path.parent.parent.parent
+            path = root / "cache" / "acceleration-patches"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+    except Exception:
+        pass
+    return _sdmlx_acceleration_cache_dir()
 
 
 def _fp8_cache_path(source: Path) -> Path:
@@ -688,7 +906,7 @@ def _flux_acceleration_cache_path(source: Path, patch_path: Path, strength: floa
     digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()[:12]
     source_stem = _safe_cache_stem(source.name)
     patch_stem = _safe_cache_stem(package_name or patch_path.name).removesuffix(".sdmlxpatch")
-    return _sdmlx_acceleration_cache_dir() / f"{source_stem}-accel-{patch_stem}-s{strength_key}-{digest}.safetensors"
+    return _sdmlx_acceleration_cache_dir_for_patch(patch_path) / f"{source_stem}-accel-{patch_stem}-s{strength_key}-{digest}.safetensors"
 
 
 def _find_existing_flux_acceleration_cache(source: Path, package_name: str, strength: float) -> Path | None:
@@ -696,11 +914,13 @@ def _find_existing_flux_acceleration_cache(source: Path, package_name: str, stre
     patch_stem = _safe_cache_stem(package_name).removesuffix(".sdmlxpatch")
     strength_key = f"{float(strength):.6g}"
     pattern = f"{source_stem}-accel-{patch_stem}-s{strength_key}-*.safetensors"
-    candidates = [
-        path
-        for path in _sdmlx_acceleration_cache_dir().glob(pattern)
-        if path.is_file() and path.stat().st_size > 0
-    ]
+    candidates = []
+    for cache_dir in _sdmlx_acceleration_cache_dirs(create_primary=False):
+        candidates.extend(
+            path
+            for path in cache_dir.glob(pattern)
+            if path.is_file() and path.stat().st_size > 0
+        )
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime_ns)
@@ -853,9 +1073,14 @@ def _configure_native_core() -> None:
     native_flux_core.SINGLE_LINEAR2_FLAT = False
     native_flux_core.SINGLE_LINEAR2_CONTIG = False
     native_flux_core.SINGLE_LINEAR2_CAST = True
+    split_linear2 = os.environ.get("SDMLX_FLUX_SINGLE_LINEAR2_SPLIT_PROJ", "1").strip().lower()
+    native_flux_core.SINGLE_LINEAR2_SPLIT_PROJ = split_linear2 not in {"0", "false", "no", "off"}
 
 
 def _reset_transformer_runtime_state(transformer: FluxNativeTransformer) -> None:
+    transformer.sdmlx_eval_clear_each_block = (
+        os.environ.get("SDMLX_FLUX_EVAL_CLEAR_EACH_BLOCK", "").lower() in {"1", "true", "yes", "on"}
+    )
     transformer.profile_enabled = False
     transformer.profile = {}
     transformer.profile_steps = set()
@@ -961,7 +1186,45 @@ def _apply_flux_mlx_mode(
     return "schnell"
 
 
+def _unwrap_flux1_conditioning(conditioning: Any) -> Any:
+    if isinstance(conditioning, dict) and conditioning.get("type") == "flux1":
+        return conditioning.get("conditioning")
+    return conditioning
+
+
 def _conditioning_to_mlx(conditioning: Any, precision: mx.Dtype) -> tuple[mx.array, mx.array, float | None]:
+    wrapper_guidance = None
+    if isinstance(conditioning, dict) and conditioning.get("type") == "flux1":
+        try:
+            wrapper_guidance = float(conditioning["guidance"]) if conditioning.get("guidance") is not None else None
+        except Exception:
+            wrapper_guidance = None
+        conditioning = conditioning.get("conditioning")
+    if isinstance(conditioning, dict) and "cond" in conditioning:
+        cond = conditioning.get("cond")
+        pooled = conditioning.get("pooled_output", conditioning.get("pooled"))
+        if pooled is None:
+            raise RuntimeError("SDMLX FLUX: positive SDMLX conditioning has no pooled output.")
+        guidance = conditioning.get("guidance")
+        try:
+            guidance = float(guidance) if guidance is not None else None
+        except Exception:
+            guidance = None
+        if guidance is None:
+            guidance = wrapper_guidance
+        cond_np = _tensor_to_numpy(cond)
+        pooled_np = _tensor_to_numpy(pooled)
+        if cond_np.ndim != 3 or cond_np.shape[-1] != 4096:
+            raise RuntimeError(f"SDMLX FLUX: expected T5 embeddings with shape [B,T,4096], got {cond_np.shape}.")
+        if pooled_np.ndim != 2 or pooled_np.shape[-1] != 768:
+            raise RuntimeError(f"SDMLX FLUX: expected pooled CLIP output with shape [B,768], got {pooled_np.shape}.")
+        if cond_np.shape[0] != 1 or pooled_np.shape[0] != 1:
+            raise RuntimeError("SDMLX FLUX prototype currently supports batch_size=1.")
+        prompt_embeds = mx.array(cond_np).astype(precision)
+        pooled_prompt_embeds = mx.array(pooled_np).astype(precision)
+        mx.eval(prompt_embeds, pooled_prompt_embeds)
+        return prompt_embeds, pooled_prompt_embeds, guidance
+
     if not conditioning:
         raise RuntimeError("SDMLX FLUX: positive conditioning is empty.")
     if len(conditioning) != 1:
@@ -987,6 +1250,8 @@ def _conditioning_to_mlx(conditioning: Any, precision: mx.Dtype) -> tuple[mx.arr
             guidance = float(meta["guidance"])
         except Exception:
             guidance = None
+    if guidance is None:
+        guidance = wrapper_guidance
     prompt_embeds = mx.array(cond_np).astype(precision)
     pooled_prompt_embeds = mx.array(pooled_np).astype(precision)
     mx.eval(prompt_embeds, pooled_prompt_embeds)
@@ -1121,6 +1386,16 @@ def _prepare_kontext_image_from_samples(samples: Any, precision: mx.Dtype) -> tu
 
 
 def _reference_latents_from_conditioning(conditioning: Any) -> tuple[list[Any], str | None]:
+    if isinstance(conditioning, dict) and conditioning.get("type") == "flux1":
+        refs = conditioning.get("reference_latents") or []
+        if hasattr(refs, "detach"):
+            refs = [refs]
+        elif not isinstance(refs, (list, tuple)):
+            refs = list(refs)
+        method = conditioning.get("reference_latents_method")
+        if refs:
+            return list(refs), str(method) if method is not None else None
+        conditioning = conditioning.get("conditioning")
     if not conditioning:
         return [], None
     ref_latents: list[Any] = []
@@ -1352,19 +1627,86 @@ def _load_flux_vae(vae_name: str, dtype_name: str) -> VAE:
     mx.eval(vae.parameters())
     VAE_CACHE[cache_key] = vae
     _flux_log(
-        "SDMLX FLUX VAE Decode: "
-        f"loaded {vae_name}, dtype={dtype_name}, load={time.perf_counter() - t0:.2f}s"
+        "SDMLX VAE Loader: "
+        f"loaded FLUX VAE {vae_name}, dtype={dtype_name}, load={time.perf_counter() - t0:.2f}s"
     )
     return vae
 
 
+def _resolve_flux_vae(mlx_vae: Any, op_name: str) -> tuple[VAE, str]:
+    if isinstance(mlx_vae, dict):
+        if mlx_vae.get("type") == "flux" and "flux_vae" in mlx_vae:
+            return mlx_vae["flux_vae"], str(mlx_vae.get("name") or "flux_vae")
+        if "weights" in mlx_vae:
+            raise RuntimeError(
+                f"{op_name} needs a FLUX VAE such as ae.safetensors. "
+                "The connected VAE looks like an SDXL VAE."
+            )
+    if isinstance(mlx_vae, str):
+        return _load_flux_vae(mlx_vae, VAE_DTYPE), mlx_vae
+    raise RuntimeError(f"{op_name} expects mlx_vae from 🍏 SDMLX VAE Loader.")
+
+
+def decode_flux_latent_with_vae(samples: dict[str, Any], mlx_vae: Any) -> torch.Tensor:
+    model_family = str(samples.get("sdmlx_flux_model_family", "unknown")).lower() if isinstance(samples, dict) else "unknown"
+    debug = bool(samples.get("sdmlx_flux_debug", False)) if isinstance(samples, dict) else False
+    t0 = time.perf_counter()
+    _apply_vae_cache_limit("pre_decode", model_family)
+    pre_limit_s = time.perf_counter() - t0
+    dtype = _dtype_from_name(VAE_DTYPE)
+    vae, _vae_name = _resolve_flux_vae(mlx_vae, "SDMLX VAE Decode")
+    latents = _comfy_flux_latent_to_mx(samples, dtype)
+    mx.reset_peak_memory()
+    raw_t0 = time.perf_counter()
+    decoded = vae.decode(latents)
+    mx.eval(decoded)
+    raw_s = time.perf_counter() - raw_t0
+    export_t0 = time.perf_counter()
+    image = _mlx_decoded_to_comfy_image(decoded)
+    export_s = time.perf_counter() - export_t0
+    del decoded, latents
+    post_t0 = time.perf_counter()
+    _apply_vae_cache_limit("post_decode", model_family)
+    mx.eval(mx.zeros((1,), dtype=mx.float16))
+    post_limit_s = time.perf_counter() - post_t0
+    if debug:
+        print(
+            "SDMLX VAE Decode: "
+            f"family={model_family}, pre_limit={pre_limit_s:.3f}s, raw={raw_s:.3f}s, "
+            f"export={export_s:.3f}s, post_limit={post_limit_s:.3f}s, {_mlx_memory_line()}"
+        )
+    return image
+
+
+def encode_flux_image_with_vae(pixels: Any, mlx_vae: Any) -> dict[str, Any]:
+    t0 = time.perf_counter()
+    _apply_vae_cache_limit("pre_encode", "kontext")
+    dtype = _dtype_from_name(VAE_DTYPE)
+    vae, vae_name = _resolve_flux_vae(mlx_vae, "SDMLX VAE Encode")
+    image = _comfy_image_to_mx_vae_image(pixels, dtype)
+    raw_t0 = time.perf_counter()
+    latents = vae.encode(image)
+    mx.eval(latents)
+    raw_s = time.perf_counter() - raw_t0
+    export_t0 = time.perf_counter()
+    samples = _mx_flux_model_latent_to_comfy_latent(latents)
+    export_s = time.perf_counter() - export_t0
+    del image, latents
+    _apply_vae_cache_limit("post_encode", "kontext")
+    _flux_log(
+        "SDMLX VAE Encode: "
+        f"vae={vae_name}, raw={raw_s:.3f}s, export={export_s:.3f}s, total={time.perf_counter() - t0:.3f}s"
+    )
+    return {"samples": samples}
+
+
 def _comfy_flux_latent_to_mx(samples: dict[str, Any], dtype: mx.Dtype) -> mx.array:
     if not isinstance(samples, dict) or "samples" not in samples:
-        raise RuntimeError("SDMLX FLUX VAE Decode: expected a Comfy LATENT input.")
+        raise RuntimeError("SDMLX VAE Decode: expected a Comfy LATENT input.")
     tensor = samples["samples"]
     if tuple(tensor.shape)[1] != 16:
         raise RuntimeError(
-            "SDMLX FLUX VAE Decode needs a 16-channel FLUX latent. "
+            "SDMLX VAE Decode needs a 16-channel FLUX latent. "
             f"Got shape {tuple(tensor.shape)}."
         )
     model_space = comfy.latent_formats.Flux().process_in(tensor.detach().cpu().float())
@@ -1382,20 +1724,20 @@ def _mlx_decoded_to_comfy_image(decoded: mx.array) -> torch.Tensor:
 
 def _comfy_image_to_mx_vae_image(image: Any, dtype: mx.Dtype) -> mx.array:
     if not hasattr(image, "detach"):
-        raise RuntimeError("SDMLX FLUX VAE Encode: expected a Comfy IMAGE tensor.")
+        raise RuntimeError("SDMLX VAE Encode: expected a Comfy IMAGE tensor.")
     tensor = image.detach().cpu().float()
     if tensor.ndim != 4:
-        raise RuntimeError(f"SDMLX FLUX VAE Encode: expected BHWC image tensor, got shape {tuple(tensor.shape)}.")
+        raise RuntimeError(f"SDMLX VAE Encode: expected BHWC image tensor, got shape {tuple(tensor.shape)}.")
     if tensor.shape[0] != 1:
-        raise RuntimeError("SDMLX FLUX VAE Encode currently supports batch_size=1.")
+        raise RuntimeError("SDMLX VAE Encode currently supports batch_size=1.")
     if tensor.shape[-1] < 3:
-        raise RuntimeError(f"SDMLX FLUX VAE Encode: expected RGB image, got shape {tuple(tensor.shape)}.")
+        raise RuntimeError(f"SDMLX VAE Encode: expected RGB image, got shape {tuple(tensor.shape)}.")
     height = int(tensor.shape[1])
     width = int(tensor.shape[2])
     pixels = height * width
     if pixels > FLUX_KONTEXT_MAX_ENCODE_PIXELS:
         raise RuntimeError(
-            "SDMLX FLUX VAE Encode: input image is too large for direct FLUX Kontext encoding "
+            "SDMLX VAE Encode: input image is too large for direct FLUX Kontext encoding "
             f"({width}x{height}, {pixels / 1_000_000:.2f} MP). "
             "Scale the reference image before VAE Encode, e.g. to a 1024px or 768px long edge."
         )
@@ -1415,6 +1757,35 @@ def _mx_flux_model_latent_to_comfy_latent(latents: mx.array) -> torch.Tensor:
     torch_latents = torch.from_numpy(np.array(comfy_latents, dtype=np.float32))
     torch_latents = comfy.latent_formats.Flux().process_out(torch_latents)
     return torch_latents
+
+
+def _torch_device_from_name(name: str) -> torch.device:
+    if name == "auto":
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+    return torch.device(name)
+
+
+def _torch_sync(device: torch.device) -> None:
+    if device.type == "mps":
+        torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def _cached_flux_lua_model(weights_path: str, device: torch.device, dtype_name: str) -> torch.nn.Module:
+    clean_path = str(weights_path or "").strip()
+    key = (clean_path or "__auto__", str(device), dtype_name)
+    cached = FLUX_LUA_CACHE.get(key)
+    if cached is not None:
+        return cached
+    dtype = torch.float32 if dtype_name == "float32" else torch.float16
+    model = load_lua_model(weights_path=clean_path or None, device=device, dtype=dtype)
+    FLUX_LUA_CACHE[key] = model
+    return model
 
 
 def _torch_tensor_to_numpy(value: Any) -> np.ndarray:
@@ -1983,20 +2354,71 @@ class SDMLXFluxNativeLoader:
         }
 
     RETURN_TYPES = (MODEL_TYPE,)
-    RETURN_NAMES = ("sdmlx_flux_model",)
+    RETURN_NAMES = ("sdmlx_model",)
     FUNCTION = "load"
-    CATEGORY = "SDMLX/FLUX"
+    CATEGORY = "SDMLX/Loaders"
 
     def load(self, model_name: str):
+        path = _full_diffusion_model_path(model_name)
+        try:
+            from .flux2_nodes import flux2_model_from_checkpoint, is_flux2_checkpoint_file
+
+            if path.is_file() and is_flux2_checkpoint_file(path):
+                model = flux2_model_from_checkpoint(path, name=model_name)
+                _flux_notice(
+                    "SDMLX Diffusion Model Loader: "
+                    f"model={model_name}, family={model.get('model_family')}, config={model.get('model_config')}"
+                )
+                return (model,)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            lowered = f"{model_name} {path}".lower()
+            if "flux2" in lowered or "flux.2" in lowered or "klein" in lowered:
+                raise RuntimeError(f"SDMLX FLUX.2 Klein: could not inspect selected diffusion model: {model_name}") from exc
+
+        try:
+            from .qwen_nodes import is_qwen_checkpoint_file, is_qwen_model_root, qwen_model_from_checkpoint, qwen_model_from_root
+
+            if is_qwen_model_root(path):
+                model = qwen_model_from_root(path, name=model_name)
+                _flux_notice(
+                    "SDMLX Diffusion Model Loader: "
+                    f"model={model_name}, family={model.get('qwen_variant') or 'qwen'}, source={path.name}"
+                )
+                return (model,)
+            if path.is_file() and is_qwen_checkpoint_file(path):
+                model = qwen_model_from_checkpoint(path, name=model_name)
+                _flux_notice(
+                    "SDMLX Diffusion Model Loader: "
+                    f"model={model_name}, family={model.get('qwen_variant') or 'qwen'}, source={path.name}"
+                )
+                return (model,)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            if "qwen" in str(model_name).lower() or "qwen" in str(path).lower():
+                raise RuntimeError(f"SDMLX Qwen: could not inspect selected diffusion model: {model_name}") from exc
+
+        if "qwen" in str(model_name).lower() or "qwen" in str(path).lower():
+            raise RuntimeError(
+                "SDMLX Qwen: selected diffusion model is not a complete Qwen root. "
+                "Use a Qwen root with transformer/, text_encoder/, vae/, and tokenizer/, "
+                "or a supported Qwen diffusion-model checkpoint."
+            )
+
         Config.precision = mx.float16
         _configure_native_core()
-        path = _full_diffusion_model_path(model_name)
         model_family = _model_family_from_path(path, model_name)
         model_config = _model_config_from_family(model_family)
         is_gguf = path.suffix.lower() == ".gguf"
         use_native_fp8 = False if is_gguf else native_flux_core._has_fp8_weights(path)
+        use_scaled_fp8 = bool(use_native_fp8 and native_flux_core._has_scaled_fp8_weights(path))
         load_path = path if (is_gguf or use_native_fp8) else _ensure_fp8_transformer_cache(path)
-        effective_fp8_mode = "native" if use_native_fp8 else "dequant"
+        # Scaled-FP8 is a Comfy quant contract, not the raw native-FP8 contract.
+        # On MPS Comfy disables native FP8 compute and materializes dense weights;
+        # doing the same here keeps FLUX.1 Kontext correctness ahead of speed.
+        effective_fp8_mode = "dequant" if use_scaled_fp8 else ("native" if use_native_fp8 else "dequant")
         transformer, casted, pretransposed, load_s = _load_prepared_flux_transformer(
             load_path,
             precision=Config.precision,
@@ -2009,7 +2431,7 @@ class SDMLXFluxNativeLoader:
         _flux_log(
             "SDMLX FLUX Loader: "
             f"model={model_name}, family={model_family}, config={model_config.alias}, source={load_path.name}, "
-            f"mode={transformer.load_mode}, fp8={'native' if use_native_fp8 else 'dequant'}, "
+            f"mode={transformer.load_mode}, fp8={'scaled_dequant' if use_scaled_fp8 else ('native' if use_native_fp8 else 'dequant')}, "
             f"precision=fp16, casted={casted}, "
             f"pretransposed={pretransposed}, fp8_weights={len(transformer.fp8_weight_keys)}, "
             f"load={load_s:.2f}s"
@@ -2032,7 +2454,15 @@ class SDMLXFluxNativeLoader:
 
 
 class SDMLXT5XXLCompatModel(comfy.sd1_clip.SDClipModel):
-    def __init__(self, device="cpu", layer="last", layer_idx=None, dtype=None, model_options=None):
+    def __init__(
+        self,
+        device="cpu",
+        layer="last",
+        layer_idx=None,
+        dtype=None,
+        model_options=None,
+        textmodel_json_config: Path | None = None,
+    ):
         model_options = dict(model_options or {})
         t5xxl_quantization_metadata = model_options.get("t5xxl_quantization_metadata")
         if t5xxl_quantization_metadata is not None:
@@ -2043,7 +2473,7 @@ class SDMLXT5XXLCompatModel(comfy.sd1_clip.SDClipModel):
             device=device,
             layer=layer,
             layer_idx=layer_idx,
-            textmodel_json_config=str(_t5xxl_support_config_path()),
+            textmodel_json_config=str(textmodel_json_config or _comfy_t5xxl_config_path()),
             dtype=dtype,
             special_tokens={"end": 1, "pad": 0},
             model_class=comfy.text_encoders.t5.T5,
@@ -2054,9 +2484,9 @@ class SDMLXT5XXLCompatModel(comfy.sd1_clip.SDClipModel):
 
 
 class SDMLXT5XXLCompatTokenizer(comfy.sd1_clip.SDTokenizer):
-    def __init__(self, embedding_directory=None, tokenizer_data=None):
+    def __init__(self, embedding_directory=None, tokenizer_data=None, tokenizer_dir: Path | None = None):
         super().__init__(
-            str(_t5xxl_support_tokenizer_dir()),
+            str(tokenizer_dir or _comfy_t5xxl_tokenizer_dir()),
             embedding_directory=embedding_directory,
             pad_with_end=False,
             embedding_size=4096,
@@ -2071,10 +2501,14 @@ class SDMLXT5XXLCompatTokenizer(comfy.sd1_clip.SDTokenizer):
 
 
 class SDMLXFluxCompatTokenizer:
-    def __init__(self, embedding_directory=None, tokenizer_data=None):
+    def __init__(self, embedding_directory=None, tokenizer_data=None, t5_tokenizer_dir: Path | None = None):
         tokenizer_data = tokenizer_data or {}
         self.clip_l = comfy.sd1_clip.SDTokenizer(embedding_directory=embedding_directory, tokenizer_data=tokenizer_data)
-        self.t5xxl = SDMLXT5XXLCompatTokenizer(embedding_directory=embedding_directory, tokenizer_data=tokenizer_data)
+        self.t5xxl = SDMLXT5XXLCompatTokenizer(
+            embedding_directory=embedding_directory,
+            tokenizer_data=tokenizer_data,
+            tokenizer_dir=t5_tokenizer_dir,
+        )
 
     def tokenize_with_weights(self, text: str, return_word_ids=False, **kwargs):
         return {
@@ -2090,7 +2524,7 @@ class SDMLXFluxCompatTokenizer:
 
 
 class SDMLXFluxCompatClipModel(torch.nn.Module):
-    def __init__(self, dtype_t5=None, device="cpu", dtype=None, model_options=None):
+    def __init__(self, dtype_t5=None, device="cpu", dtype=None, model_options=None, t5_config_path: Path | None = None):
         super().__init__()
         model_options = model_options or {}
         dtype_t5 = comfy.model_management.pick_weight_dtype(dtype_t5, dtype, device)
@@ -2100,7 +2534,12 @@ class SDMLXFluxCompatClipModel(torch.nn.Module):
             return_projected_pooled=False,
             model_options=model_options,
         )
-        self.t5xxl = SDMLXT5XXLCompatModel(device=device, dtype=dtype_t5, model_options=model_options)
+        self.t5xxl = SDMLXT5XXLCompatModel(
+            device=device,
+            dtype=dtype_t5,
+            model_options=model_options,
+            textmodel_json_config=t5_config_path,
+        )
         self.dtypes = {dtype, dtype_t5}
 
     def set_clip_options(self, options):
@@ -2122,18 +2561,24 @@ class SDMLXFluxCompatClipModel(torch.nn.Module):
         return self.t5xxl.load_sd(sd)
 
 
-def sdmlx_flux_compat_clip(dtype_t5=None, t5_quantization_metadata=None):
+def sdmlx_flux_compat_clip(dtype_t5=None, t5_quantization_metadata=None, t5_config_path: Path | None = None):
     class SDMLXFluxCompatClipModel_(SDMLXFluxCompatClipModel):
         def __init__(self, device="cpu", dtype=None, model_options=None):
             model_options = dict(model_options or {})
             if t5_quantization_metadata is not None:
                 model_options["t5xxl_quantization_metadata"] = t5_quantization_metadata
-            super().__init__(dtype_t5=dtype_t5, device=device, dtype=dtype, model_options=model_options)
+            super().__init__(
+                dtype_t5=dtype_t5,
+                device=device,
+                dtype=dtype,
+                model_options=model_options,
+                t5_config_path=t5_config_path,
+            )
 
     return SDMLXFluxCompatClipModel_
 
 
-class SDMLXFluxCLIPLoader:
+class _SDMLXFluxDualCLIPLoaderImpl:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -2146,9 +2591,20 @@ class SDMLXFluxCLIPLoader:
             },
         }
 
-    RETURN_TYPES = ("CLIP",)
+    RETURN_TYPES = ("mlx_clip",)
+    RETURN_NAMES = ("mlx_clip",)
     FUNCTION = "load_clip"
-    CATEGORY = "SDMLX/FLUX"
+    CATEGORY = "SDMLX/Loaders"
+
+    @staticmethod
+    def _mlx_clip_handle(clip: Any, clip_name: str, t5xxl_name: str, mode: str) -> dict[str, Any]:
+        return {
+            "type": "flux1",
+            "clip": clip,
+            "clip_name": str(clip_name),
+            "t5xxl_name": str(t5xxl_name),
+            "cache_key": f"flux1:{clip_name}:{t5xxl_name}:{mode}",
+        }
 
     def load_clip(self, clip_name: str, t5xxl_name: str, device: str = "default"):
         clip_path = folder_paths.get_full_path_or_raise("text_encoders", clip_name)
@@ -2166,13 +2622,13 @@ class SDMLXFluxCLIPLoader:
                 model_options=model_options,
             )
             _flux_log(
-                "SDMLX FLUX CLIP Loader: "
+                "SDMLX Dual CLIP Loader (flux): "
                 f"clip={clip_name}, t5={t5xxl_name}, tokenizer=standard"
             )
-            return (clip,)
+            return (self._mlx_clip_handle(clip, clip_name, t5xxl_name, "standard"),)
         except Exception as standard_exc:
             _flux_log(
-                "SDMLX FLUX CLIP Loader: "
+                "SDMLX Dual CLIP Loader (flux): "
                 f"standard tokenizer path failed for t5={t5xxl_name}; trying compatibility path. "
                 f"error={standard_exc}"
             )
@@ -2199,30 +2655,65 @@ class SDMLXFluxCLIPLoader:
             model_options=model_options,
         )
         _flux_log(
-            "SDMLX FLUX CLIP Loader: "
+            "SDMLX Dual CLIP Loader (flux): "
             f"clip={clip_name}, t5={t5xxl_name}, tokenizer=compat"
         )
-        return (clip,)
+        return (self._mlx_clip_handle(clip, clip_name, t5xxl_name, "compat"),)
 
 
-class SDMLXLoRALoader:
+class SDMLX_CLIPTextEncodeFlux:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "sdmlx_model": (MODEL_TYPE,),
-                "lora_name": (_lora_names(),),
-                "strength_model": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05, "round": 0.001}),
-            }
+                "mlx_clip": ("mlx_clip",),
+                "clip_l": ("STRING", {"multiline": True, "dynamicPrompts": True, "default": ""}),
+                "t5xxl": ("STRING", {"multiline": True, "dynamicPrompts": True, "default": ""}),
+                "guidance": ("FLOAT", {"default": 3.5, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.001}),
+            },
         }
 
-    RETURN_TYPES = (MODEL_TYPE,)
-    RETURN_NAMES = ("sdmlx_model",)
-    FUNCTION = "load_lora"
-    CATEGORY = "SDMLX/FLUX"
+    RETURN_TYPES = ("mlx_conditioning",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "encode"
+    CATEGORY = "SDMLX/Conditioning"
 
-    def load_lora(self, sdmlx_model: SDMLXFluxNativeModel, lora_name: str, strength_model: float):
-        return (_apply_flux_lora(sdmlx_model, lora_name, float(strength_model)),)
+    def encode(self, mlx_clip, clip_l: str, t5xxl: str, guidance: float):
+        if not isinstance(mlx_clip, dict) or mlx_clip.get("type") != "flux1":
+            raise RuntimeError(
+                "SDMLX FLUX.1 CLIP Text Encode Flux: connect mlx_clip from SDMLX Dual CLIP Loader with type=flux."
+            )
+        clip = mlx_clip.get("clip")
+        if clip is None:
+            raise RuntimeError("SDMLX FLUX.1 CLIP Text Encode Flux: missing FLUX CLIP runtime.")
+
+        try:
+            guidance_value = float(guidance)
+        except Exception:
+            guidance_value = 3.5
+
+        cache_key = (
+            "flux1_clip_text_encode_flux_v1",
+            mlx_clip.get("cache_key"),
+            str(clip_l),
+            str(t5xxl),
+            guidance_value,
+        )
+        if cache_key in FLUX_TEXT_CONDITIONING_CACHE:
+            return (FLUX_TEXT_CONDITIONING_CACHE[cache_key],)
+
+        tokens = clip.tokenize(clip_l)
+        tokens["t5xxl"] = clip.tokenize(t5xxl)["t5xxl"]
+        conditioning = clip.encode_from_tokens_scheduled(tokens, add_dict={"guidance": guidance_value})
+        out = {
+            "type": "flux1",
+            "conditioning": conditioning,
+            "clip_l": str(clip_l),
+            "t5xxl": str(t5xxl),
+            "guidance": guidance_value,
+        }
+        FLUX_TEXT_CONDITIONING_CACHE[cache_key] = out
+        return (out,)
 
 
 class SDMLXFluxSeaCacheAdvanced:
@@ -2240,7 +2731,7 @@ class SDMLXFluxSeaCacheAdvanced:
     RETURN_TYPES = (SEACACHE_ADVANCED_TYPE,)
     RETURN_NAMES = ("seacache_advanced",)
     FUNCTION = "configure"
-    CATEGORY = "SDMLX/FLUX"
+    CATEGORY = "SDMLX/Advanced"
 
     def configure(self, threshold_start: float, threshold_end: float, start_at: int, final_guard: str):
         return ({
@@ -2256,9 +2747,9 @@ class SDMLXFluxNativeSampler:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "sdmlx_flux_model": (MODEL_INPUT_TYPE,),
-                "positive": ("CONDITIONING",),
-                "negative": ("CONDITIONING",),
+                "sdmlx_model": (MODEL_INPUT_TYPE,),
+                "positive": ("CONDITIONING,mlx_conditioning",),
+                "negative": ("CONDITIONING,mlx_conditioning",),
                 "latent_image": ("LATENT",),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 64}),
@@ -2275,11 +2766,11 @@ class SDMLXFluxNativeSampler:
     RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("latent",)
     FUNCTION = "sample"
-    CATEGORY = "SDMLX/FLUX"
+    CATEGORY = "SDMLX/Sampling"
 
     def sample(
         self,
-        sdmlx_flux_model: SDMLXFluxNativeModel,
+        sdmlx_model: SDMLXFluxNativeModel,
         positive,
         negative,
         latent_image,
@@ -2289,8 +2780,16 @@ class SDMLXFluxNativeSampler:
         patch_strength,
         seacache_acceleration,
         preview,
+        guidance=None,
         seacache_advanced=None,
+        **legacy_inputs,
     ):
+        if legacy_inputs and set(legacy_inputs) - {"sdmlx_flux_model"}:
+            _flux_log(
+                "SDMLX FLUX Sampler: ignored stale workflow input(s): "
+                + ", ".join(sorted(legacy_inputs))
+            )
+        sdmlx_flux_model = sdmlx_model
         if not isinstance(sdmlx_flux_model, SDMLXFluxNativeModel):
             raise RuntimeError("SDMLX FLUX Sampler needs a FLUX model from the SDMLX Checkpoint Loader.")
         del negative
@@ -2441,9 +2940,9 @@ class SDMLXFluxNativeSampler:
                 transformer.teacache_warmup_steps = min(int(steps), 2)
                 transformer.teacache_final_steps = max(0, int(steps) - 3)
                 if schnell_seacache_step3_enabled:
-                    _flux_notice("SDMLX FLUX: FLUX-schnell SeaCache acceleration active")
+                    _flux_log("SDMLX FLUX: FLUX-schnell SeaCache acceleration active", debug=debug)
                 else:
-                    _flux_notice("SDMLX FLUX: Dev acceleration-patch SeaCache acceleration active")
+                    _flux_log("SDMLX FLUX: Dev acceleration-patch SeaCache acceleration active", debug=debug)
             else:
                 seacache_start = max(0, seacache_start_at)
                 seacache_end = max(1, int(steps) + 1 - _seacache_final_guard_steps(seacache_final_guard))
@@ -2468,8 +2967,16 @@ class SDMLXFluxNativeSampler:
             positive,
             sdmlx_flux_model.precision,
         )
-        using_guidance_fallback = conditioning_guidance is None
-        effective_guidance = float(DEFAULT_FLUX_GUIDANCE if using_guidance_fallback else conditioning_guidance)
+        if guidance is None:
+            using_guidance_fallback = conditioning_guidance is None
+            effective_guidance = float(DEFAULT_FLUX_GUIDANCE if using_guidance_fallback else conditioning_guidance)
+        else:
+            try:
+                effective_guidance = float(guidance)
+                using_guidance_fallback = False
+            except Exception:
+                using_guidance_fallback = conditioning_guidance is None
+                effective_guidance = float(DEFAULT_FLUX_GUIDANCE if using_guidance_fallback else conditioning_guidance)
 
         reference_latents = None
         reference_height = None
@@ -2481,11 +2988,12 @@ class SDMLXFluxNativeSampler:
             )
         reference_tokens = int(reference_latents.shape[1]) if reference_latents is not None else 0
         kontext_cache_mode = "off"
+        kontext_cache_fill_step = _flux_kontext_cache_fill_step(int(steps))
         if kontext_active and reference_tokens > 0:
             if reference_latents_method == "index_timestep_zero":
                 kontext_cache_mode = "index_timestep_zero_immediate"
             elif reference_latents_method == "offset":
-                kontext_cache_mode = f"offset_delayed_step{KONTEXT_OFFSET_CACHE_FILL_STEP}"
+                kontext_cache_mode = f"offset_delayed_step{kontext_cache_fill_step}"
         # The cache is armed per real sampling step below. This lets the offset
         # experiment keep early reference passes fully real before freezing K/V.
         transformer.set_kontext_kv_cache(False, reference_tokens)
@@ -2501,6 +3009,30 @@ class SDMLXFluxNativeSampler:
             Config(num_inference_steps=int(steps), width=width, height=height, guidance=effective_guidance),
             model_config,
         )
+        kontext_profile_enabled = _env_flag("SDMLX_FLUX_KONTEXT_PROFILE")
+        kontext_profile_steps: set[int] = set()
+        if kontext_profile_enabled:
+            if kontext_active and reference_tokens > 0:
+                if kontext_cache_mode.startswith("offset_delayed_step"):
+                    default_profile_step = min(int(steps), kontext_cache_fill_step + 1)
+                else:
+                    default_profile_step = 1
+                kontext_profile_steps = _parse_flux_profile_steps(
+                    os.environ.get("SDMLX_FLUX_KONTEXT_PROFILE_STEPS"),
+                    default_step=default_profile_step,
+                    max_steps=int(steps),
+                )
+                transformer.profile_enabled = True
+                transformer.profile = {}
+                transformer.profile_steps = set(kontext_profile_steps)
+                transformer.profile_by_step = len(kontext_profile_steps) > 1
+                _flux_notice(
+                    "SDMLX FLUX Kontext profile: "
+                    f"active steps={sorted(kontext_profile_steps)}, "
+                    f"ref_tokens={reference_tokens}, target_tokens={target_tokens}"
+                )
+            else:
+                _flux_notice("SDMLX FLUX Kontext profile: requested but no Kontext reference tokens are active")
 
         if debug:
             print(
@@ -2579,7 +3111,7 @@ class SDMLXFluxNativeSampler:
                 if not getattr(transformer, "kontext_kv_cache_enabled", False):
                     transformer.set_kontext_kv_cache(True, reference_tokens)
                 return
-            if kontext_cache_mode.startswith("offset_delayed_step") and sampling_step >= KONTEXT_OFFSET_CACHE_FILL_STEP:
+            if kontext_cache_mode.startswith("offset_delayed_step") and sampling_step >= kontext_cache_fill_step:
                 if not getattr(transformer, "kontext_kv_cache_enabled", False):
                     transformer.set_kontext_kv_cache(True, reference_tokens)
 
@@ -2656,6 +3188,45 @@ class SDMLXFluxNativeSampler:
         sample_s = time.perf_counter() - sample_t0
         if debug and step3_seacache_acceleration:
             _flux_notice(f"SDMLX FLUX: SeaCache reused_steps={teacache_reused_steps or 'none'}")
+        if teacache_mode == "sea_img":
+            _flux_log(
+                "SDMLX FLUX SeaCache: "
+                f"profile={seacache_profile}, "
+                f"hits={getattr(transformer, 'teacache_hits', 0)}, "
+                f"real_steps={getattr(transformer, 'teacache_real_steps', 0)}, "
+                f"reused_steps={teacache_reused_steps or 'none'}"
+            )
+        if kontext_active:
+            _flux_log(
+                "SDMLX FLUX Kontext: "
+                f"kv_cache={kontext_cache_mode}, "
+                f"ref_tokens={reference_tokens}, target_tokens={target_tokens}, "
+                f"stores={getattr(transformer, 'kontext_kv_cache_stores', 0)}, "
+                f"hits={getattr(transformer, 'kontext_kv_cache_hits', 0)}"
+            )
+        if kontext_profile_enabled and kontext_profile_steps:
+            profile_path = _write_flux_profile_report(
+                transformer,
+                model_name=sdmlx_flux_model.name,
+                width=output_width,
+                height=output_height,
+                steps=int(steps),
+                seed=int(seed),
+                profile_steps=kontext_profile_steps,
+                reference_tokens=reference_tokens,
+                target_tokens=target_tokens,
+            )
+            if profile_path is None:
+                _flux_notice(
+                    "SDMLX FLUX Kontext profile: no buckets recorded "
+                    "(profiled step may have been reused by SeaCache)"
+                )
+            else:
+                top = transformer.profile_report()[:4]
+                top_summary = ", ".join(f"{label}={total:.2f}s" for label, _count, total, _mean in top)
+                _flux_notice(f"SDMLX FLUX Kontext profile: wrote {profile_path}")
+                if top_summary:
+                    _flux_notice(f"SDMLX FLUX Kontext profile top: {top_summary}")
         if debug:
             print(f"SDMLX FLUX Sampler memory before latent export: {_mlx_memory_line()}")
         out_latent = _latent_to_comfy(latents, height, width, latent_image, crop_latent_shape=output_latent_shape)
@@ -2715,103 +3286,155 @@ class SDMLXFluxNativeSampler:
         return (out_latent,)
 
 
-class SDMLXFluxVAEDecode:
+class SDMLXFluxLUAAdapter:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "samples": ("LATENT",),
-                "vae_name": (_vae_names(),),
+                "mlx_vae": ("mlx_vae",),
+                "scale": (["2x", "4x"], {"default": "2x"}),
+                "device": (["auto", "mps", "cpu", "cuda"], {"default": "auto"}),
+                "dtype": (["float32", "float16"], {"default": "float32"}),
+                "enabled": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "weights_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "Optional local lua_flux.pth path. Leave empty to use the official HF weights.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "LATENT")
+    RETURN_NAMES = ("image", "upscaled_latent")
+    FUNCTION = "upscale"
+    CATEGORY = "SDMLX/Upscale"
+
+    def upscale(self, samples, mlx_vae, scale, device, dtype, enabled=True, weights_path=""):
+        if not isinstance(samples, dict) or "samples" not in samples:
+            raise RuntimeError("SDMLX FLUX LUA Adapter expects a Comfy FLUX LATENT input.")
+        head = "x4" if scale == "4x" else "x2"
+
+        latent = samples["samples"]
+        if getattr(latent, "is_nested", False):
+            latent = latent.unbind()[0]
+        if not hasattr(latent, "detach"):
+            raise RuntimeError("SDMLX FLUX LUA Adapter expects a torch-backed FLUX LATENT.")
+        if latent.ndim != 4:
+            raise RuntimeError(f"SDMLX FLUX LUA Adapter expects a 4D latent tensor, got shape {tuple(latent.shape)}.")
+        if int(latent.shape[1]) != 16:
+            raise RuntimeError(
+                "SDMLX FLUX LUA Adapter needs a 16-channel FLUX/SD3 latent. "
+                f"Got shape {tuple(latent.shape)}. SDXL MLX_LATENT/4-channel latents are not supported by lua_flux.pth."
+            )
+
+        if enabled:
+            torch_device = _torch_device_from_name(device)
+            model = _cached_flux_lua_model(weights_path or "", torch_device, dtype)
+
+            upscaled = lua_upscale_latent(model, latent.detach().float(), head=head).detach().cpu().float()
+            _torch_sync(torch_device)
+
+            out_latent = dict(samples)
+            out_latent["samples"] = upscaled
+            out_latent["sdmlx_lua_scale"] = head
+        else:
+            out_latent = dict(samples)
+            out_latent.pop("sdmlx_lua_scale", None)
+
+        model_family = str(samples.get("sdmlx_flux_model_family", "unknown")).lower()
+        _apply_vae_cache_limit("pre_decode", model_family)
+        vae, _vae_name = _resolve_flux_vae(mlx_vae, "SDMLX FLUX LUA Adapter")
+        latents = _comfy_flux_latent_to_mx(out_latent, _dtype_from_name(VAE_DTYPE))
+        decoded = vae.decode(latents)
+        mx.eval(decoded)
+        image = _mlx_decoded_to_comfy_image(decoded)
+        del decoded, latents
+        _apply_vae_cache_limit("post_decode", model_family)
+        mx.eval(mx.zeros((1,), dtype=mx.float16))
+
+        if enabled:
+            print(f"SDMLX FLUX LUA Adapter: {head}")
+        return (image, out_latent)
+
+
+class SDMLXFluxKontextImageScale:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "profile": (["kontext", "balanced", "preview"], {"default": "kontext"}),
             }
         }
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image",)
-    FUNCTION = "decode"
-    CATEGORY = "SDMLX/FLUX"
+    FUNCTION = "scale"
+    CATEGORY = "SDMLX/Image"
 
-    def decode(self, samples, vae_name):
-        model_family = str(samples.get("sdmlx_flux_model_family", "unknown")).lower() if isinstance(samples, dict) else "unknown"
-        debug = bool(samples.get("sdmlx_flux_debug", False)) if isinstance(samples, dict) else False
-        t0 = time.perf_counter()
-        _apply_vae_cache_limit("pre_decode", model_family)
-        pre_limit_s = time.perf_counter() - t0
-        dtype = _dtype_from_name(VAE_DTYPE)
-        vae = _load_flux_vae(vae_name, VAE_DTYPE)
-        latents = _comfy_flux_latent_to_mx(samples, dtype)
-        mx.reset_peak_memory()
-        raw_t0 = time.perf_counter()
-        decoded = vae.decode(latents)
-        mx.eval(decoded)
-        raw_s = time.perf_counter() - raw_t0
-        export_t0 = time.perf_counter()
-        image = _mlx_decoded_to_comfy_image(decoded)
-        export_s = time.perf_counter() - export_t0
-        del decoded, latents
-        post_t0 = time.perf_counter()
-        _apply_vae_cache_limit("post_decode", model_family)
-        mx.eval(mx.zeros((1,), dtype=mx.float16))
-        post_limit_s = time.perf_counter() - post_t0
-        if debug:
-            print(
-                "SDMLX FLUX VAE Decode: "
-                f"family={model_family}, pre_limit={pre_limit_s:.3f}s, raw={raw_s:.3f}s, "
-                f"export={export_s:.3f}s, post_limit={post_limit_s:.3f}s, {_mlx_memory_line()}"
-            )
-        return (image,)
+    def scale(self, image, profile):
+        width = int(image.shape[2])
+        height = int(image.shape[1])
+        target_width, target_height = _closest_flux_dimensions(width, height, profile)
+        scaled = comfy.utils.common_upscale(
+            image.movedim(-1, 1),
+            target_width,
+            target_height,
+            "lanczos",
+            "center",
+        ).movedim(1, -1)
+        return (scaled,)
 
 
-class SDMLXFluxVAEEncode:
+class SDMLXFluxEmptyLatentImage:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "pixels": ("IMAGE",),
-                "vae_name": (_vae_names(),),
+                "width": ("INT", {"default": 1024, "min": 16, "max": 16384, "step": 16}),
+                "height": ("INT", {"default": 1024, "min": 16, "max": 16384, "step": 16}),
+                "flux_dimensions": (_flux_dimension_options(), {"default": "1024 x 1024"}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
             }
         }
 
     RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("latent",)
-    FUNCTION = "encode"
-    CATEGORY = "SDMLX/FLUX"
+    FUNCTION = "generate"
+    CATEGORY = "SDMLX/Latent"
 
-    def encode(self, pixels, vae_name):
-        t0 = time.perf_counter()
-        _apply_vae_cache_limit("pre_encode", "kontext")
-        dtype = _dtype_from_name(VAE_DTYPE)
-        vae = _load_flux_vae(vae_name, VAE_DTYPE)
-        image = _comfy_image_to_mx_vae_image(pixels, dtype)
-        raw_t0 = time.perf_counter()
-        latents = vae.encode(image)
-        mx.eval(latents)
-        raw_s = time.perf_counter() - raw_t0
-        export_t0 = time.perf_counter()
-        samples = _mx_flux_model_latent_to_comfy_latent(latents)
-        export_s = time.perf_counter() - export_t0
-        del image, latents
-        _apply_vae_cache_limit("post_encode", "kontext")
-        _flux_log(
-            "SDMLX FLUX VAE Encode: "
-            f"vae={vae_name}, raw={raw_s:.3f}s, export={export_s:.3f}s, total={time.perf_counter() - t0:.3f}s"
+    def generate(self, width, height, flux_dimensions, batch_size=1):
+        width, height = _parse_flux_dimension_option(flux_dimensions, width, height)
+        latent = torch.zeros(
+            [batch_size, 16, height // 8, width // 8],
+            device=comfy.model_management.intermediate_device(),
+            dtype=comfy.model_management.intermediate_dtype(),
         )
-        return ({"samples": samples},)
+        return ({"samples": latent, "downscale_ratio_spacial": 8},)
 
 
 NODE_CLASS_MAPPINGS = {
     "SDMLXFluxNativeLoader": SDMLXFluxNativeLoader,
-    "SDMLXFluxCLIPLoader": SDMLXFluxCLIPLoader,
+    "SDMLX_CLIPTextEncodeFlux": SDMLX_CLIPTextEncodeFlux,
     "SDMLXFluxNativeSampler": SDMLXFluxNativeSampler,
     "SDMLXFluxSeaCacheAdvanced": SDMLXFluxSeaCacheAdvanced,
-    "SDMLXFluxVAEEncode": SDMLXFluxVAEEncode,
-    "SDMLXFluxVAEDecode": SDMLXFluxVAEDecode,
+    "SDMLXFluxLUAAdapter": SDMLXFluxLUAAdapter,
+    "SDMLXFluxKontextImageScale": SDMLXFluxKontextImageScale,
+    "SDMLXFluxEmptyLatentImage": SDMLXFluxEmptyLatentImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SDMLXFluxNativeLoader": "🍏 SDMLX Load Diffusion Model",
-    "SDMLXFluxCLIPLoader": "🍏 SDMLX FLUX CLIP Loader",
-    "SDMLXFluxNativeSampler": "🍏 SDMLX FLUX MLX Sampler",
+    "SDMLX_CLIPTextEncodeFlux": "🍏 SDMLX CLIP Text Encode Flux",
+    "SDMLXFluxNativeSampler": "🍏 SDMLX KSampler (FLUX.1)",
     "SDMLXFluxSeaCacheAdvanced": "🍏 SDMLX FLUX SeaCache Advanced",
-    "SDMLXFluxVAEEncode": "🍏 SDMLX FLUX VAE Encode",
-    "SDMLXFluxVAEDecode": "🍏 SDMLX FLUX VAE Decode",
+    "SDMLXFluxLUAAdapter": "🍏 SDMLX FLUX LUA Adapter",
+    "SDMLXFluxKontextImageScale": "🍏 SDMLX FLUX Kontext Scale",
+    "SDMLXFluxEmptyLatentImage": "🍏 SDMLX Empty Latent Image FLUX.1",
 }

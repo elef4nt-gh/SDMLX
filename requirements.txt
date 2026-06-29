@@ -9,3 +9,5 @@ tqdm
 insightface
 onnxruntime
 gguf
+platformdirs
+piexif

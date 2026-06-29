@@ -2,7 +2,7 @@
 
 SDMLX tries to keep ComfyUI familiar while making SDXL on Apple Silicon feel more direct. A few controls are named differently from older diffusion nodes on purpose: the goal is to describe what the control does in the image or workflow, not the implementation detail behind it.
 
-Example workflows are shipped with the node suite in `resources/workflows`. The `speed_workflows` subfolder contains DMD2 and Lightning variants, the `flux` subfolder contains basic FLUX workflows, and `resources/workflow_png` contains PNG previews without embedded workflow JSON.
+Example workflows are shipped with the node suite in `resources/workflows`. The `speed_workflows` subfolder contains DMD2 and Lightning variants, the `flux` subfolder contains basic FLUX workflows, `qwen_flux` contains the current FLUX.1 / FLUX.2 Klein / Qwen example set, and `resources/workflow_png` contains PNG previews without embedded workflow JSON.
 
 ## Loaders And Memory Assist
 
@@ -65,7 +65,7 @@ Credits: Spectrum support in SDMLX is an MLX adaptation inspired by the official
 
 ## FLUX Acceleration
 
-FLUX workflows use a separate node family: `SDMLX Load Diffusion Model`, `SDMLX FLUX CLIP Loader`, `SDMLX FLUX MLX Sampler`, `SDMLX FLUX VAE Encode`, and `SDMLX FLUX VAE Decode`.
+FLUX workflows use a separate model/sampling path: `SDMLX Load Diffusion Model`, `SDMLX Dual CLIP Loader` with `type=flux`, and `SDMLX KSampler (FLUX.1)`. VAE work uses the shared `SDMLX VAE Loader`, `SDMLX VAE Encode`, and `SDMLX VAE Decode` nodes; load `ae.safetensors` for FLUX.
 
 The FLUX sampler has two user-facing speed controls:
 
@@ -89,7 +89,7 @@ Current sampler behavior:
 
 For FLUX Kontext, acceleration patches are turned off automatically when reference image conditioning is present. This avoids mixing a speed-patch trajectory with image-reference behavior that has not been validated. SeaCache is still allowed.
 
-Scale very large reference images before `SDMLX FLUX VAE Encode`. A 1024px or 768px long edge is usually the useful range for SDMLX Kontext workflows; raw multi-megapixel inputs can create very large MLX allocations without adding useful edit fidelity.
+Scale very large reference images before `SDMLX VAE Encode`. `SDMLX FLUX Kontext Scale` keeps Comfy's FLUX Kontext aspect-ratio family and offers `kontext`, `balanced` and `preview` pixel budgets. Use `SDMLX Empty Latent Image FLUX.1` when the target latent should use the same FLUX-friendly dimension family. Raw multi-megapixel inputs can create very large MLX allocations without adding useful edit fidelity.
 
 SeaCache can give very useful speedups, especially for prompt testing. It can also change small details. The built-in FLUX-dev settings are starting points or sweet spots for many prompts, not a promise that every image will match an all-real run. For detail-heavy FLUX-dev txt2img prompts, adding a few steps with SeaCache can be better than trying to make the original step count faster. If exact detail fidelity matters, compare once with `seacache_acceleration=false` or connect `SDMLX FLUX SeaCache Advanced` to tune `threshold_start`, `threshold_end`, `start_at` and `final_guard`.
 
@@ -106,6 +106,43 @@ ComfyUI/models/SDMLX/cache/acceleration-patches
 ```
 
 Both folders are intentionally user-visible so generated caches can be removed if needed.
+
+## FLUX.2 Klein Enhanced Edit
+
+For normal FLUX.2 Klein txt2img or native edit workflows, keep using `SDMLX KSampler (FLUX.2-klein)`. It is the validated default sampler path.
+
+Use `SDMLX KSampler (FLUX.2-klein Enhanced Edit)` when the workflow intentionally needs multi-image identity/reference steering. Connect the same `SDMLX CLIP Text Encode` outputs, the FLUX.2 latent, and the FLUX.2 VAE as usual, then connect direct images and optional masks to the sampler. Images and masks are handled as reference inputs internally; the target canvas still comes from the latent image node.
+
+`SDMLX FLUX.2 Klein Enhancer Advanced` is optional. When connected, it supplies the detailed similarity, block schedule, mask threshold, reference selection, text-control, and debug settings. The sampler's simple preset is ignored while this advanced config is connected.
+
+If reference-token steering is active, Enhanced Edit may disable KV-cache and prints that in the terminal. This is expected for the enhanced route and does not change the standard FLUX.2 sampler.
+
+## Qwen Image Edit
+
+Qwen Image Edit 2511 uses its own MLX-native path because it is an image-edit model with vision-language conditioning, not an SDXL or FLUX sampler variant.
+
+Basic wiring:
+
+1. `SDMLX Loader` with a Qwen `.sdmlx` package
+2. loader `mlx_clip` into the `clip` input of `SDMLX Qwen Image Edit Conditioning`
+3. one or more input images into `SDMLX Qwen Image Edit Conditioning`
+4. `SDMLX KSampler`
+5. `Save Image`
+
+The Qwen `.sdmlx` package points at a local MLX-native model folder or a Hugging Face repo id such as `mlx-community/qwen-image-edit-2511-8bit`. Qwen LoRAs use the normal `SDMLX LoRA Loader` or `SDMLX Multi LoRA Loader`.
+
+`SDMLX Qwen Image Edit Conditioning` outputs one conditioning object, like Comfy's Qwen text/image encode node. Connect one instance to the sampler's positive input. If you want a negative prompt, use a second instance without an image and connect it to the negative input.
+
+The sampler's `speed_patch` dropdown includes `Qwen Image Edit 2511 Lightning 4-step`. It is treated as an SDMLX acceleration patch and is applied internally as the validated Lightning LoRA path. This keeps speed LoRAs in the same workflow location as SDXL and FLUX acceleration patches. Set it to `None` for all-real Qwen Image Edit runs.
+
+Validated starting point:
+
+- `speed_patch`: `Qwen Image Edit 2511 Lightning 4-step`
+- `steps`: `4`
+- `cfg`: `1.0`
+- `scheduler`: leave the KSampler UI on `simple`; Qwen Image Edit uses the validated linear path internally.
+
+Custom Qwen LoRAs can be added through the normal SDMLX LoRA nodes. Modulation LoRA keys remain disabled by default through `mod_lora_scale=0.0`; the Qwen 2511 tests showed those modulation layers are very sensitive and can break image structure when applied at normal LoRA strength.
 
 ## Scheduler Curves
 

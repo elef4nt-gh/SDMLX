@@ -34,6 +34,7 @@ SINGLE_LINEAR1_FLAT = False
 SINGLE_LINEAR2_FLAT = False
 SINGLE_LINEAR2_CONTIG = False
 SINGLE_LINEAR2_CAST = False
+SINGLE_LINEAR2_SPLIT_PROJ = False
 FP8_FUSED_LINEAR_NAME = "off"
 FP8_FUSED_LINEAR_FN = None
 FP8_FUSED_LINEAR_LUT = None
@@ -327,6 +328,47 @@ def _has_fp8_weights(path: Path) -> bool:
     return False
 
 
+def _is_scaled_fp8_marker(key: str) -> bool:
+    return key == "scaled_fp8" or key.endswith(".scaled_fp8")
+
+
+def _scale_weight_layer(key: str) -> str | None:
+    for suffix in (".scale_weight", ".weight_scale"):
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return None
+
+
+def _scale_input_layer(key: str) -> str | None:
+    for suffix in (".scale_input", ".input_scale"):
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return None
+
+
+def _has_scaled_fp8_weights(path: Path) -> bool:
+    if path.suffix.lower() == ".gguf":
+        return False
+    has_fp8_weight = False
+    has_scale_weight = False
+    has_marker = False
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        for key in f.keys():
+            normalized = normalize_flux_weight_key(key)
+            if normalized is None:
+                continue
+            if _is_scaled_fp8_marker(normalized):
+                has_marker = True
+                continue
+            if _scale_weight_layer(normalized) is not None:
+                has_scale_weight = True
+                continue
+            dtype = f.get_slice(key).get_dtype()
+            if dtype.startswith("F8_") and normalized.endswith(".weight") and len(f.get_slice(key).get_shape()) == 2:
+                has_fp8_weight = True
+    return has_fp8_weight and (has_marker or has_scale_weight)
+
+
 def _load_regular_flux_weights(path: Path) -> dict[str, mx.array]:
     raw = mx.load(str(path))
     weights: dict[str, mx.array] = {}
@@ -476,12 +518,35 @@ def _load_fp8_flux_weights(path: Path, precision) -> dict[str, mx.array]:
 
     weights: dict[str, mx.array] = {}
     with safe_open(str(path), framework="pt", device="cpu") as f:
+        scale_weights = {}
         for key in f.keys():
             normalized = normalize_flux_weight_key(key)
             if normalized is None:
                 continue
+            layer = _scale_weight_layer(normalized)
+            if layer is not None:
+                scale_weights[layer] = f.get_tensor(key).float()
+
+        for key in f.keys():
+            normalized = normalize_flux_weight_key(key)
+            if normalized is None:
+                continue
+            if (
+                _is_scaled_fp8_marker(normalized)
+                or _scale_weight_layer(normalized) is not None
+                or _scale_input_layer(normalized) is not None
+            ):
+                continue
+            dtype = f.get_slice(key).get_dtype()
             tensor = f.get_tensor(key)
-            if tensor.is_floating_point():
+            if dtype.startswith("F8_") and normalized.endswith(".weight") and len(tensor.shape) == 2:
+                tensor = tensor.to(torch.float32)
+                layer = normalized[: -len(".weight")]
+                scale = scale_weights.get(layer)
+                if scale is not None:
+                    tensor = tensor * scale.to(torch.float32)
+                tensor = tensor.to(torch_dtype)
+            elif tensor.is_floating_point():
                 tensor = tensor.to(torch_dtype)
             array = mx.array(tensor.cpu().contiguous().numpy())
             if array.dtype in (mx.float16, mx.float32, mx.bfloat16):
@@ -504,6 +569,8 @@ def _load_native_fp8_flux_weights(path: Path, precision) -> tuple[dict[str, mx.a
         for key in f.keys():
             normalized = normalize_flux_weight_key(key)
             if normalized is None:
+                continue
+            if _is_scaled_fp8_marker(normalized):
                 continue
             dtype = f.get_slice(key).get_dtype()
             tensor = f.get_tensor(key)
@@ -585,9 +652,10 @@ def load_flux_weights(
         weights, load_mode, gguf_q8 = _load_gguf_flux_weights(path, precision)
         fp8_weight_keys = set()
     elif _has_fp8_weights(path):
+        scaled_fp8 = _has_scaled_fp8_weights(path)
         if fp8_mode in {"native", "native_fp8", "mlx_fp8_native"}:
             weights, fp8_weight_keys = _load_native_fp8_flux_weights(path, precision)
-            load_mode = "mlx_fp8_native"
+            load_mode = "mlx_fp8_scaled_native" if scaled_fp8 else "mlx_fp8_native"
         elif fp8_mode == "packed_mxfp8":
             weights, fp8_mxfp8 = _load_packed_mxfp8_flux_weights(path, precision)
             fp8_weight_keys = set()
@@ -595,7 +663,7 @@ def load_flux_weights(
         else:
             weights = _load_fp8_flux_weights(path, precision)
             fp8_weight_keys = set()
-            load_mode = "torch_fp8_dequant"
+            load_mode = "torch_scaled_fp8_dequant" if scaled_fp8 else "torch_fp8_dequant"
     else:
         weights = _load_regular_flux_weights(path)
         fp8_weight_keys = set()
@@ -745,6 +813,7 @@ class FluxNativeTransformer:
         self.kontext_kv_cache_stores = 0
         self.kontext_reference_zero_calls = 0
         self.kontext_reference_zero_last: dict[str, object] = {}
+        self.sdmlx_eval_clear_each_block = False
 
     @classmethod
     def load(cls, path: Path = FLUX_PATH, precision=mx.bfloat16, fp8_mode: str = "dequant") -> "FluxNativeTransformer":
@@ -811,7 +880,11 @@ class FluxNativeTransformer:
             if not self.quant_scope_matches(key, scope):
                 continue
             if fp8_dequant and key in self.fp8_weight_keys:
-                self.wt[key] = mx.from_fp8(value.T, self.precision)
+                weight = mx.from_fp8(value.T, self.precision)
+                scale = self._fp8_weight_scale_for_key(key)
+                if scale is not None:
+                    weight = weight * scale
+                self.wt[key] = weight
                 dequantized_fp8_keys.add(key)
                 pending_eval.append(self.wt[key])
                 pending_raw_keys.append(key)
@@ -842,6 +915,18 @@ class FluxNativeTransformer:
         self.lora_adapters.clear()
         self.lora_sources.clear()
         self.fp8_weight_keys.clear()
+
+    def _fp8_weight_scale_for_prefix(self, prefix: str) -> mx.array | None:
+        for suffix in (".scale_weight", ".weight_scale"):
+            key = f"{prefix}{suffix}"
+            if key in self.w:
+                return self.w[key].astype(self.precision)
+        return None
+
+    def _fp8_weight_scale_for_key(self, weight_key: str) -> mx.array | None:
+        if not weight_key.endswith(".weight"):
+            return None
+        return self._fp8_weight_scale_for_prefix(weight_key[: -len(".weight")])
 
     def profile_eval(self, label: str, start: float, *arrays: mx.array) -> None:
         if not self.profile_enabled:
@@ -2253,6 +2338,55 @@ class FluxNativeTransformer:
             output = output.at[..., start:end].add(delta)
         return output
 
+    def split_linear2_lora_adapters_supported(self, weight_key: str) -> bool:
+        adapters = self.lora_adapters.get(weight_key)
+        if not adapters:
+            return True
+        input_dim = HIDDEN_DIM + MLP_DIM
+        output_dim = HIDDEN_DIM
+        for down_t, up_t, start, length in adapters:
+            if down_t.ndim != 2 or up_t.ndim != 2:
+                return False
+            if int(down_t.shape[0]) != input_dim:
+                return False
+            if int(up_t.shape[0]) != int(down_t.shape[1]):
+                return False
+            out_slice = int(up_t.shape[1])
+            if start is None:
+                if out_slice != output_dim:
+                    return False
+                continue
+            start_i = int(start)
+            length_i = int(length or out_slice)
+            if start_i < 0 or start_i + length_i > output_dim or out_slice != length_i:
+                return False
+        return True
+
+    def apply_split_linear2_lora_adapters(
+        self,
+        output: mx.array,
+        attn_value: mx.array,
+        mlp_value: mx.array,
+        weight_key: str,
+    ) -> mx.array:
+        adapters = self.lora_adapters.get(weight_key)
+        if not adapters:
+            return output
+        for down_t, up_t, start, length in adapters:
+            down_attn = down_t[:HIDDEN_DIM, :]
+            down_mlp = down_t[HIDDEN_DIM:, :]
+            delta_rank = (attn_value @ down_attn) + (mlp_value @ down_mlp)
+            delta = delta_rank @ up_t
+            if delta.dtype != output.dtype:
+                delta = delta.astype(output.dtype)
+            if start is None:
+                output = output + delta
+                continue
+            start_i = int(start)
+            end = start_i + int(length or int(delta.shape[-1]))
+            output = output.at[..., start_i:end].add(delta)
+        return output
+
     def linear(self, x: mx.array, prefix: str) -> mx.array:
         weight_key = f"{prefix}.weight"
         bias_key = f"{prefix}.bias"
@@ -2337,8 +2471,11 @@ class FluxNativeTransformer:
                 x = x + self.w[bias_key]
             return with_lora(x)
         if weight_key in self.fp8_weight_keys:
+            fp8_scale = self._fp8_weight_scale_for_prefix(prefix)
             if weight_key in self.wt:
                 if (
+                    fp8_scale is None
+                    and
                     FP8_FUSED_LINEAR_FN is not None
                     and self.precision == mx.float16
                     and bias_key in self.w
@@ -2357,6 +2494,8 @@ class FluxNativeTransformer:
                         if m >= 64 and k == k2 and k % 32 == 0 and n % 64 == 0:
                             return with_lora(FP8_FUSED_LINEAR_FN(x, self.wt[weight_key], self.w[bias_key], FP8_FUSED_LINEAR_LUT))
                 weight = mx.from_fp8(self.wt[weight_key], self.precision)
+                if fp8_scale is not None:
+                    weight = weight * fp8_scale
                 if (
                     SINGLE_LINEAR1_FLAT
                     and prefix.startswith("single_blocks.")
@@ -2383,6 +2522,8 @@ class FluxNativeTransformer:
                     return with_lora(mx.addmm(self.w[bias_key], x, weight))
                 return with_lora(x @ weight)
             weight = mx.from_fp8(self.w[weight_key], self.precision)
+            if fp8_scale is not None:
+                weight = weight * fp8_scale
             if bias_key in self.w:
                 return with_lora(mx.addmm(self.w[bias_key], x, weight.T))
             return with_lora(x @ weight.T)
@@ -2955,13 +3096,27 @@ class FluxNativeTransformer:
             self.record_single_attention(index, attn_out)
         t0 = time.perf_counter()
         mlp = nn.gelu_approx(mlp)
-        attn_mlp = mx.concatenate([attn_out, mlp], axis=2)
-        if SINGLE_LINEAR2_CAST:
-            attn_mlp = attn_mlp.astype(self.precision)
-        if SINGLE_LINEAR2_CONTIG:
-            attn_mlp = mx.contiguous(attn_mlp)
-        forecast_linear2_late = self.forecast_single_linear2_late(index, int(attn_mlp.shape[1]), gate)
+        linear2_weight_key = f"{base}.linear2.weight"
+        linear2_bias_key = f"{base}.linear2.bias"
+        can_split_linear2 = (
+            SINGLE_LINEAR2_SPLIT_PROJ
+            and linear2_weight_key in self.wt
+            and linear2_bias_key in self.w
+            and self.split_linear2_lora_adapters_supported(linear2_weight_key)
+            and attn_out.ndim == 3
+            and mlp.ndim == 3
+            and attn_out.shape[0] == 1
+            and mlp.shape[0] == 1
+            and int(attn_out.shape[2]) == HIDDEN_DIM
+            and int(mlp.shape[2]) == MLP_DIM
+        )
+        forecast_linear2_late = self.forecast_single_linear2_late(index, int(attn_out.shape[1]), gate)
         if forecast_linear2_late is not None:
+            attn_mlp = mx.concatenate([attn_out, mlp], axis=2)
+            if SINGLE_LINEAR2_CAST:
+                attn_mlp = attn_mlp.astype(self.precision)
+            if SINGLE_LINEAR2_CONTIG:
+                attn_mlp = mx.contiguous(attn_mlp)
             split = str(self.forecast_single_linear2_late_split or "all")
             if split == "all":
                 out = forecast_linear2_late
@@ -2973,7 +3128,29 @@ class FluxNativeTransformer:
                 actual_out = self.linear(attn_mlp, f"{base}.linear2")
                 out = self.blend_single_linear2_late(actual_out, forecast_linear2_late)
                 self.profile_eval("single.linear2_forecast_late_split", t0, out)
+        elif can_split_linear2:
+            if SINGLE_LINEAR2_CAST:
+                attn_out = attn_out.astype(self.precision)
+                mlp = mlp.astype(self.precision)
+            if SINGLE_LINEAR2_CONTIG:
+                attn_out = mx.contiguous(attn_out)
+                mlp = mx.contiguous(mlp)
+            tokens = int(attn_out.shape[1])
+            weight_t = self.wt[linear2_weight_key]
+            attn2 = mx.reshape(attn_out, (tokens, HIDDEN_DIM))
+            mlp2 = mx.reshape(mlp, (tokens, MLP_DIM))
+            out = mx.addmm(self.w[linear2_bias_key], attn2, weight_t[:HIDDEN_DIM, :])
+            out = out + (mlp2 @ weight_t[HIDDEN_DIM:, :])
+            out = mx.reshape(out, (1, tokens, HIDDEN_DIM))
+            out = self.apply_split_linear2_lora_adapters(out, attn_out, mlp, linear2_weight_key)
+            self.profile_eval("single.linear2_split", t0, out)
+            self.record_single_linear2(index, out, norm_x, gate)
         else:
+            attn_mlp = mx.concatenate([attn_out, mlp], axis=2)
+            if SINGLE_LINEAR2_CAST:
+                attn_mlp = attn_mlp.astype(self.precision)
+            if SINGLE_LINEAR2_CONTIG:
+                attn_mlp = mx.contiguous(attn_mlp)
             out = self.linear(attn_mlp, f"{base}.linear2")
             self.profile_eval("single.linear2", t0, out)
             self.record_single_linear2(index, out, norm_x, gate)
@@ -3266,6 +3443,9 @@ class FluxNativeTransformer:
                 reference_tokens=reference_tokens,
                 img_modulation_dims=img_modulation_dims,
             )
+            if self.sdmlx_eval_clear_each_block:
+                mx.eval(img, txt)
+                mx.clear_cache()
 
         img = nan_to_num_flux_fp16(img)
         self.token_scout_txt_len = int(txt.shape[1])
@@ -3296,6 +3476,9 @@ class FluxNativeTransformer:
                 reference_tokens=reference_tokens,
                 modulation_dims=single_modulation_dims,
             )
+            if self.sdmlx_eval_clear_each_block:
+                mx.eval(x)
+                mx.clear_cache()
 
         feature = x[:, txt.shape[1] :, ...]
         feature = feature[:, :target_len, ...] if reference_latents is not None else feature
@@ -3397,6 +3580,9 @@ class FluxNativeTransformer:
                 reference_tokens=reference_tokens,
                 img_modulation_dims=img_modulation_dims,
             )
+            if self.sdmlx_eval_clear_each_block:
+                mx.eval(img, txt)
+                mx.clear_cache()
 
         img = nan_to_num_flux_fp16(img)
         self.token_scout_txt_len = int(txt.shape[1])
@@ -3427,6 +3613,9 @@ class FluxNativeTransformer:
                 reference_tokens=reference_tokens,
                 modulation_dims=single_modulation_dims,
             )
+            if self.sdmlx_eval_clear_each_block:
+                mx.eval(x)
+                mx.clear_cache()
 
         img = x[:, txt.shape[1] :, ...]
         if reference_latents is not None:

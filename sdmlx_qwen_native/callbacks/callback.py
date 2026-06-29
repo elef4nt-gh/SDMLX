@@ -1,0 +1,53 @@
+from typing import Protocol
+
+import mlx.core as mx
+import PIL.Image
+import tqdm
+
+from sdmlx_qwen_native.models.common.config.config import Config
+
+
+class BeforeLoopCallback(Protocol):
+    def call_before_loop(
+        self,
+        seed: int,
+        prompt: str,
+        latents: mx.array,
+        config: Config,
+        canny_image: PIL.Image.Image | None = None,
+        depth_image: PIL.Image.Image | None = None,
+    ) -> None: ...
+
+
+class InLoopCallback(Protocol):
+    def call_in_loop(
+        self,
+        t: int,
+        seed: int,
+        prompt: str,
+        latents: mx.array,
+        config: Config,
+        time_steps: tqdm,
+    ) -> None: ...
+
+
+class AfterLoopCallback(Protocol):
+    def call_after_loop(
+        self,
+        seed: int,
+        prompt: str,
+        latents: mx.array,
+        config: Config,
+    ) -> None: ...
+
+
+class InterruptCallback(Protocol):
+    def call_interrupt(
+        self,
+        t: int,
+        seed: int,
+        prompt: str,
+        latents: mx.array,
+        config: Config,
+        time_steps: tqdm,
+    ) -> None: ...

@@ -1,4 +1,5 @@
 import { app } from "../../../scripts/app.js";
+import { api } from "../../../scripts/api.js";
 
 const NODE_NAME = "SDMLX_MultiLoraLoader";
 const LORA_SLOT_COUNT = 12;
@@ -99,6 +100,35 @@ function widgetValues(widget) {
   return [];
 }
 
+function setWidgetValues(widget, values) {
+  if (!widget || !values?.length) return;
+  widget.options = widget.options || {};
+  const current = widget.value;
+  const resolved = current && !values.includes(current) ? [...values, current] : values;
+  widget.options.values = resolved;
+  widget.values = resolved;
+}
+
+async function fetchLatestLoraValues() {
+  try {
+    const response = await api.fetchApi(`/object_info/${NODE_NAME}`);
+    const data = await response.json();
+    return data?.[NODE_NAME]?.input?.required?.lora_1?.[0] || [];
+  } catch (error) {
+    console.warn("SDMLX: Could not refresh Multi LoRA list", error);
+    return [];
+  }
+}
+
+async function refreshLoraValues(node) {
+  const values = await fetchLatestLoraValues();
+  if (!values.length) return;
+  for (let index = 1; index <= LORA_SLOT_COUNT; index++) {
+    setWidgetValues(widgetByName(node, `lora_${index}`), values);
+  }
+  node.setDirtyCanvas?.(true, true);
+}
+
 function fitText(ctx, text, maxWidth) {
   const value = String(text ?? "");
   if (ctx.measureText(value).width <= maxWidth) return value;
@@ -197,7 +227,8 @@ function setStrengthValue(node, index, value, event) {
   node.setDirtyCanvas?.(true, true);
 }
 
-function showLoraChooser(event, node, index) {
+async function showLoraChooser(event, node, index) {
+  await refreshLoraValues(node);
   const widget = widgetByName(node, `lora_${index}`);
   const values = widgetValues(widget);
   if (!widget || !values.length || !globalThis.LiteGraph?.ContextMenu) return;
@@ -592,6 +623,7 @@ function updateMultiLoraNode(node, resize = false, forceMinimumWidth = false) {
 function stabilize(node, resize = false, forceMinimumWidth = false) {
   hookLoraWidgetCallbacks(node);
   updateMultiLoraNode(node, resize, forceMinimumWidth);
+  refreshLoraValues(node);
 }
 
 app.registerExtension({
