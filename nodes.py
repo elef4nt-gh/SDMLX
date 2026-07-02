@@ -8138,10 +8138,32 @@ class SDMLX_LoaderUniversal:
         except Exception as exc:
             if path and ("qwen" in str(checkpoint_path_name).lower() or "qwen" in str(path).lower()):
                 raise RuntimeError(f"SDMLX Qwen: checkpoint could not be prepared: {checkpoint_path_name}") from exc
+        try:
+            from .flux_nodes import flux1_model_from_checkpoint, is_flux1_checkpoint_file
+
+            if path and is_diffusion_model_selection and is_flux1_checkpoint_file(path):
+                model = flux1_model_from_checkpoint(path, name=checkpoint_path_name)
+                log_timing(
+                    "SDMLX Loader Universal: FLUX.1 diffusion model "
+                    f"{os.path.basename(checkpoint_path_name)} -> native path"
+                )
+                placeholder = {
+                    "type": "flux1",
+                    "cache_key": str(path),
+                    "model_path": str(path),
+                    "unused": True,
+                }
+                return (model, dict(placeholder), dict(placeholder))
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            lowered = f"{checkpoint_path_name} {path}".lower()
+            if "flux1" in lowered or "flux.1" in lowered or "schnell" in lowered or "kontext" in lowered:
+                raise RuntimeError(f"SDMLX FLUX.1: checkpoint could not be loaded: {checkpoint_path_name}") from exc
         if is_diffusion_model_selection:
             raise RuntimeError(
                 "SDMLX Loader Universal: this diffusion model is not yet supported by the universal MLX package path. "
-                "FLUX.2 Klein and Qwen diffusion checkpoints are supported here; use SDMLX Load Diffusion Model for FLUX.1."
+                "Supported diffusion models here: FLUX.1, FLUX.2 Klein, and Qwen."
             )
         package_path, identity = checkpoint_cache_package(path)
         try:

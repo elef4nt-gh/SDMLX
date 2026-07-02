@@ -74,10 +74,12 @@ FLUX2_DEFAULT_ROOT: Path | None = None
 _FLUX2_ROOT_DISPLAY_TO_PATH: dict[str, Path] = {}
 _FLUX2_MODEL_CACHE: dict[tuple, Any] = {}
 _FLUX2_VAE_CACHE: dict[tuple, Any] = {}
+_FLUX2_TEXT_CONDITIONING_CACHE: dict[tuple[Any, ...], tuple[Any, Any]] = {}
 _FLUX2_QUANT_CONTRACT_LOGGED: set[str] = set()
 _FLUX2_VAE_STANDARD = "standard"
 _FLUX2_VAE_SMALL_DECODER = "small_decoder"
 _FLUX2_TEXT_ENCODER_CACHE_FORMAT = "sdmlx-flux2-text-encoder-cache-v1"
+_FLUX2_TEXT_ENCODER_CACHE_MANIFEST_FORMAT = "sdmlx-flux2-text-encoder-cache-v1"
 
 _FLUX2_QUANT_DENSE_BF16 = "dense_bf16"
 _FLUX2_QUANT_SCALED_FP8 = "scaled_fp8"
@@ -89,6 +91,14 @@ _FLUX2_QUANT_UNKNOWN = "unknown"
 _FLUX2_LORA_QUANT_BAKE_REQUANTIZE = "requantize"
 _FLUX2_LORA_QUANT_BAKE_DENSE_TOUCHED = "dense_touched"
 _FLUX2_LORA_QUANT_BAKE_OFF = "off"
+_FLUX2_LAB_RUNTIME_PLAN_TYPE = "flux2_lab_runtime_plan"
+_FLUX2_LAB_PRODUCT_CURRENT = "product_current"
+_FLUX2_LAB_AUTO_COMFY_LAYERED = "auto_comfy_layered"
+_FLUX2_LAB_RUNTIME_REBIND = "runtime_rebind"
+_FLUX2_LAB_DENSE_WEIGHT_PATCH = "dense_weight_patch"
+_FLUX2_LAB_QUANTIZED_REQUANTIZE = "quantized_requantize"
+_FLUX2_LAB_QUANTIZED_DENSE_TOUCHED = "quantized_dense_touched"
+_FLUX2_LAB_NO_LORA = "no_lora"
 _FLUX2_DEFAULT_SCHEDULER = "flow_match_euler_discrete"
 FLUX2_NATIVE_RESOLUTIONS = [
     (672, 1568),
@@ -279,6 +289,70 @@ def _flux2_env_enabled(name: str, default: str = "0") -> bool:
     return str(os.environ.get(name, default)).strip().lower() in {"1", "true", "on", "yes"}
 
 
+def _flux2_text_conditioning_cache_enabled() -> bool:
+    return _flux2_env_enabled("SDMLX_FLUX2_TEXT_CONDITIONING_CACHE", "1")
+
+
+def _flux2_text_conditioning_cache_limit() -> int:
+    raw = str(os.environ.get("SDMLX_FLUX2_TEXT_CONDITIONING_CACHE_LIMIT") or "16").strip()
+    try:
+        return max(0, int(float(raw)))
+    except ValueError:
+        return 16
+
+
+def _flux2_cache_path_identity(path_value: Any) -> tuple[str, int, int]:
+    if not path_value:
+        return ("", 0, 0)
+    try:
+        path = Path(str(path_value)).expanduser().resolve()
+        stat = path.stat()
+        return (str(path), int(stat.st_size), int(stat.st_mtime_ns))
+    except Exception:
+        return (str(path_value), 0, 0)
+
+
+def _flux2_text_conditioning_cache_key(sdmlx_model: dict[str, Any], text: str) -> tuple[Any, ...] | None:
+    if not _flux2_text_conditioning_cache_enabled():
+        return None
+    return (
+        FLUX2_MODEL_FAMILY,
+        str(sdmlx_model.get("model_config") or ""),
+        _flux2_cache_path_identity(sdmlx_model.get("clip_path")),
+        _flux2_cache_path_identity(sdmlx_model.get("tokenizer_path")),
+        str(text or ""),
+    )
+
+
+def _flux2_get_cached_text_conditioning(sdmlx_model: dict[str, Any], text: str) -> tuple[Any, Any] | None:
+    key = _flux2_text_conditioning_cache_key(sdmlx_model, text)
+    if key is None:
+        return None
+    cached = _FLUX2_TEXT_CONDITIONING_CACHE.get(key)
+    if cached is not None:
+        # Keep normal dict insertion order useful for simple LRU pruning.
+        _FLUX2_TEXT_CONDITIONING_CACHE.pop(key, None)
+        _FLUX2_TEXT_CONDITIONING_CACHE[key] = cached
+    return cached
+
+
+def _flux2_store_text_conditioning(sdmlx_model: dict[str, Any], text: str, prompt_embeds: Any, text_ids: Any) -> None:
+    key = _flux2_text_conditioning_cache_key(sdmlx_model, text)
+    limit = _flux2_text_conditioning_cache_limit()
+    if key is None or limit <= 0:
+        return
+    try:
+        mx.eval(prompt_embeds, text_ids)
+    except Exception:
+        return
+    _FLUX2_TEXT_CONDITIONING_CACHE[key] = (prompt_embeds, text_ids)
+    while len(_FLUX2_TEXT_CONDITIONING_CACHE) > limit:
+        oldest = next(iter(_FLUX2_TEXT_CONDITIONING_CACHE), None)
+        if oldest is None:
+            break
+        _FLUX2_TEXT_CONDITIONING_CACHE.pop(oldest, None)
+
+
 def _flux2_verbose_logs_enabled() -> bool:
     return _flux2_env_enabled("SDMLX_FLUX2_VERBOSE") or _flux2_env_enabled("SDMLX_FLUX2_DEBUG")
 
@@ -318,10 +392,32 @@ def _flux2_raw_fp8_dense_dtype(quant_contract: dict[str, Any] | None) -> str | N
     return "bf16"
 
 
-def _flux2_runtime_lora_rebind_enabled(quant_contract: dict[str, Any] | None) -> bool:
-    return _flux2_quant_contract_kind(quant_contract) == _FLUX2_QUANT_RAW_FP8 and (
+def _flux2_runtime_lora_rebind_enabled(
+    quant_contract: dict[str, Any] | None,
+    model_config: Any | None = None,
+) -> bool:
+    kind = _flux2_quant_contract_kind(quant_contract)
+    if kind == _FLUX2_QUANT_DENSE_BF16 and model_config is not None:
+        model_name = str(getattr(model_config, "model_name", "") or "").lower()
+        if _flux2_is_4b_model_config(model_config):
+            return _flux2_env_enabled("SDMLX_FLUX2_4B_RUNTIME_LORA_REBIND", "1")
+        if _flux2_is_9b_model_config(model_config) and "kv" not in model_name:
+            return _flux2_env_enabled("SDMLX_FLUX2_9B_DENSE_RUNTIME_LORA_REBIND", "0")
+    return kind == _FLUX2_QUANT_RAW_FP8 and (
         _flux2_raw_fp8_dense_dtype(quant_contract) is not None
     )
+
+
+def _flux2_dense_lora_weight_patch_enabled(
+    quant_contract: dict[str, Any] | None,
+    model_config: Any | None = None,
+) -> bool:
+    if _flux2_quant_contract_kind(quant_contract) != _FLUX2_QUANT_DENSE_BF16 or model_config is None:
+        return False
+    model_name = str(getattr(model_config, "model_name", "") or "").lower()
+    if not _flux2_is_9b_model_config(model_config) or "kv" in model_name:
+        return False
+    return _flux2_env_enabled("SDMLX_FLUX2_9B_DENSE_LORA_WEIGHT_PATCH", "1")
 
 
 def _normalize_flux2_kv_first_step_barriers(value: Any) -> int:
@@ -527,15 +623,28 @@ def _flux2_preferred_cache_sdmlx_root() -> Path:
     return _flux2_primary_sdmlx_root()
 
 
-def _flux2_text_encoder_cache_dir() -> Path:
-    path = _flux2_preferred_cache_sdmlx_root() / "cache" / "text-encoders" / "flux2-klein"
+def _flux2_text_encoder_prepared_cache_dir() -> Path:
+    path = _flux2_preferred_cache_sdmlx_root() / "cache" / "text_encoders" / "flux2-klein"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def _flux2_prepared_text_encoder_cache_enabled() -> bool:
-    value = str(os.environ.get("SDMLX_FLUX2_TEXT_ENCODER_PREPARED_CACHE", "0")).strip().lower()
+    value = os.environ.get("SDMLX_FLUX2_TEXT_ENCODER_PREPARED_CACHE")
+    if value is None or str(value).strip() == "":
+        return True
+    value = str(value).strip().lower()
     return value in {"1", "true", "on", "yes"}
+
+
+def _flux2_prepared_text_encoder_cache_allowed(model_config, transformer_quant_contract: dict[str, Any] | None) -> bool:
+    if not _flux2_prepared_text_encoder_cache_enabled():
+        return False
+    overrides = getattr(model_config, "text_encoder_overrides", None) or {}
+    if int(overrides.get("hidden_size") or 0) != 4096:
+        return False
+    contract = _flux2_quant_contract_kind(transformer_quant_contract)
+    return contract in {_FLUX2_QUANT_DENSE_BF16, _FLUX2_QUANT_SCALED_FP8}
 
 
 def _flux2_safe_package_name(path: str | os.PathLike[str]) -> str:
@@ -2163,9 +2272,13 @@ def _flux2_log_quant_contract_once(package_path: Path, contract: dict[str, Any] 
         return
     _FLUX2_QUANT_CONTRACT_LOGGED.add(key)
     print(
+        f"SDMLX FLUX.2 Klein: loaded SDMLX container '{package_path.name}'",
+        flush=True,
+    )
+    _flux2_log(
         "SDMLX FLUX.2 Klein package: "
         f"quant-contract: {_flux2_quant_contract_summary(contract)}",
-        flush=True,
+        verbose=True,
     )
 
 
@@ -2355,7 +2468,7 @@ def _write_flux2_manifest(package_path: Path, manifest: dict[str, Any]) -> None:
 def _iter_flux2_sdmlx_packages() -> list[Path]:
     packages: list[Path] = []
     seen: set[str] = set()
-    skip_dirs = {"cache", "AccelerationPatches", "SpeedPatches"}
+    skip_dirs = {"cache", "registry", "AccelerationPatches", "SpeedPatches"}
 
     def visit(root: Path) -> None:
         try:
@@ -2649,6 +2762,13 @@ def flux2_model_from_manifest(package_path: str | os.PathLike[str], manifest: di
     vae_path = str(vae_placeholder.get("vae_path") or "")
     clip_path = str(clip_placeholder.get("text_encoder_path") or "")
     tokenizer_path = str(clip_placeholder.get("tokenizer_path") or "")
+    manifest, _prepared_entry_changed = _flux2_refresh_package_text_encoder_cache_manifest_entry(
+        package_root,
+        manifest,
+        clip_path,
+        model_config,
+        transformer_quant_contract,
+    )
     model = {
         "model_family": FLUX2_MODEL_FAMILY,
         "model_path": str(package_root),
@@ -3068,6 +3188,214 @@ def flux2_lora_specs_from_model(model: dict[str, Any]) -> tuple[tuple[str, float
     return tuple(specs)
 
 
+def _normalize_flux2_lab_patch_policy(value: Any) -> str:
+    text = str(value or _FLUX2_LAB_AUTO_COMFY_LAYERED).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": _FLUX2_LAB_AUTO_COMFY_LAYERED,
+        "comfy": _FLUX2_LAB_AUTO_COMFY_LAYERED,
+        "comfy_layered": _FLUX2_LAB_AUTO_COMFY_LAYERED,
+        "current": _FLUX2_LAB_PRODUCT_CURRENT,
+        "product": _FLUX2_LAB_PRODUCT_CURRENT,
+        "native": _FLUX2_LAB_PRODUCT_CURRENT,
+        "rebind": _FLUX2_LAB_RUNTIME_REBIND,
+        "runtime": _FLUX2_LAB_RUNTIME_REBIND,
+        "dense": _FLUX2_LAB_DENSE_WEIGHT_PATCH,
+        "dense_patch": _FLUX2_LAB_DENSE_WEIGHT_PATCH,
+        "weight_patch": _FLUX2_LAB_DENSE_WEIGHT_PATCH,
+        "requantize": _FLUX2_LAB_QUANTIZED_REQUANTIZE,
+        "quantized": _FLUX2_LAB_QUANTIZED_REQUANTIZE,
+        "dense_touched": _FLUX2_LAB_QUANTIZED_DENSE_TOUCHED,
+        "quantized_dense": _FLUX2_LAB_QUANTIZED_DENSE_TOUCHED,
+    }
+    text = aliases.get(text, text)
+    allowed = {
+        _FLUX2_LAB_AUTO_COMFY_LAYERED,
+        _FLUX2_LAB_PRODUCT_CURRENT,
+        _FLUX2_LAB_RUNTIME_REBIND,
+        _FLUX2_LAB_DENSE_WEIGHT_PATCH,
+        _FLUX2_LAB_QUANTIZED_REQUANTIZE,
+        _FLUX2_LAB_QUANTIZED_DENSE_TOUCHED,
+    }
+    return text if text in allowed else _FLUX2_LAB_AUTO_COMFY_LAYERED
+
+
+def _normalize_flux2_lab_lora_patch_strategy(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    allowed = {
+        "",
+        _FLUX2_LAB_PRODUCT_CURRENT,
+        _FLUX2_LAB_RUNTIME_REBIND,
+        _FLUX2_LAB_DENSE_WEIGHT_PATCH,
+        _FLUX2_LAB_QUANTIZED_REQUANTIZE,
+        _FLUX2_LAB_QUANTIZED_DENSE_TOUCHED,
+        _FLUX2_LAB_NO_LORA,
+    }
+    return text if text in allowed else ""
+
+
+def _flux2_lab_effective_lora_strategy(
+    patch_policy: Any,
+    model_config: Any,
+    quant_contract: dict[str, Any] | None,
+    lora_specs: tuple[tuple[str, float, tuple], ...],
+) -> str:
+    policy = _normalize_flux2_lab_patch_policy(patch_policy)
+    kind = _flux2_quant_contract_kind(quant_contract)
+
+    if not lora_specs:
+        if policy == _FLUX2_LAB_PRODUCT_CURRENT:
+            return _FLUX2_LAB_NO_LORA
+        if policy == _FLUX2_LAB_DENSE_WEIGHT_PATCH:
+            return _FLUX2_LAB_DENSE_WEIGHT_PATCH
+        if policy == _FLUX2_LAB_AUTO_COMFY_LAYERED:
+            if kind == _FLUX2_QUANT_RAW_FP8 and _flux2_raw_fp8_dense_dtype(quant_contract) is not None:
+                return _FLUX2_LAB_DENSE_WEIGHT_PATCH
+        return _FLUX2_LAB_NO_LORA
+
+    if policy != _FLUX2_LAB_AUTO_COMFY_LAYERED:
+        return policy
+
+    model_name = str(getattr(model_config, "model_name", "") or "").lower()
+    if kind == _FLUX2_QUANT_DENSE_BF16:
+        if _flux2_is_9b_model_config(model_config) and "kv" not in model_name:
+            return _FLUX2_LAB_DENSE_WEIGHT_PATCH
+        return _FLUX2_LAB_RUNTIME_REBIND
+    if kind == _FLUX2_QUANT_RAW_FP8:
+        return _FLUX2_LAB_DENSE_WEIGHT_PATCH
+    if kind in {_FLUX2_QUANT_SCALED_FP8, _FLUX2_QUANT_COMFY, _FLUX2_QUANT_COMFY_MXFP8}:
+        return _FLUX2_LAB_QUANTIZED_REQUANTIZE
+    return _FLUX2_LAB_RUNTIME_REBIND
+
+
+def _flux2_lab_strategy_notes(
+    strategy: str,
+    model_config: Any,
+    quant_contract: dict[str, Any] | None,
+) -> list[str]:
+    kind = _flux2_quant_contract_kind(quant_contract)
+    notes: list[str] = []
+    if strategy == _FLUX2_LAB_DENSE_WEIGHT_PATCH:
+        notes.append("LoRA stack patches dense target weights before sampling.")
+        if kind == _FLUX2_QUANT_RAW_FP8:
+            notes.append("raw-FP8 source uses dense compatibility materialization first.")
+    elif strategy == _FLUX2_LAB_RUNTIME_REBIND:
+        notes.append("LoRA wrappers are stripped/rebound on warm cache reuse.")
+    elif strategy == _FLUX2_LAB_QUANTIZED_REQUANTIZE:
+        notes.append("LoRA stack patches quantized targets through dequantize/add/requantize.")
+    elif strategy == _FLUX2_LAB_QUANTIZED_DENSE_TOUCHED:
+        notes.append("Diagnostic: touched quantized targets remain dense after LoRA patch.")
+    elif strategy == _FLUX2_LAB_PRODUCT_CURRENT:
+        notes.append("Uses the current validated product decision tree.")
+    elif strategy == _FLUX2_LAB_NO_LORA:
+        notes.append("No active LoRA stack.")
+
+    if strategy == _FLUX2_LAB_DENSE_WEIGHT_PATCH and kind == _FLUX2_QUANT_RAW_FP8:
+        notes.append("Lab keeps the raw-FP8 dense compatibility branch stable even with no active LoRA.")
+
+    if _flux2_is_4b_model_config(model_config):
+        notes.append("4B branch remains conservative in Lab V1 unless explicitly overridden.")
+    return notes
+
+
+def _flux2_lab_conditioning_ref_count(*conditionings: Any) -> int:
+    total = 0
+    for conditioning in conditionings:
+        if isinstance(conditioning, dict):
+            total += len(conditioning.get("reference_latents") or [])
+    return total
+
+
+def _flux2_build_lab_runtime_plan(
+    sdmlx_model: dict[str, Any],
+    *,
+    patch_policy: Any = _FLUX2_LAB_AUTO_COMFY_LAYERED,
+    positive: Any = None,
+    negative: Any = None,
+) -> dict[str, Any]:
+    if not is_flux2_sdmlx_model(sdmlx_model):
+        raise RuntimeError("SDMLX FLUX.2 Lab Runtime Plan: connect a FLUX.2 Klein model.")
+    root = Path(str(sdmlx_model["model_path"])).expanduser()
+    config_name = str(sdmlx_model.get("model_config") or "")
+    model_config = _flux2_model_config_by_name(config_name) if config_name else _model_config_for_root(root)
+    transformer_path = _flux2_transformer_file(root)
+    quant_contract = sdmlx_model.get("transformer_quant_contract")
+    if not isinstance(quant_contract, dict) and transformer_path is not None:
+        quant_contract = _flux2_inspect_transformer_quant_contract(transformer_path)
+    kind = _flux2_quant_contract_kind(quant_contract)
+    lora_specs = flux2_lora_specs_from_model(sdmlx_model)
+    policy = _normalize_flux2_lab_patch_policy(patch_policy)
+    strategy = _flux2_lab_effective_lora_strategy(policy, model_config, quant_contract, lora_specs)
+    model_name = str(getattr(model_config, "model_name", "") or config_name or root.name)
+    reference_count = _flux2_lab_conditioning_ref_count(positive, negative)
+    supports_kv = bool(getattr(model_config, "supports_kv_cache", False))
+    lora_identity = [
+        {
+            "path": path,
+            "strength": float(strength),
+            "identity": list(identity) if isinstance(identity, tuple) else identity,
+        }
+        for path, strength, identity in lora_specs
+    ]
+    plan = {
+        "type": _FLUX2_LAB_RUNTIME_PLAN_TYPE,
+        "model_family": FLUX2_MODEL_FAMILY,
+        "model_path": str(root),
+        "model_name": str(sdmlx_model.get("model_name") or root.name),
+        "model_config": model_name,
+        "model_size": "9B" if _flux2_is_9b_model_config(model_config) else "4B" if _flux2_is_4b_model_config(model_config) else "unknown",
+        "quant_kind": kind,
+        "quant_policy": (quant_contract or {}).get("policy"),
+        "patch_policy": policy,
+        "lora_patch_strategy": strategy,
+        "lora_count": len(lora_specs),
+        "lora_identity": lora_identity,
+        "reference_count": int(reference_count),
+        "supports_kv_cache": supports_kv,
+        "raw_fp8_dense_dtype": _flux2_raw_fp8_dense_dtype(quant_contract),
+        "notes": _flux2_lab_strategy_notes(strategy, model_config, quant_contract),
+    }
+    return plan
+
+
+def _flux2_lab_plan_summary(plan: dict[str, Any]) -> str:
+    notes = "; ".join(str(item) for item in plan.get("notes") or [])
+    return (
+        f"model={plan.get('model_name')} config={plan.get('model_config')} "
+        f"size={plan.get('model_size')} quant={plan.get('quant_kind')} "
+        f"policy={plan.get('patch_policy')} strategy={plan.get('lora_patch_strategy')} "
+        f"loras={plan.get('lora_count')} refs={plan.get('reference_count')} "
+        f"kv={plan.get('supports_kv_cache')}"
+        + (f"\n{notes}" if notes else "")
+    )
+
+
+def _flux2_lora_strategy_from_runtime_plan(plan: Any) -> str | None:
+    if not isinstance(plan, dict):
+        return None
+    strategy = _normalize_flux2_lab_lora_patch_strategy(plan.get("lora_patch_strategy"))
+    if strategy in {"", _FLUX2_LAB_PRODUCT_CURRENT, _FLUX2_LAB_NO_LORA}:
+        return None
+    return strategy
+
+
+def _flux2_suite_lora_patch_strategy(
+    sdmlx_model: dict[str, Any],
+    *,
+    positive: Any = None,
+    negative: Any = None,
+) -> str | None:
+    explicit = _normalize_flux2_lab_lora_patch_strategy(sdmlx_model.get("_flux2_lab_lora_patch_strategy"))
+    if explicit not in {"", _FLUX2_LAB_PRODUCT_CURRENT, _FLUX2_LAB_NO_LORA}:
+        return explicit
+    plan = _flux2_build_lab_runtime_plan(
+        sdmlx_model,
+        patch_policy=_FLUX2_LAB_AUTO_COMFY_LAYERED,
+        positive=positive,
+        negative=negative,
+    )
+    return _flux2_lora_strategy_from_runtime_plan(plan)
+
+
 def _validate_flux2_lora_specs(lora_specs: tuple[tuple[str, float, tuple], ...], model_config: Any) -> None:
     if not lora_specs:
         return
@@ -3240,6 +3568,313 @@ def _flux2_rebind_runtime_loras(model: Any, lora_specs: tuple[tuple[str, float, 
     )
 
 
+def _flux2_dense_lora_bake_allowed(
+    model_config,
+    transformer_quant_contract: dict[str, Any] | None,
+    *,
+    has_quantized_modules: bool,
+    lora_specs: tuple[tuple[str, float, tuple], ...],
+) -> bool:
+    if not lora_specs or has_quantized_modules:
+        return False
+    if _flux2_quant_contract_kind(transformer_quant_contract) != _FLUX2_QUANT_DENSE_BF16:
+        return False
+    overrides = getattr(model_config, "text_encoder_overrides", None) or {}
+    hidden_size = int(overrides.get("hidden_size") or 0)
+    model_name = str(getattr(model_config, "model_name", "") or "").lower()
+    if hidden_size != 4096 or "9b" not in model_name or "kv" in model_name:
+        return False
+    value = str(os.environ.get("SDMLX_FLUX2_DENSE_LORA_BAKE") or "").strip().lower()
+    return value in {"1", "true", "on", "yes", "bf16", "dense"}
+
+
+def _flux2_bake_dense_lora_with_stats(module: Any) -> dict[str, int | float]:
+    _ensure_suite_qwen_native_runtime()
+    from sdmlx_qwen_native.models.common.lora.layer.fused_linear_lora_layer import FusedLoRALinear
+    from sdmlx_qwen_native.models.common.lora.layer.linear_lora_layer import LoRALinear
+    from sdmlx_qwen_native.models.common.lora.layer.lokr_linear_layer import LoKrLinear
+
+    import time
+
+    stats: dict[str, int | float] = {
+        "wrappers": 0,
+        "baked_modules": 0,
+        "baked_loras": 0,
+        "passthrough": 0,
+        "skipped": 0,
+        "seconds": 0.0,
+    }
+
+    def _assign(parent: Any, attr_name: str | None, idx: int | None, new_child: Any) -> None:
+        if parent is None:
+            return
+        if isinstance(parent, list) and idx is not None:
+            parent[idx] = new_child
+        elif isinstance(parent, dict) and attr_name is not None:
+            parent[attr_name] = new_child
+        elif attr_name is not None:
+            setattr(parent, attr_name, new_child)
+
+    def _apply_lora_delta(base_linear: Any, lora_layer: Any) -> bool:
+        if not isinstance(lora_layer, LoRALinear) or not hasattr(base_linear, "weight"):
+            return False
+        if isinstance(base_linear, nn.QuantizedLinear):
+            return False
+
+        weight = base_linear.weight
+        delta = mx.matmul(lora_layer.lora_A.astype(mx.float32), lora_layer.lora_B.astype(mx.float32))
+        delta = mx.transpose(delta) * float(getattr(lora_layer, "scale", 1.0))
+        if tuple(weight.shape) != tuple(delta.shape):
+            stats["skipped"] = int(stats["skipped"]) + 1
+            return False
+        base_linear.weight = (weight.astype(mx.float32) + delta).astype(weight.dtype)
+        mx.eval(base_linear.weight)
+        stats["baked_loras"] = int(stats["baked_loras"]) + 1
+        return True
+
+    def _bake(base_linear: Any, loras: list[Any]) -> Any:
+        if isinstance(base_linear, nn.QuantizedLinear) or not hasattr(base_linear, "weight"):
+            stats["skipped"] = int(stats["skipped"]) + len(loras)
+            return FusedLoRALinear(base_linear=base_linear, loras=loras) if loras else base_linear
+
+        passthrough_loras: list[Any] = []
+        baked_here = 0
+        for lora in loras:
+            if isinstance(lora, LoRALinear) and _apply_lora_delta(base_linear, lora):
+                baked_here += 1
+            else:
+                passthrough_loras.append(lora)
+
+        if baked_here:
+            stats["baked_modules"] = int(stats["baked_modules"]) + 1
+        if passthrough_loras:
+            stats["passthrough"] = int(stats["passthrough"]) + len(passthrough_loras)
+            return FusedLoRALinear(base_linear=base_linear, loras=passthrough_loras)
+        return base_linear
+
+    def _walk(obj: Any, parent: Any = None, attr_name: str | None = None, idx: int | None = None) -> None:
+        if isinstance(obj, FusedLoRALinear):
+            stats["wrappers"] = int(stats["wrappers"]) + 1
+            new_child = _bake(obj.base_linear, list(obj.loras))
+            _assign(parent, attr_name, idx, new_child)
+            return
+        if isinstance(obj, LoRALinear):
+            stats["wrappers"] = int(stats["wrappers"]) + 1
+            new_child = _bake(obj.linear, [obj])
+            _assign(parent, attr_name, idx, new_child)
+            return
+        if isinstance(obj, LoKrLinear):
+            return
+
+        if isinstance(obj, list):
+            for index, child in enumerate(list(obj)):
+                _walk(child, obj, None, index)
+            return
+        if isinstance(obj, tuple):
+            temp_list = list(obj)
+            for index, child in enumerate(temp_list):
+                _walk(child, temp_list, None, index)
+            if parent is not None:
+                _assign(parent, attr_name, idx, type(obj)(temp_list))
+            return
+        if isinstance(obj, dict):
+            for key, child in list(obj.items()):
+                _walk(child, obj, key, None)
+            return
+        if isinstance(obj, nn.Module):
+            for name, child in list(vars(obj).items()):
+                if isinstance(child, (nn.Module, list, tuple, dict)):
+                    _walk(child, obj, name, None)
+
+    t0 = time.perf_counter()
+    _walk(module)
+    mx.clear_cache()
+    gc.collect()
+    stats["seconds"] = time.perf_counter() - t0
+    return stats
+
+
+def _flux2_negated_lora_specs(
+    lora_specs: tuple[tuple[str, float, tuple], ...],
+) -> tuple[tuple[str, float, tuple], ...]:
+    return tuple((path, -float(scale), identity) for path, scale, identity in lora_specs)
+
+
+def _flux2_lora_specs_dense_reversible_supported(
+    lora_specs: tuple[tuple[str, float, tuple], ...],
+) -> bool:
+    for path, _scale, _identity in lora_specs:
+        try:
+            with safe_open(str(path), framework="pt", device="cpu") as handle:
+                keys = [str(key).lower() for key in handle.keys()]
+        except Exception:
+            return False
+        joined = "\n".join(keys)
+        unsupported_markers = (
+            "lokr",
+            "hada",
+            "ia3",
+            "boft",
+            ".oft",
+            "dora",
+        )
+        if any(marker in joined for marker in unsupported_markers):
+            return False
+        if not any(token in joined for token in ("lora_a", "lora_b", "lora_down", "lora_up")):
+            return False
+    return True
+
+
+def _flux2_dense_lora_weight_patch_can_reverse(
+    model: Any,
+    current_specs: tuple[tuple[str, float, tuple], ...],
+    requested_specs: tuple[tuple[str, float, tuple], ...],
+) -> bool:
+    if not bool(getattr(model, "_sdmlx_lora_patch_reversible", False)):
+        return False
+    return (
+        _flux2_lora_specs_dense_reversible_supported(current_specs)
+        and _flux2_lora_specs_dense_reversible_supported(requested_specs)
+    )
+
+
+def _flux2_dense_lora_weight_patch_requires_reload(
+    model: Any,
+    lora_specs: tuple[tuple[str, float, tuple], ...],
+) -> bool:
+    current_specs = tuple(getattr(model, "_sdmlx_lora_specs", ()) or ())
+    patch_mode = str(getattr(model, "_sdmlx_lora_patch_mode", "") or "")
+    requested = tuple(lora_specs)
+    if current_specs == requested:
+        return False
+    # Product dense-BF16 keeps the cached model either clean or patched for one
+    # LoRA stack. The Lab raw-FP8 branch may opt into reversible A/B patch
+    # switching to avoid full base reloads while testing Comfy-like layering.
+    if patch_mode == "dense_weight_patch" and bool(current_specs):
+        return not _flux2_dense_lora_weight_patch_can_reverse(model, current_specs, requested)
+    return patch_mode == "dense_weight_patch" and bool(current_specs)
+
+
+def _flux2_apply_dense_lora_delta_specs(
+    model: Any,
+    lora_specs: tuple[tuple[str, float, tuple], ...],
+    *,
+    strict_ab_only: bool,
+) -> tuple[dict[str, int | float], int]:
+    stats: dict[str, int | float] = {
+        "wrappers": 0,
+        "baked_modules": 0,
+        "baked_loras": 0,
+        "passthrough": 0,
+        "skipped": 0,
+        "seconds": 0.0,
+    }
+    removed = _flux2_strip_lora_wrappers(model.transformer)
+    if not lora_specs:
+        return stats, removed
+    if strict_ab_only and not _flux2_lora_specs_dense_reversible_supported(lora_specs):
+        raise RuntimeError(
+            "SDMLX FLUX.2 Lab: reversible dense LoRA switching supports only normal A/B LoRAs; "
+            "reload the clean base for this adapter type."
+        )
+
+    from sdmlx_qwen_native.models.flux2.flux2_initializer import Flux2Initializer
+
+    lora_paths = [path for path, _scale, _identity in lora_specs]
+    lora_scales = [scale for _path, scale, _identity in lora_specs]
+    Flux2Initializer._apply_lora(model, lora_paths, lora_scales)
+    stats = _flux2_bake_dense_lora_with_stats(model.transformer)
+    remaining = _flux2_strip_lora_wrappers(model.transformer)
+    if strict_ab_only and (
+        int(stats.get("passthrough") or 0) > 0
+        or int(stats.get("skipped") or 0) > 0
+        or int(remaining or 0) > 0
+    ):
+        raise RuntimeError(
+            "SDMLX FLUX.2 Lab: reversible dense LoRA switch found unbaked adapter wrappers; "
+            "reload the clean base for this adapter stack."
+        )
+    return stats, removed + remaining
+
+
+def _flux2_apply_dense_lora_weight_patch(
+    model: Any,
+    lora_specs: tuple[tuple[str, float, tuple], ...],
+) -> None:
+    requested = tuple(lora_specs)
+    current_specs = tuple(getattr(model, "_sdmlx_lora_specs", ()) or ())
+    patch_mode = str(getattr(model, "_sdmlx_lora_patch_mode", "") or "")
+    if patch_mode == "dense_weight_patch" and current_specs == requested:
+        return
+    reversible_switch = (
+        patch_mode == "dense_weight_patch"
+        and bool(current_specs)
+        and current_specs != requested
+        and _flux2_dense_lora_weight_patch_can_reverse(model, current_specs, requested)
+    )
+    if _flux2_dense_lora_weight_patch_requires_reload(model, requested):
+        raise RuntimeError(
+            "SDMLX FLUX.2 Klein: dense LoRA weight patch stack changed on an already patched model; "
+            "reload the clean base model before applying the new LoRA stack."
+        )
+
+    removed = 0
+    undo_stats = None
+    if reversible_switch:
+        undo_stats, removed = _flux2_apply_dense_lora_delta_specs(
+            model,
+            _flux2_negated_lora_specs(current_specs),
+            strict_ab_only=True,
+        )
+
+    if not requested:
+        if not reversible_switch:
+            removed += _flux2_strip_lora_wrappers(model.transformer)
+        model._sdmlx_lora_specs = ()
+        model._sdmlx_lora_patch_mode = "dense_weight_patch"
+        if removed:
+            gc.collect()
+            mx.clear_cache()
+        if reversible_switch:
+            _flux2_log(
+                "SDMLX FLUX.2 Lab: reversible dense LoRA switch "
+                f"(undo_loras={int((undo_stats or {}).get('baked_loras') or 0)}, "
+                "apply_loras=0)",
+                verbose=True,
+            )
+        return
+
+    patch_stats, patch_removed = _flux2_apply_dense_lora_delta_specs(
+        model,
+        requested,
+        strict_ab_only=bool(getattr(model, "_sdmlx_lora_patch_reversible", False)),
+    )
+    removed += patch_removed
+    model._sdmlx_lora_specs = requested
+    model._sdmlx_lora_patch_mode = "dense_weight_patch"
+    if removed or int(patch_stats.get("wrappers") or 0) > 0:
+        gc.collect()
+        mx.clear_cache()
+    if reversible_switch:
+        _flux2_log(
+            "SDMLX FLUX.2 Lab: reversible dense LoRA switch "
+            f"(undo_loras={int((undo_stats or {}).get('baked_loras') or 0)}, "
+            f"apply_loras={int(patch_stats.get('baked_loras') or 0)}, "
+            f"time={float((undo_stats or {}).get('seconds') or 0.0) + float(patch_stats.get('seconds') or 0.0):.2f}s)",
+            verbose=True,
+        )
+    else:
+        _flux2_log(
+            "SDMLX FLUX.2 Klein: dense LoRA weight patch "
+            f"(modules={int(patch_stats.get('baked_modules') or 0)}, "
+            f"loras={int(patch_stats.get('baked_loras') or 0)}, "
+            f"passthrough={int(patch_stats.get('passthrough') or 0)}, "
+            f"skipped={int(patch_stats.get('skipped') or 0)}, "
+            f"time={float(patch_stats.get('seconds') or 0.0):.2f}s)",
+            verbose=True,
+        )
+
+
 def _validate_flux2_text_encoder_for_model(text_encoder_path: Path, model_config) -> None:
     expected_hidden = int((model_config.text_encoder_overrides or {}).get("hidden_size") or 0)
     actual_hidden = int(_flux2_text_encoder_hidden_size(text_encoder_path) or 0)
@@ -3390,10 +4025,9 @@ def _flux2_text_encoder_uses_comfy_quant(path: Path) -> bool:
         return False
 
 
-def _flux2_text_encoder_cache_metadata(path: Path, model_config) -> dict[str, str]:
-    identity = _flux2_file_identity(path)
+def _flux2_text_encoder_cache_model_config_payload(model_config) -> dict[str, Any]:
     overrides = model_config.text_encoder_overrides or {}
-    config_payload = {
+    return {
         "model_name": str(getattr(model_config, "model_name", "")),
         "hidden_size": int(overrides.get("hidden_size") or 0),
         "intermediate_size": int(overrides.get("intermediate_size") or 0),
@@ -3402,6 +4036,11 @@ def _flux2_text_encoder_cache_metadata(path: Path, model_config) -> dict[str, st
         "num_key_value_heads": int(overrides.get("num_key_value_heads") or 0),
         "head_dim": int(overrides.get("head_dim") or _FLUX2_HEAD_DIM),
     }
+
+
+def _flux2_text_encoder_cache_metadata(path: Path, model_config) -> dict[str, str]:
+    identity = _flux2_file_identity(path)
+    config_payload = _flux2_text_encoder_cache_model_config_payload(model_config)
     return {
         "cache_format": _FLUX2_TEXT_ENCODER_CACHE_FORMAT,
         "source_path": str(identity["source_path"]),
@@ -3419,7 +4058,76 @@ def _flux2_text_encoder_cache_path(path: Path, model_config) -> Path:
     digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:16]
     safe_stem = _flux2_safe_package_name(path)
     hidden = (model_config.text_encoder_overrides or {}).get("hidden_size") or "qwen3"
-    return _flux2_text_encoder_cache_dir() / f"{safe_stem}-h{hidden}-{digest}.safetensors"
+    return _flux2_text_encoder_prepared_cache_dir() / f"{safe_stem}-h{hidden}-{digest}" / "weights.safetensors"
+
+
+def _flux2_text_encoder_cache_manifest_path(cache_path: Path) -> Path:
+    return cache_path.parent / "manifest.json"
+
+
+def _flux2_text_encoder_cache_manifest_entry(
+    source_path: Path,
+    model_config,
+    cache_path: Path | None = None,
+) -> dict[str, Any]:
+    source_path = source_path.expanduser().resolve()
+    cache_path = cache_path or _flux2_text_encoder_cache_path(source_path, model_config)
+    identity = _flux2_file_identity(source_path)
+    return {
+        "format": _FLUX2_TEXT_ENCODER_CACHE_MANIFEST_FORMAT,
+        "kind": "prepared_text_encoder",
+        "model_family": FLUX2_MODEL_FAMILY,
+        "component": "text_encoder",
+        "cache_format": _FLUX2_TEXT_ENCODER_CACHE_FORMAT,
+        "storage": "sdmlx_cache",
+        "path": _flux2_manifest_path(cache_path),
+        "manifest": _flux2_manifest_path(_flux2_text_encoder_cache_manifest_path(cache_path)),
+        "source_identity": identity,
+        "model_config": _flux2_text_encoder_cache_model_config_payload(model_config),
+        "derived_from": _flux2_manifest_path(source_path),
+    }
+
+
+def _flux2_write_text_encoder_cache_manifest(
+    source_path: Path,
+    model_config,
+    cache_path: Path | None = None,
+) -> dict[str, Any]:
+    cache_path = cache_path or _flux2_text_encoder_cache_path(source_path, model_config)
+    manifest = _flux2_text_encoder_cache_manifest_entry(source_path, model_config, cache_path)
+    manifest_path = _flux2_text_encoder_cache_manifest_path(cache_path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = manifest_path.with_name(".manifest.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp_path, manifest_path)
+    return manifest
+
+
+def _flux2_refresh_package_text_encoder_cache_manifest_entry(
+    package_path: Path,
+    manifest: dict[str, Any],
+    text_encoder_path: str | os.PathLike[str] | None,
+    model_config,
+    transformer_quant_contract: dict[str, Any] | None,
+) -> tuple[dict[str, Any], bool]:
+    if not text_encoder_path or not _flux2_prepared_text_encoder_cache_allowed(model_config, transformer_quant_contract):
+        return manifest, False
+    source_path = Path(text_encoder_path).expanduser()
+    if not source_path.is_file() or not _flux2_text_encoder_uses_comfy_quant(source_path):
+        return manifest, False
+    prepared = _flux2_text_encoder_cache_manifest_entry(source_path, model_config)
+    updated = dict(manifest or {})
+    components = dict(updated.get("components") or {})
+    text_entry = dict(components.get("text_encoder") or {})
+    if text_entry.get("prepared_cache") == prepared:
+        return manifest, False
+    text_entry["prepared_cache"] = prepared
+    components["text_encoder"] = text_entry
+    updated["components"] = components
+    _write_flux2_manifest(package_path, updated)
+    return updated, True
 
 
 def _flux2_flatten_weight_tree(tree: Any, prefix: str = "") -> dict[str, mx.array]:
@@ -3450,7 +4158,11 @@ def _flux2_load_prepared_text_encoder_cache(path: Path, model_config) -> dict[st
         for key, expected in expected_metadata.items():
             if str(metadata.get(key) or "") != str(expected):
                 return None
-        _flux2_log(f"SDMLX FLUX.2 Klein CLIP cache: hit {cache_path.name}", verbose=True)
+        try:
+            _flux2_write_text_encoder_cache_manifest(path, model_config, cache_path)
+        except Exception:
+            pass
+        _flux2_log(f"SDMLX FLUX.2 Klein CLIP cache: hit {cache_path.parent.name}", verbose=True)
         return tree_unflatten(list(dict(arrays.items()).items()))
     except Exception:
         try:
@@ -3465,15 +4177,17 @@ def _flux2_store_prepared_text_encoder_cache(path: Path, model_config, weights: 
     if cache_path.is_file() and cache_path.stat().st_size > 0:
         return
     flat = _flux2_flatten_weight_tree(weights)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.with_name(f".{cache_path.stem}.tmp.safetensors")
     metadata = _flux2_text_encoder_cache_metadata(path, model_config)
     try:
         mx.save_safetensors(str(tmp_path), flat, metadata=metadata)
         os.replace(tmp_path, cache_path)
+        _flux2_write_text_encoder_cache_manifest(path, model_config, cache_path)
         size_gib = cache_path.stat().st_size / (1024**3)
         _flux2_log(
             "SDMLX FLUX.2 Klein CLIP cache: stored "
-            f"{cache_path.name} ({size_gib:.2f} GiB, source load {elapsed_s:.2f}s)",
+            f"{cache_path.parent.name} ({size_gib:.2f} GiB, source load {elapsed_s:.2f}s)",
             verbose=True,
         )
     except Exception as exc:
@@ -3487,7 +4201,12 @@ def _flux2_store_prepared_text_encoder_cache(path: Path, model_config, weights: 
         )
 
 
-def _load_flux2_text_encoder_weights(text_encoder_path: str | os.PathLike[str], model_config) -> dict[str, Any]:
+def _load_flux2_text_encoder_weights(
+    text_encoder_path: str | os.PathLike[str],
+    model_config,
+    *,
+    prepared_cache: bool = False,
+) -> dict[str, Any]:
     path = Path(text_encoder_path).expanduser()
     _validate_flux2_text_encoder_for_model(path, model_config)
     standalone_dir = _flux2_standalone_text_encoder_dir(path)
@@ -3510,7 +4229,7 @@ def _load_flux2_text_encoder_weights(text_encoder_path: str | os.PathLike[str], 
         raise RuntimeError(f"SDMLX FLUX.2 Klein CLIP: unsupported Qwen3 text encoder file: {path.name}")
 
     use_prepared_cache = (
-        _flux2_prepared_text_encoder_cache_enabled()
+        bool(prepared_cache)
         and _flux2_text_encoder_uses_comfy_quant(path)
     )
     if use_prepared_cache:
@@ -3618,6 +4337,7 @@ def _load_flux2_packed_model(
     clip_path: str | None = None,
     tokenizer_path: str | None = None,
     lora_specs: tuple[tuple[str, float, tuple], ...] = (),
+    lora_quant_bake_mode: str | None = None,
 ):
     _ensure_suite_qwen_native_runtime()
     from sdmlx_qwen_native.models.common.weights.loading.weight_loader import WeightLoader
@@ -3645,7 +4365,11 @@ def _load_flux2_packed_model(
         if component.name == "vae" and vae_variant == _FLUX2_VAE_SMALL_DECODER:
             continue
         if component.name == "text_encoder" and clip_path:
-            weights = _load_flux2_text_encoder_weights(clip_path, model_config)
+            weights = _load_flux2_text_encoder_weights(
+                clip_path,
+                model_config,
+                prepared_cache=_flux2_prepared_text_encoder_cache_allowed(model_config, transformer_quant_contract),
+            )
         elif component.name == "vae" and vae_path:
             weights = Flux2Initializer._load_vae_from_file(vae_path).components["vae"]
         else:
@@ -3679,8 +4403,29 @@ def _load_flux2_packed_model(
     lora_paths = [path for path, _scale, _identity in lora_specs] or None
     lora_scales = [scale for _path, scale, _identity in lora_specs] or None
     Flux2Initializer._apply_lora(model, lora_paths, lora_scales)
-    lora_quant_bake_mode = _flux2_lora_quant_bake_mode()
-    if has_quantized_modules and lora_specs and lora_quant_bake_mode != _FLUX2_LORA_QUANT_BAKE_OFF:
+    lora_quant_bake_mode = str(lora_quant_bake_mode or _flux2_lora_quant_bake_mode()).strip().lower().replace("-", "_")
+    if lora_quant_bake_mode == _FLUX2_LAB_QUANTIZED_REQUANTIZE:
+        lora_quant_bake_mode = _FLUX2_LORA_QUANT_BAKE_REQUANTIZE
+    elif lora_quant_bake_mode == _FLUX2_LAB_QUANTIZED_DENSE_TOUCHED:
+        lora_quant_bake_mode = _FLUX2_LORA_QUANT_BAKE_DENSE_TOUCHED
+    if _flux2_dense_lora_bake_allowed(
+        model_config,
+        transformer_quant_contract,
+        has_quantized_modules=has_quantized_modules,
+        lora_specs=lora_specs,
+    ):
+        bake_stats = _flux2_bake_dense_lora_with_stats(model.transformer)
+        if int(bake_stats.get("baked_loras") or 0) > 0:
+            _flux2_log(
+                "SDMLX FLUX.2 Klein: baked LoRA into dense BF16 weights "
+                f"(modules={int(bake_stats.get('baked_modules') or 0)}, "
+                f"loras={int(bake_stats.get('baked_loras') or 0)}, "
+                f"passthrough={int(bake_stats.get('passthrough') or 0)}, "
+                f"skipped={int(bake_stats.get('skipped') or 0)}, "
+                f"time={float(bake_stats.get('seconds') or 0.0):.2f}s)",
+                verbose=True,
+            )
+    elif has_quantized_modules and lora_specs and lora_quant_bake_mode != _FLUX2_LORA_QUANT_BAKE_OFF:
         from sdmlx_qwen_native.models.common.lora.mapping.lora_saver import LoRASaver
 
         keep_touched_dense = lora_quant_bake_mode == _FLUX2_LORA_QUANT_BAKE_DENSE_TOUCHED
@@ -3689,7 +4434,7 @@ def _load_flux2_packed_model(
             keep_touched_dense=keep_touched_dense,
         )
         if int(bake_stats.get("baked_loras") or 0) > 0:
-            print(
+            _flux2_log(
                 "SDMLX FLUX.2 Klein: baked LoRA into quantized weights "
                 f"(mode={lora_quant_bake_mode}, "
                 f"modules={int(bake_stats.get('baked_modules') or 0)}, "
@@ -3699,7 +4444,7 @@ def _load_flux2_packed_model(
                 f"passthrough={int(bake_stats.get('passthrough') or 0)}, "
                 f"skipped={int(bake_stats.get('skipped') or 0)}, "
                 f"time={float(bake_stats.get('seconds') or 0.0):.2f}s)",
-                flush=True,
+                verbose=True,
             )
     return model
 
@@ -3734,7 +4479,14 @@ def _ensure_flux2_text_encoder_loaded(model: Any, root: Path, clip_path: str | N
         if component.name == "text_encoder"
     )
     if clip_path:
-        weights = _load_flux2_text_encoder_weights(clip_path, model.model_config)
+        weights = _load_flux2_text_encoder_weights(
+            clip_path,
+            model.model_config,
+            prepared_cache=_flux2_prepared_text_encoder_cache_allowed(
+                model.model_config,
+                getattr(model, "transformer_quant_contract", None),
+            ),
+        )
     else:
         weights, _q_level, _version = WeightLoader._load_component(root, component)
     model.text_encoder.update(weights, strict=False)
@@ -3763,6 +4515,8 @@ def _load_flux2_model(
     clip_path: str | None = None,
     tokenizer_path: str | None = None,
     lora_specs: tuple[tuple[str, float, tuple], ...] = (),
+    require_text_encoder: bool = True,
+    lora_patch_strategy: str | None = None,
 ):
     _ensure_suite_qwen_native_runtime()
     from sdmlx_qwen_native.models.flux2.flux2_initializer import Flux2Initializer
@@ -3770,6 +4524,7 @@ def _load_flux2_model(
 
     mode = "edit" if edit else "txt2img"
     vae_variant = _normalize_flux2_vae_variant(vae_variant)
+    lab_lora_patch_strategy = _normalize_flux2_lab_lora_patch_strategy(lora_patch_strategy)
     lora_quant_bake_mode = _flux2_lora_quant_bake_mode()
     transformer_path = _flux2_transformer_file(root)
     transformer_quant_contract = (
@@ -3777,10 +4532,58 @@ def _load_flux2_model(
         if _is_packed_flux2_transformer(transformer_path)
         else None
     )
+    model_config = _flux2_model_config_by_name(config_name) if config_name else _model_config_for_root(root)
+    quant_kind = _flux2_quant_contract_kind(transformer_quant_contract)
     raw_fp8_dense_dtype = _flux2_raw_fp8_dense_dtype(transformer_quant_contract) or ""
-    lora_rebind_enabled = _flux2_runtime_lora_rebind_enabled(transformer_quant_contract)
-    lora_cache_key = () if lora_rebind_enabled else tuple(lora_specs)
-    lora_mode_key = "runtime_rebind" if lora_rebind_enabled else lora_quant_bake_mode
+    dense_lora_reversible_enabled = False
+    dense_lora_weight_patch_enabled = _flux2_dense_lora_weight_patch_enabled(transformer_quant_contract, model_config)
+    lora_rebind_enabled = (
+        not dense_lora_weight_patch_enabled
+        and _flux2_runtime_lora_rebind_enabled(transformer_quant_contract, model_config)
+    )
+    if lab_lora_patch_strategy and lab_lora_patch_strategy not in {
+        _FLUX2_LAB_PRODUCT_CURRENT,
+        _FLUX2_LAB_NO_LORA,
+    }:
+        if lab_lora_patch_strategy == _FLUX2_LAB_RUNTIME_REBIND:
+            dense_lora_weight_patch_enabled = False
+            lora_rebind_enabled = bool(lora_specs)
+        elif lab_lora_patch_strategy == _FLUX2_LAB_DENSE_WEIGHT_PATCH:
+            if quant_kind not in {_FLUX2_QUANT_DENSE_BF16, _FLUX2_QUANT_RAW_FP8}:
+                raise RuntimeError(
+                    "SDMLX FLUX.2 Lab: dense_weight_patch requires dense_bf16 or raw_fp8_unscaled dense "
+                    f"compatibility, got {quant_kind}."
+                )
+            if quant_kind == _FLUX2_QUANT_RAW_FP8 and not raw_fp8_dense_dtype:
+                raise RuntimeError(
+                    "SDMLX FLUX.2 Lab: dense_weight_patch for raw_fp8_unscaled requires the dense "
+                    "compatibility route. Set raw-FP8 dense mode to bf16/fp16 or use another lab policy."
+                )
+            dense_lora_weight_patch_enabled = True
+            dense_lora_reversible_enabled = quant_kind == _FLUX2_QUANT_RAW_FP8
+            lora_rebind_enabled = False
+        elif lab_lora_patch_strategy in {_FLUX2_LAB_QUANTIZED_REQUANTIZE, _FLUX2_LAB_QUANTIZED_DENSE_TOUCHED}:
+            if quant_kind not in {_FLUX2_QUANT_SCALED_FP8, _FLUX2_QUANT_COMFY, _FLUX2_QUANT_COMFY_MXFP8}:
+                raise RuntimeError(
+                    "SDMLX FLUX.2 Lab: quantized LoRA patching requires scaled_fp8/comfy_quant, "
+                    f"got {quant_kind}."
+                )
+            dense_lora_weight_patch_enabled = False
+            lora_rebind_enabled = False
+            lora_quant_bake_mode = (
+                _FLUX2_LORA_QUANT_BAKE_DENSE_TOUCHED
+                if lab_lora_patch_strategy == _FLUX2_LAB_QUANTIZED_DENSE_TOUCHED
+                else _FLUX2_LORA_QUANT_BAKE_REQUANTIZE
+            )
+    lora_cache_key = () if (lora_rebind_enabled or dense_lora_weight_patch_enabled) else tuple(lora_specs)
+    if lab_lora_patch_strategy and lab_lora_patch_strategy not in {_FLUX2_LAB_PRODUCT_CURRENT, _FLUX2_LAB_NO_LORA}:
+        lora_mode_key = f"strategy:{lab_lora_patch_strategy}:{lora_quant_bake_mode}"
+    elif dense_lora_weight_patch_enabled:
+        lora_mode_key = "dense_weight_patch"
+    elif lora_rebind_enabled:
+        lora_mode_key = "runtime_rebind"
+    else:
+        lora_mode_key = lora_quant_bake_mode
     key = (
         str(root.resolve()),
         config_name,
@@ -3795,12 +4598,21 @@ def _load_flux2_model(
     )
     cached = _FLUX2_MODEL_CACHE.get(key)
     if cached is not None:
+        cached._sdmlx_lora_patch_reversible = bool(dense_lora_reversible_enabled)
         if edit and not _flux2_model_supports_argument(cached, "reference_sizes"):
             _FLUX2_MODEL_CACHE.pop(key, None)
             _ensure_suite_qwen_native_runtime()
+        elif dense_lora_weight_patch_enabled and _flux2_dense_lora_weight_patch_requires_reload(cached, lora_specs):
+            _FLUX2_MODEL_CACHE.pop(key, None)
+            gc.collect()
+            mx.clear_cache()
+            cached = None
         else:
-            _ensure_flux2_text_encoder_loaded(cached, root, clip_path=clip_path)
-            if lora_rebind_enabled:
+            if require_text_encoder:
+                _ensure_flux2_text_encoder_loaded(cached, root, clip_path=clip_path)
+            if dense_lora_weight_patch_enabled:
+                _flux2_apply_dense_lora_weight_patch(cached, lora_specs)
+            elif lora_rebind_enabled:
                 _flux2_rebind_runtime_loras(cached, lora_specs)
             _apply_flux2_kv_first_step_barriers(cached, 0)
             _apply_flux2_decode_tiling_default(cached)
@@ -3812,9 +4624,8 @@ def _load_flux2_model(
         from sdmlx_qwen_native.models.flux2.variants import Flux2Klein, Flux2KleinEdit
     else:
         return cached
-    model_config = _flux2_model_config_by_name(config_name) if config_name else _model_config_for_root(root)
     _validate_flux2_lora_specs(lora_specs, model_config)
-    load_lora_specs = () if lora_rebind_enabled else lora_specs
+    load_lora_specs = () if (lora_rebind_enabled or dense_lora_weight_patch_enabled) else lora_specs
     if _is_packed_flux2_transformer(transformer_path):
         model = _load_flux2_packed_model(
             root,
@@ -3825,6 +4636,7 @@ def _load_flux2_model(
             clip_path=clip_path,
             tokenizer_path=tokenizer_path,
             lora_specs=load_lora_specs,
+            lora_quant_bake_mode=lora_quant_bake_mode,
         )
     else:
         cls = Flux2KleinEdit if edit else Flux2Klein
@@ -3845,7 +4657,11 @@ def _load_flux2_model(
             from sdmlx_qwen_native.models.flux2.model.flux2_text_encoder.qwen3_text_encoder import Qwen3TextEncoder
 
             model.text_encoder = Qwen3TextEncoder(**model.model_config.text_encoder_overrides)
-            weights = _load_flux2_text_encoder_weights(clip_path, model_config)
+            weights = _load_flux2_text_encoder_weights(
+                clip_path,
+                model_config,
+                prepared_cache=_flux2_prepared_text_encoder_cache_allowed(model_config, transformer_quant_contract),
+            )
             model.text_encoder.update(weights, strict=False)
             del weights
             gc.collect()
@@ -3859,9 +4675,13 @@ def _load_flux2_model(
         )
     model._sdmlx_model_path = str(root)
     model._sdmlx_clip_path = str(clip_path or "")
-    _ensure_flux2_text_encoder_loaded(model, root, clip_path=clip_path)
+    model._sdmlx_lora_patch_reversible = bool(dense_lora_reversible_enabled)
+    if require_text_encoder:
+        _ensure_flux2_text_encoder_loaded(model, root, clip_path=clip_path)
     model._sdmlx_lora_specs = tuple(load_lora_specs)
-    if lora_rebind_enabled:
+    if dense_lora_weight_patch_enabled:
+        _flux2_apply_dense_lora_weight_patch(model, lora_specs)
+    elif lora_rebind_enabled:
         _flux2_rebind_runtime_loras(model, lora_specs)
     _apply_flux2_kv_first_step_barriers(model, 0)
     _apply_flux2_decode_tiling_default(model)
@@ -4818,6 +5638,23 @@ class SDMLXFlux2KleinKSampler:
         profiler.mark("components resolved")
         root = Path(sdmlx_model["model_path"])
         lora_specs = flux2_lora_specs_from_model(sdmlx_model)
+        width, height, batch_size = self._latent_dimensions(latent_image)
+        positive_text = self._conditioning_text(positive, "positive")
+        negative_text = self._conditioning_text(negative, "negative")
+        references = self._conditioning_refs(positive, negative)
+        needs_negative_text = float(guidance) > 1.0
+        cached_positive_text = _flux2_get_cached_text_conditioning(sdmlx_model, positive_text)
+        cached_negative_text = (
+            _flux2_get_cached_text_conditioning(sdmlx_model, negative_text)
+            if needs_negative_text
+            else None
+        )
+        require_text_encoder = cached_positive_text is None or (needs_negative_text and cached_negative_text is None)
+        lora_patch_strategy = _flux2_suite_lora_patch_strategy(
+            sdmlx_model,
+            positive=positive,
+            negative=negative,
+        )
         model = _load_flux2_model(
             root,
             str(sdmlx_model.get("model_config") or ""),
@@ -4827,13 +5664,11 @@ class SDMLXFlux2KleinKSampler:
             clip_path=sdmlx_model.get("clip_path"),
             tokenizer_path=sdmlx_model.get("tokenizer_path"),
             lora_specs=lora_specs,
+            require_text_encoder=require_text_encoder,
+            lora_patch_strategy=lora_patch_strategy,
         )
         profiler.mark("model ready")
 
-        width, height, batch_size = self._latent_dimensions(latent_image)
-        positive_text = self._conditioning_text(positive, "positive")
-        negative_text = self._conditioning_text(negative, "negative")
-        references = self._conditioning_refs(positive, negative)
         profiler.mark("conditioning metadata")
 
         supports_kv = bool(getattr(model.model_config, "supports_kv_cache", False))
@@ -4858,28 +5693,49 @@ class SDMLXFlux2KleinKSampler:
         profiler.mark("scheduler config")
 
         try:
-            prompt_embeds, text_ids = _Flux2KleinEditHelpers.encode_text(
-                positive_text,
-                tokenizer=model.tokenizers["qwen3"],
-                text_encoder=model.text_encoder,
-            )
-            profiler.mark("positive text encode")
-            negative_prompt_embeds = None
-            negative_text_ids = None
-            if float(guidance) > 1.0:
-                negative_prompt_embeds, negative_text_ids = _Flux2KleinEditHelpers.encode_text(
-                    negative_text,
+            if cached_positive_text is not None:
+                prompt_embeds, text_ids = cached_positive_text
+                profiler.mark("positive text cache")
+            else:
+                prompt_embeds, text_ids = _Flux2KleinEditHelpers.encode_text(
+                    positive_text,
                     tokenizer=model.tokenizers["qwen3"],
                     text_encoder=model.text_encoder,
                 )
-                profiler.mark("negative text encode")
+                _flux2_store_text_conditioning(sdmlx_model, positive_text, prompt_embeds, text_ids)
+                profiler.mark("positive text encode")
+            negative_prompt_embeds = None
+            negative_text_ids = None
+            if needs_negative_text:
+                if cached_negative_text is not None:
+                    negative_prompt_embeds, negative_text_ids = cached_negative_text
+                    profiler.mark("negative text cache")
+                else:
+                    negative_prompt_embeds, negative_text_ids = _Flux2KleinEditHelpers.encode_text(
+                        negative_text,
+                        tokenizer=model.tokenizers["qwen3"],
+                        text_encoder=model.text_encoder,
+                    )
+                    _flux2_store_text_conditioning(
+                        sdmlx_model,
+                        negative_text,
+                        negative_prompt_embeds,
+                        negative_text_ids,
+                    )
+                    profiler.mark("negative text encode")
+            had_text_encoder = "text_encoder" in model
             model._release_text_encoder_after_encode(
                 prompt_embeds=prompt_embeds,
                 text_ids=text_ids,
                 negative_prompt_embeds=negative_prompt_embeds,
                 negative_text_ids=negative_text_ids,
             )
-            profiler.mark("text encoder retained" if keep_text_encoder else "text encoder released")
+            if keep_text_encoder:
+                profiler.mark("text encoder retained")
+            elif had_text_encoder:
+                profiler.mark("text encoder released")
+            else:
+                profiler.mark("text encoder skipped")
 
             latents, latent_ids, latent_height, latent_width = _Flux2KleinEditHelpers.prepare_generation_latents(
                 seed=int(seed),
@@ -5036,6 +5892,127 @@ class SDMLXFlux2KleinKSampler:
                     "vae_path": str(sdmlx_model.get("vae_path") or ""),
                 },
             },
+        )
+
+
+class SDMLXFlux2LabRuntimePlan:
+    _patch_policies = [
+        _FLUX2_LAB_AUTO_COMFY_LAYERED,
+        _FLUX2_LAB_PRODUCT_CURRENT,
+        _FLUX2_LAB_RUNTIME_REBIND,
+        _FLUX2_LAB_DENSE_WEIGHT_PATCH,
+        _FLUX2_LAB_QUANTIZED_REQUANTIZE,
+        _FLUX2_LAB_QUANTIZED_DENSE_TOUCHED,
+    ]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sdmlx_model": (MODEL_TYPE,),
+                "patch_policy": (cls._patch_policies, {"default": _FLUX2_LAB_AUTO_COMFY_LAYERED}),
+            },
+            "optional": {
+                "positive": ("mlx_conditioning",),
+                "negative": ("mlx_conditioning",),
+            },
+        }
+
+    RETURN_TYPES = (_FLUX2_LAB_RUNTIME_PLAN_TYPE, "STRING")
+    RETURN_NAMES = ("runtime_plan", "summary")
+    FUNCTION = "plan"
+    CATEGORY = "SDMLX/FLUX.2 Lab"
+
+    def plan(
+        self,
+        sdmlx_model,
+        patch_policy: str = _FLUX2_LAB_AUTO_COMFY_LAYERED,
+        positive=None,
+        negative=None,
+    ):
+        runtime_plan = _flux2_build_lab_runtime_plan(
+            sdmlx_model,
+            patch_policy=patch_policy,
+            positive=positive,
+            negative=negative,
+        )
+        return runtime_plan, _flux2_lab_plan_summary(runtime_plan)
+
+
+class SDMLXFlux2LabKSampler:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sdmlx_model": (MODEL_TYPE,),
+                "positive": ("mlx_conditioning",),
+                "negative": ("mlx_conditioning",),
+                "latent_image": ("LATENT,mlx_latent",),
+                "seed": ("INT", {"default": 1234567890, "min": 0, "max": 2**63 - 1}),
+                "steps": ("INT", {"default": 20, "min": 2, "max": 100}),
+                "guidance": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 20.0, "step": 0.1}),
+                "preview": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "runtime_plan": (_FLUX2_LAB_RUNTIME_PLAN_TYPE,),
+            },
+        }
+
+    RETURN_TYPES = ("mlx_latent",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "sample"
+    CATEGORY = "SDMLX/FLUX.2 Lab"
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        if _flux2_env_enabled("SDMLX_FLUX2_FORCE_RERUN"):
+            return time.time_ns()
+        return False
+
+    def sample(
+        self,
+        sdmlx_model,
+        positive,
+        negative,
+        latent_image,
+        seed: int,
+        steps: int,
+        guidance: float,
+        preview: bool = False,
+        runtime_plan: dict[str, Any] | None = None,
+    ):
+        if not is_flux2_sdmlx_model(sdmlx_model):
+            raise RuntimeError("SDMLX KSampler (FLUX.2 Lab): connect a FLUX.2 Klein model.")
+        if int(steps) < 2:
+            raise RuntimeError(
+                "SDMLX KSampler (FLUX.2 Lab): FLUX.2 scheduler needs at least 2 steps; "
+                "use 4 for distilled checkpoints or 20+ for base checkpoints."
+            )
+        patch_policy = (
+            runtime_plan.get("patch_policy")
+            if isinstance(runtime_plan, dict) and runtime_plan.get("type") == _FLUX2_LAB_RUNTIME_PLAN_TYPE
+            else _FLUX2_LAB_AUTO_COMFY_LAYERED
+        )
+        current_plan = _flux2_build_lab_runtime_plan(
+            sdmlx_model,
+            patch_policy=patch_policy,
+            positive=positive,
+            negative=negative,
+        )
+        strategy = _flux2_lora_strategy_from_runtime_plan(current_plan)
+        lab_model = dict(sdmlx_model)
+        if strategy:
+            lab_model["_flux2_lab_lora_patch_strategy"] = strategy
+            lab_model["_flux2_lab_runtime_plan"] = current_plan
+        return SDMLXFlux2KleinKSampler().sample(
+            lab_model,
+            positive,
+            negative,
+            latent_image,
+            seed=seed,
+            steps=steps,
+            guidance=guidance,
+            preview=preview,
         )
 
 
@@ -5274,6 +6251,11 @@ class SDMLXFlux2KleinEnhancedEditSampler:
         sdmlx_model = _flux2_model_with_components(sdmlx_model, clip, mlx_vae)
         root = Path(sdmlx_model["model_path"])
         lora_specs = flux2_lora_specs_from_model(sdmlx_model)
+        lora_patch_strategy = _flux2_suite_lora_patch_strategy(
+            sdmlx_model,
+            positive=positive,
+            negative=negative,
+        )
         model = _load_flux2_model(
             root,
             str(sdmlx_model.get("model_config") or ""),
@@ -5283,6 +6265,7 @@ class SDMLXFlux2KleinEnhancedEditSampler:
             clip_path=sdmlx_model.get("clip_path"),
             tokenizer_path=sdmlx_model.get("tokenizer_path"),
             lora_specs=lora_specs,
+            lora_patch_strategy=lora_patch_strategy,
         )
         profiler.mark("model ready")
 
@@ -5542,6 +6525,8 @@ NODE_CLASS_MAPPINGS = {
     "SDMLXFlux2EmptyLatentImage": SDMLXFlux2EmptyLatentImage,
     "SDMLXFlux2ReferenceLatent": SDMLXFlux2ReferenceLatent,
     "SDMLXFlux2KleinKSampler": SDMLXFlux2KleinKSampler,
+    "SDMLXFlux2LabRuntimePlan": SDMLXFlux2LabRuntimePlan,
+    "SDMLXFlux2LabKSampler": SDMLXFlux2LabKSampler,
     "SDMLXFlux2KleinEnhancerAdvanced": SDMLXFlux2KleinEnhancerAdvanced,
     "SDMLXFlux2KleinEnhancedEditSampler": SDMLXFlux2KleinEnhancedEditSampler,
 }
@@ -5551,6 +6536,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SDMLXFlux2EmptyLatentImage": "🍏 SDMLX Empty Latent Image FLUX.2",
     "SDMLXFlux2ReferenceLatent": "🍏 SDMLX Reference Latent",
     "SDMLXFlux2KleinKSampler": "🍏 SDMLX KSampler (FLUX.2-klein)",
+    "SDMLXFlux2LabRuntimePlan": "🍏 SDMLX FLUX.2 Lab Runtime Plan",
+    "SDMLXFlux2LabKSampler": "🍏 SDMLX KSampler (FLUX.2 Lab)",
     "SDMLXFlux2KleinEnhancerAdvanced": "🍏 SDMLX FLUX.2 Klein Enhancer Advanced",
     "SDMLXFlux2KleinEnhancedEditSampler": "🍏 SDMLX KSampler (FLUX.2-klein Enhanced Edit)",
 }

@@ -579,6 +579,20 @@ def _model_family_from_path(path: Path, model_name: str) -> str:
     return structure_family
 
 
+def is_flux1_checkpoint_file(path: str | os.PathLike[str]) -> bool:
+    candidate = Path(path)
+    if not candidate.is_file():
+        return False
+    lowered = f"{candidate.name} {candidate}".lower()
+    if "flux2" in lowered or "flux.2" in lowered or "klein" in lowered or "qwen" in lowered:
+        return False
+    structure_family = _model_family_from_structure(candidate)
+    if structure_family in {"dev", "schnell"}:
+        return True
+    has_flux1_signal = any(token in lowered for token in ("flux1", "flux.1", "flux-1", "schnell"))
+    return has_flux1_signal and _model_family_from_name(candidate.name) in {"dev", "schnell"}
+
+
 def _vae_names() -> list[str]:
     names = list(folder_paths.get_filename_list("vae"))
     preferred = "ae.safetensors"
@@ -2407,50 +2421,56 @@ class SDMLXFluxNativeLoader:
                 "or a supported Qwen diffusion-model checkpoint."
             )
 
-        Config.precision = mx.float16
-        _configure_native_core()
-        model_family = _model_family_from_path(path, model_name)
-        model_config = _model_config_from_family(model_family)
-        is_gguf = path.suffix.lower() == ".gguf"
-        use_native_fp8 = False if is_gguf else native_flux_core._has_fp8_weights(path)
-        use_scaled_fp8 = bool(use_native_fp8 and native_flux_core._has_scaled_fp8_weights(path))
-        load_path = path if (is_gguf or use_native_fp8) else _ensure_fp8_transformer_cache(path)
-        # Scaled-FP8 is a Comfy quant contract, not the raw native-FP8 contract.
-        # On MPS Comfy disables native FP8 compute and materializes dense weights;
-        # doing the same here keeps FLUX.1 Kontext correctness ahead of speed.
-        effective_fp8_mode = "dequant" if use_scaled_fp8 else ("native" if use_native_fp8 else "dequant")
-        transformer, casted, pretransposed, load_s = _load_prepared_flux_transformer(
-            load_path,
-            precision=Config.precision,
-            fp8_mode=effective_fp8_mode,
-            drop_raw="all" if is_gguf else "off",
-        )
-        if is_gguf:
-            mx.clear_cache()
-            gc.collect()
-        _flux_log(
-            "SDMLX FLUX Loader: "
-            f"model={model_name}, family={model_family}, config={model_config.alias}, source={load_path.name}, "
-            f"mode={transformer.load_mode}, fp8={'scaled_dequant' if use_scaled_fp8 else ('native' if use_native_fp8 else 'dequant')}, "
-            f"precision=fp16, casted={casted}, "
-            f"pretransposed={pretransposed}, fp8_weights={len(transformer.fp8_weight_keys)}, "
-            f"load={load_s:.2f}s"
-        )
-        _flux_log(f"SDMLX FLUX Loader memory: {_transformer_memory_line(transformer)}, {_mlx_memory_line()}")
-        return (
-            SDMLXFluxNativeModel(
-                model_name,
-                load_path,
-                transformer,
-                Config.precision,
-                model_config,
-                pretransposed,
-                casted,
-                None,
-                0.0,
-                model_family,
-            ),
-        )
+        return (flux1_model_from_checkpoint(path, name=model_name),)
+
+
+def flux1_model_from_checkpoint(path: str | os.PathLike[str], name: str | None = None) -> SDMLXFluxNativeModel:
+    path = Path(path)
+    model_name = str(name or path.name)
+    if not is_flux1_checkpoint_file(path):
+        raise RuntimeError(f"SDMLX FLUX.1: unsupported diffusion model checkpoint: {model_name}")
+    Config.precision = mx.float16
+    _configure_native_core()
+    model_family = _model_family_from_path(path, model_name)
+    model_config = _model_config_from_family(model_family)
+    is_gguf = path.suffix.lower() == ".gguf"
+    use_native_fp8 = False if is_gguf else native_flux_core._has_fp8_weights(path)
+    use_scaled_fp8 = bool(use_native_fp8 and native_flux_core._has_scaled_fp8_weights(path))
+    load_path = path if (is_gguf or use_native_fp8) else _ensure_fp8_transformer_cache(path)
+    # Scaled-FP8 is a Comfy quant contract, not the raw native-FP8 contract.
+    # On MPS Comfy disables native FP8 compute and materializes dense weights;
+    # doing the same here keeps FLUX.1 Kontext correctness ahead of speed.
+    effective_fp8_mode = "dequant" if use_scaled_fp8 else ("native" if use_native_fp8 else "dequant")
+    transformer, casted, pretransposed, load_s = _load_prepared_flux_transformer(
+        load_path,
+        precision=Config.precision,
+        fp8_mode=effective_fp8_mode,
+        drop_raw="all" if is_gguf else "off",
+    )
+    if is_gguf:
+        mx.clear_cache()
+        gc.collect()
+    _flux_log(
+        "SDMLX FLUX Loader: "
+        f"model={model_name}, family={model_family}, config={model_config.alias}, source={load_path.name}, "
+        f"mode={transformer.load_mode}, fp8={'scaled_dequant' if use_scaled_fp8 else ('native' if use_native_fp8 else 'dequant')}, "
+        f"precision=fp16, casted={casted}, "
+        f"pretransposed={pretransposed}, fp8_weights={len(transformer.fp8_weight_keys)}, "
+        f"load={load_s:.2f}s"
+    )
+    _flux_log(f"SDMLX FLUX Loader memory: {_transformer_memory_line(transformer)}, {_mlx_memory_line()}")
+    return SDMLXFluxNativeModel(
+        model_name,
+        load_path,
+        transformer,
+        Config.precision,
+        model_config,
+        pretransposed,
+        casted,
+        None,
+        0.0,
+        model_family,
+    )
 
 
 class SDMLXT5XXLCompatModel(comfy.sd1_clip.SDClipModel):

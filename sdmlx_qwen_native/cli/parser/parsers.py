@@ -368,7 +368,6 @@ class CommandLineParser(argparse.ArgumentParser):
         if self.supports_image_outpaint and namespace.image_outpaint_padding is not None:
             # parse and normalize any acceptable 1,2,3,4-tuple box value to 4-tuple
             namespace.image_outpaint_padding = box_values.BoxValues.parse(namespace.image_outpaint_padding)
-            print(f"{namespace.image_outpaint_padding=}")
 
         # Resolve lora paths from library if needed
         if self.supports_lora and hasattr(namespace, "lora_paths") and namespace.lora_paths:
