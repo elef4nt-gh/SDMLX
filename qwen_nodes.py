@@ -661,24 +661,47 @@ def is_qwen_checkpoint_file(path: str | os.PathLike[str]) -> bool:
     lowered = str(path).lower()
     if "flux2" in lowered or "flux.2" in lowered or ("flux" in lowered and "klein" in lowered):
         return False
-    if "qwen" in lowered and str(path).lower().endswith((".safetensors", ".ckpt")):
-        return True
+    if not lowered.endswith((".safetensors", ".ckpt")):
+        return False
+    if not lowered.endswith(".safetensors"):
+        return "qwen" in lowered
     try:
         from safetensors import safe_open
 
         with safe_open(str(path), framework="np") as handle:
             keys = set(handle.keys())
         if (
+            "model.diffusion_model.input_blocks.0.0.weight" in keys
+            or "first_stage_model.encoder.conv_in.weight" in keys
+            or any(key.startswith("conditioner.embedders.") for key in keys)
+        ):
+            return False
+        if (
             "double_blocks.0.img_attn.qkv.weight" in keys
             or "single_blocks.0.linear1.weight" in keys
             or "final_layer.adaLN_modulation.1.weight" in keys
         ):
             return False
-        return (
+        qwen_aio_transformer = (
+            "model.diffusion_model.img_in.weight" in keys
+            and any(key.startswith("model.diffusion_model.transformer_blocks.0.attn.") for key in keys)
+        )
+        qwen_aio_bundle = (
+            qwen_aio_transformer
+            and any(key.startswith("text_encoders.") for key in keys)
+            and any(key.startswith("vae.") for key in keys)
+        )
+        qwen_bare_transformer = (
             "__index_timestep_zero__" in keys
-            or any(key.startswith("model.diffusion_model.") for key in keys)
-            or "img_in.weight" in keys
-            or any(key.startswith("transformer_blocks.0.attn.") for key in keys)
+            or (
+                "img_in.weight" in keys
+                and any(key.startswith("transformer_blocks.0.attn.") for key in keys)
+            )
+            or qwen_aio_transformer
+        )
+        return (
+            qwen_aio_bundle
+            or qwen_bare_transformer
         )
     except Exception:
         return False

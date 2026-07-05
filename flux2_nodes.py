@@ -75,6 +75,7 @@ _FLUX2_ROOT_DISPLAY_TO_PATH: dict[str, Path] = {}
 _FLUX2_MODEL_CACHE: dict[tuple, Any] = {}
 _FLUX2_VAE_CACHE: dict[tuple, Any] = {}
 _FLUX2_TEXT_CONDITIONING_CACHE: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+_FLUX2_DIRECT_REFERENCE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _FLUX2_QUANT_CONTRACT_LOGGED: set[str] = set()
 _FLUX2_VAE_STANDARD = "standard"
 _FLUX2_VAE_SMALL_DECODER = "small_decoder"
@@ -353,6 +354,83 @@ def _flux2_store_text_conditioning(sdmlx_model: dict[str, Any], text: str, promp
         _FLUX2_TEXT_CONDITIONING_CACHE.pop(oldest, None)
 
 
+def _flux2_direct_reference_cache_enabled() -> bool:
+    return _flux2_env_enabled("SDMLX_FLUX2_DIRECT_REFERENCE_CACHE", "1")
+
+
+def _flux2_direct_reference_cache_limit() -> int:
+    raw = str(os.environ.get("SDMLX_FLUX2_DIRECT_REFERENCE_CACHE_LIMIT") or "16").strip()
+    try:
+        return max(0, int(float(raw)))
+    except ValueError:
+        return 16
+
+
+def _flux2_vae_identity_for_cache(mlx_vae: dict[str, Any]) -> tuple[Any, ...]:
+    vae_variant = _normalize_flux2_vae_variant(mlx_vae.get("vae_variant") or _FLUX2_VAE_STANDARD)
+    return (
+        vae_variant,
+        _flux2_cache_path_identity(mlx_vae.get("vae_path")),
+        _flux2_cache_path_identity(mlx_vae.get("model_path")),
+    )
+
+
+def _flux2_image_content_key(image: torch.Tensor) -> tuple[Any, ...] | None:
+    try:
+        tensor = image.detach().cpu() if isinstance(image, torch.Tensor) else image
+        array = np.asarray(tensor, dtype=np.float32)
+        if array.ndim == 3:
+            array = array[None, ...]
+        if array.ndim != 4 or array.shape[-1] != 3:
+            return None
+        array = np.ascontiguousarray(np.clip(array, 0.0, 1.0))
+        digest = hashlib.sha256(array.view(np.uint8)).hexdigest()
+        return (tuple(int(v) for v in array.shape), str(array.dtype), digest)
+    except Exception:
+        return None
+
+
+def _flux2_direct_reference_cache_key(image: torch.Tensor, mlx_vae: dict[str, Any]) -> tuple[Any, ...] | None:
+    if not _flux2_direct_reference_cache_enabled():
+        return None
+    image_key = _flux2_image_content_key(image)
+    if image_key is None:
+        return None
+    return (FLUX2_MODEL_FAMILY, "enhanced-direct-reference-v1", _flux2_vae_identity_for_cache(mlx_vae), image_key)
+
+
+def _flux2_get_cached_direct_reference(image: torch.Tensor, mlx_vae: dict[str, Any]) -> dict[str, Any] | None:
+    key = _flux2_direct_reference_cache_key(image, mlx_vae)
+    if key is None:
+        return None
+    cached = _FLUX2_DIRECT_REFERENCE_CACHE.get(key)
+    if cached is not None:
+        _FLUX2_DIRECT_REFERENCE_CACHE.pop(key, None)
+        _FLUX2_DIRECT_REFERENCE_CACHE[key] = cached
+        return dict(cached)
+    return None
+
+
+def _flux2_store_direct_reference(image: torch.Tensor, mlx_vae: dict[str, Any], latent: dict[str, Any]) -> None:
+    key = _flux2_direct_reference_cache_key(image, mlx_vae)
+    limit = _flux2_direct_reference_cache_limit()
+    if key is None or limit <= 0:
+        return
+    samples = latent.get("samples") if isinstance(latent, dict) else None
+    if samples is None:
+        return
+    try:
+        mx.eval(samples)
+    except Exception:
+        return
+    _FLUX2_DIRECT_REFERENCE_CACHE[key] = dict(latent)
+    while len(_FLUX2_DIRECT_REFERENCE_CACHE) > limit:
+        oldest = next(iter(_FLUX2_DIRECT_REFERENCE_CACHE), None)
+        if oldest is None:
+            break
+        _FLUX2_DIRECT_REFERENCE_CACHE.pop(oldest, None)
+
+
 def _flux2_verbose_logs_enabled() -> bool:
     return _flux2_env_enabled("SDMLX_FLUX2_VERBOSE") or _flux2_env_enabled("SDMLX_FLUX2_DEBUG")
 
@@ -508,6 +586,29 @@ def _apply_flux2_pre_encode_memory_policy(model: Any, *, keep_text_encoder: bool
     # competes with the denoising graph for MLX memory.
     model.sdmlx_release_text_encoder_after_encode = not keep_text_encoder
     model.sdmlx_clear_after_reference_latents = True
+
+
+def _flux2_should_clear_cache_before_text_encode(model: Any) -> bool:
+    if not _flux2_env_enabled("SDMLX_FLUX2_PRE_TEXT_ENCODE_CACHE_HYGIENE", "1"):
+        return False
+    if _flux2_model_quant_kind(model) != _FLUX2_QUANT_RAW_FP8:
+        return False
+    if not _flux2_is_9b_model_config(model.model_config):
+        return False
+    return not bool(getattr(model, "sdmlx_release_text_encoder_after_encode", True))
+
+
+def _flux2_clear_cache_before_text_encode(model: Any, profiler: _Flux2PhaseProfiler, label: str) -> None:
+    if not _flux2_should_clear_cache_before_text_encode(model):
+        return
+    try:
+        has_cache = mx.get_cache_memory() > 0
+    except Exception:
+        has_cache = True
+    if not has_cache:
+        return
+    mx.clear_cache()
+    profiler.mark(label)
 
 
 def _apply_flux2_sampling_memory_policy(model: Any, *, cache_enabled: bool) -> None:
@@ -5532,7 +5633,10 @@ def _flux2_enhanced_direct_reference(
     *,
     index: int,
 ) -> dict[str, Any]:
-    latent = encode_flux2_image_with_vae(image, mlx_vae)
+    latent = _flux2_get_cached_direct_reference(image, mlx_vae)
+    if latent is None:
+        latent = encode_flux2_image_with_vae(image, mlx_vae)
+        _flux2_store_direct_reference(image, mlx_vae, latent)
     packed = latent.get("samples")
     grid_height = int(latent.get("flux2_grid_height") or 0)
     grid_width = int(latent.get("flux2_grid_width") or 0)
@@ -5697,6 +5801,7 @@ class SDMLXFlux2KleinKSampler:
                 prompt_embeds, text_ids = cached_positive_text
                 profiler.mark("positive text cache")
             else:
+                _flux2_clear_cache_before_text_encode(model, profiler, "positive text cache hygiene")
                 prompt_embeds, text_ids = _Flux2KleinEditHelpers.encode_text(
                     positive_text,
                     tokenizer=model.tokenizers["qwen3"],
@@ -5711,6 +5816,7 @@ class SDMLXFlux2KleinKSampler:
                     negative_prompt_embeds, negative_text_ids = cached_negative_text
                     profiler.mark("negative text cache")
                 else:
+                    _flux2_clear_cache_before_text_encode(model, profiler, "negative text cache hygiene")
                     negative_prompt_embeds, negative_text_ids = _Flux2KleinEditHelpers.encode_text(
                         negative_text,
                         tokenizer=model.tokenizers["qwen3"],
@@ -6251,6 +6357,21 @@ class SDMLXFlux2KleinEnhancedEditSampler:
         sdmlx_model = _flux2_model_with_components(sdmlx_model, clip, mlx_vae)
         root = Path(sdmlx_model["model_path"])
         lora_specs = flux2_lora_specs_from_model(sdmlx_model)
+        width, height, batch_size = SDMLXFlux2KleinKSampler._latent_dimensions(latent_image)
+        positive_text = _flux2_enhanced_apply_markers_hint(
+            SDMLXFlux2KleinKSampler._conditioning_text(positive, "positive")
+        )
+        negative_text = _flux2_enhanced_apply_markers_hint(
+            SDMLXFlux2KleinKSampler._conditioning_text(negative, "negative")
+        )
+        needs_negative_text = float(guidance) > 1.0
+        cached_positive_text = _flux2_get_cached_text_conditioning(sdmlx_model, positive_text)
+        cached_negative_text = (
+            _flux2_get_cached_text_conditioning(sdmlx_model, negative_text)
+            if needs_negative_text
+            else None
+        )
+        require_text_encoder = cached_positive_text is None or (needs_negative_text and cached_negative_text is None)
         lora_patch_strategy = _flux2_suite_lora_patch_strategy(
             sdmlx_model,
             positive=positive,
@@ -6265,17 +6386,11 @@ class SDMLXFlux2KleinEnhancedEditSampler:
             clip_path=sdmlx_model.get("clip_path"),
             tokenizer_path=sdmlx_model.get("tokenizer_path"),
             lora_specs=lora_specs,
+            require_text_encoder=require_text_encoder,
             lora_patch_strategy=lora_patch_strategy,
         )
         profiler.mark("model ready")
 
-        width, height, batch_size = SDMLXFlux2KleinKSampler._latent_dimensions(latent_image)
-        positive_text = _flux2_enhanced_apply_markers_hint(
-            SDMLXFlux2KleinKSampler._conditioning_text(positive, "positive")
-        )
-        negative_text = _flux2_enhanced_apply_markers_hint(
-            SDMLXFlux2KleinKSampler._conditioning_text(negative, "negative")
-        )
         references = self._conditioning_refs_ordered(positive, negative)
         references.extend(self._direct_references(mlx_vae, len(references), optional))
         profiler.mark("references ready")
@@ -6303,12 +6418,18 @@ class SDMLXFlux2KleinEnhancedEditSampler:
 
         state: _Flux2KleinEnhanceState | None = None
         try:
-            prompt_embeds, text_ids = _Flux2KleinEditHelpers.encode_text(
-                positive_text,
-                tokenizer=model.tokenizers["qwen3"],
-                text_encoder=model.text_encoder,
-            )
-            profiler.mark("positive text encode")
+            if cached_positive_text is not None:
+                prompt_embeds, text_ids = cached_positive_text
+                profiler.mark("positive text cache")
+            else:
+                _flux2_clear_cache_before_text_encode(model, profiler, "positive text cache hygiene")
+                prompt_embeds, text_ids = _Flux2KleinEditHelpers.encode_text(
+                    positive_text,
+                    tokenizer=model.tokenizers["qwen3"],
+                    text_encoder=model.text_encoder,
+                )
+                _flux2_store_text_conditioning(sdmlx_model, positive_text, prompt_embeds, text_ids)
+                profiler.mark("positive text encode")
             advanced_values, advanced_connected = _flux2_enhancer_advanced_values(enhancer_advanced, optional)
             state = self._build_state(
                 references=references,
@@ -6335,20 +6456,37 @@ class SDMLXFlux2KleinEnhancedEditSampler:
             prompt_embeds = state.apply_text_controls(prompt_embeds)
             negative_prompt_embeds = None
             negative_text_ids = None
-            if float(guidance) > 1.0:
-                negative_prompt_embeds, negative_text_ids = _Flux2KleinEditHelpers.encode_text(
-                    negative_text,
-                    tokenizer=model.tokenizers["qwen3"],
-                    text_encoder=model.text_encoder,
-                )
-                profiler.mark("negative text encode")
+            if needs_negative_text:
+                if cached_negative_text is not None:
+                    negative_prompt_embeds, negative_text_ids = cached_negative_text
+                    profiler.mark("negative text cache")
+                else:
+                    _flux2_clear_cache_before_text_encode(model, profiler, "negative text cache hygiene")
+                    negative_prompt_embeds, negative_text_ids = _Flux2KleinEditHelpers.encode_text(
+                        negative_text,
+                        tokenizer=model.tokenizers["qwen3"],
+                        text_encoder=model.text_encoder,
+                    )
+                    _flux2_store_text_conditioning(
+                        sdmlx_model,
+                        negative_text,
+                        negative_prompt_embeds,
+                        negative_text_ids,
+                    )
+                    profiler.mark("negative text encode")
+            had_text_encoder = "text_encoder" in model
             model._release_text_encoder_after_encode(
                 prompt_embeds=prompt_embeds,
                 text_ids=text_ids,
                 negative_prompt_embeds=negative_prompt_embeds,
                 negative_text_ids=negative_text_ids,
             )
-            profiler.mark("text encoder retained" if keep_text_encoder else "text encoder released")
+            if keep_text_encoder:
+                profiler.mark("text encoder retained")
+            elif had_text_encoder:
+                profiler.mark("text encoder released")
+            else:
+                profiler.mark("text encoder skipped")
 
             latents, latent_ids, latent_height, latent_width = _Flux2KleinEditHelpers.prepare_generation_latents(
                 seed=int(seed),

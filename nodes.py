@@ -5361,13 +5361,30 @@ def get_vae_model(cache_key, weights, compute_dtype="float32"):
     return vae
 
 
+def require_sdxl_vae_handle(mlx_vae, op_name="SDMLX SDXL VAE"):
+    if isinstance(mlx_vae, dict):
+        cache_key = mlx_vae.get("cache_key")
+        weights = mlx_vae.get("weights")
+        if cache_key is not None and weights is not None:
+            return cache_key, weights
+        vae_type = mlx_vae.get("type") or "unknown"
+    else:
+        vae_type = type(mlx_vae).__name__
+    raise RuntimeError(
+        f"{op_name}: expected an SDXL mlx_vae handle with VAE weights, got {vae_type}. "
+        "Use an SDXL .sdmlx package/checkpoint through SDMLX Loader Universal, "
+        "or connect an SDXL VAE from SDMLX VAE Loader."
+    )
+
+
 def preload_mlx_model(mlx_model, mlx_clip, mlx_vae, fast_mode=True, compute_dtype="float16", vae_dtype="float32"):
     start_time = time.perf_counter()
     fast_mode = bool(fast_mode)
     static_loras, scheduled_loras = split_loras_by_schedule(mlx_model.get("loras", []))
     get_clip_model(mlx_clip["cache_key"], mlx_clip["clip_l"], is_g=False)
     get_clip_model(mlx_clip["cache_key"], mlx_clip["clip_g"], is_g=True)
-    get_vae_model(mlx_vae["cache_key"], mlx_vae["weights"], vae_dtype)
+    vae_cache_key, vae_weights = require_sdxl_vae_handle(mlx_vae, "SDMLX preload")
+    get_vae_model(vae_cache_key, vae_weights, vae_dtype)
     get_unet_model(
         mlx_model["cache_key"],
         mlx_model["weights"],
@@ -7213,8 +7230,9 @@ def warn_if_nonfinite_mx_tree(label, values):
 def decode_latents(mlx_vae, latents, compile_vae=False, vae_dtype="float32", debug_timing=False):
     configure_mlx_memory_limits()
     start_time = time.perf_counter()
-    vae = get_vae_model(mlx_vae["cache_key"], mlx_vae["weights"], vae_dtype)
-    decoder = get_vae_decoder(mlx_vae["cache_key"], vae, vae_dtype, compile_vae)
+    vae_cache_key, vae_weights = require_sdxl_vae_handle(mlx_vae, "SDMLX VAE Decode")
+    vae = get_vae_model(vae_cache_key, vae_weights, vae_dtype)
+    decoder = get_vae_decoder(vae_cache_key, vae, vae_dtype, compile_vae)
 
     if debug_timing:
         vae_start = time.perf_counter()
@@ -7308,8 +7326,9 @@ def decode_latents_tiled(
 ):
     configure_mlx_memory_limits()
     start_time = time.perf_counter()
-    vae = get_vae_model(mlx_vae["cache_key"], mlx_vae["weights"], vae_dtype)
-    decoder = get_vae_decoder(mlx_vae["cache_key"], vae, vae_dtype, compile_vae)
+    vae_cache_key, vae_weights = require_sdxl_vae_handle(mlx_vae, "SDMLX VAE Decode")
+    vae = get_vae_model(vae_cache_key, vae_weights, vae_dtype)
+    decoder = get_vae_decoder(vae_cache_key, vae, vae_dtype, compile_vae)
 
     latent_height = int(latents.shape[1])
     latent_width = int(latents.shape[2])
@@ -7368,8 +7387,9 @@ def decode_latents_tiled(
 
 
 def decode_latents_quiet(mlx_vae, latents, compile_vae=True, vae_dtype="float32"):
-    vae = get_vae_model(mlx_vae["cache_key"], mlx_vae["weights"], vae_dtype)
-    decoder = get_vae_decoder(mlx_vae["cache_key"], vae, vae_dtype, compile_vae)
+    vae_cache_key, vae_weights = require_sdxl_vae_handle(mlx_vae, "SDMLX VAE Decode")
+    vae = get_vae_model(vae_cache_key, vae_weights, vae_dtype)
+    decoder = get_vae_decoder(vae_cache_key, vae, vae_dtype, compile_vae)
     pixels = decoder(latents)
     if isinstance(pixels, tuple):
         pixels = pixels[0]
@@ -7389,7 +7409,8 @@ def should_use_tiled_decode(mode, width, height):
 
 
 def encode_pixels_to_latents(mlx_vae, pixels, vae_dtype="float32"):
-    vae = get_vae_model(mlx_vae["cache_key"], mlx_vae["weights"], vae_dtype)
+    vae_cache_key, vae_weights = require_sdxl_vae_handle(mlx_vae, "SDMLX VAE Encode")
+    vae = get_vae_model(vae_cache_key, vae_weights, vae_dtype)
     if hasattr(pixels, "detach"):
         pixels_np = pixels.detach().cpu().float().numpy()
     else:
@@ -8194,7 +8215,7 @@ class SDMLX_LoaderUniversal:
         save_time = time.perf_counter() - save_start
         package_bytes = package_component_bytes(components)
         total_time = time.perf_counter() - total_start
-        print(f"SDMLX: MLX checkpoint package created: {package_path}")
+        print(f"SDMLX: MLX checkpoint package created: {os.path.basename(package_path)}")
         print(
             "SDMLX: Conversion Timing "
             f"(load={load_time:.2f}s, map={split_time:.2f}s, save={save_time:.2f}s, total={total_time:.2f}s, "
@@ -10165,7 +10186,7 @@ class SDMLX_InpaintDetailer:
         sample_start = time.perf_counter()
         if spectrum_preset is None:
             if use_spectrum:
-                print(f"SDMLX: Spectrum mode: off ({spectrum_reason}).")
+                log_timing(f"SDMLX: Spectrum mode: off ({spectrum_reason}).")
             latents = sample_latents(
                 mlx_model=mlx_model,
                 positive=positive,
@@ -10206,10 +10227,10 @@ class SDMLX_InpaintDetailer:
             from . import spectrum as spectrum_engine
 
             if isinstance(spectrum_acceleration_advanced, dict):
-                print("SDMLX: Spectrum mode: advanced.")
+                log_timing("SDMLX: Spectrum mode: advanced.")
             else:
                 terminal_label = spectrum_engine.terminal_profile_label(spectrum_label, spectrum_choice)
-                print(f"SDMLX: Spectrum mode: {terminal_label}.")
+                log_timing(f"SDMLX: Spectrum mode: {terminal_label}.")
             latents = spectrum_engine.sample_latents_spectrum(
                 mlx_model,
                 positive,
@@ -10467,7 +10488,7 @@ class SDMLX_HiresFix:
         sample_start = time.perf_counter()
         if spectrum_preset is None:
             if use_spectrum:
-                print(f"SDMLX: Spectrum mode: off ({spectrum_reason}).")
+                log_timing(f"SDMLX: Spectrum mode: off ({spectrum_reason}).")
             latents = sample_latents(
                 mlx_model=mlx_model,
                 positive=positive,
@@ -10506,10 +10527,10 @@ class SDMLX_HiresFix:
             from . import spectrum as spectrum_engine
 
             if isinstance(spectrum_acceleration_advanced, dict):
-                print("SDMLX: Spectrum mode: advanced.")
+                log_timing("SDMLX: Spectrum mode: advanced.")
             else:
                 terminal_label = spectrum_engine.terminal_profile_label(spectrum_label, spectrum_choice)
-                print(f"SDMLX: Spectrum mode: {terminal_label}.")
+                log_timing(f"SDMLX: Spectrum mode: {terminal_label}.")
             latents = spectrum_engine.sample_latents_spectrum(
                 mlx_model,
                 positive,
@@ -10879,7 +10900,7 @@ class SDMLX_KSampler:
             )
             return (image, latent_image)
         if is_qwen_speed_patch_selection(effective_patch):
-            print("SDMLX: acceleration-patch: off (not applicable)")
+            log_timing("SDMLX: acceleration-patch: off (not applicable)")
             effective_patch = SPEED_PATCH_NONE
         spectrum_preset = None
         spectrum_label = "off"
@@ -10911,7 +10932,7 @@ class SDMLX_KSampler:
                     )
         if spectrum_preset is None:
             if use_spectrum:
-                print(f"SDMLX: Spectrum mode: off ({spectrum_reason}).")
+                log_timing(f"SDMLX: Spectrum mode: off ({spectrum_reason}).")
             samples = sample_latents(
                 mlx_model,
                 positive,
@@ -10951,10 +10972,10 @@ class SDMLX_KSampler:
             from . import spectrum as spectrum_engine
 
             if isinstance(spectrum_acceleration_advanced, dict):
-                print("SDMLX: Spectrum mode: advanced.")
+                log_timing("SDMLX: Spectrum mode: advanced.")
             else:
                 terminal_label = spectrum_engine.terminal_profile_label(spectrum_label, spectrum_choice)
-                print(f"SDMLX: Spectrum mode: {terminal_label}.")
+                log_timing(f"SDMLX: Spectrum mode: {terminal_label}.")
             effective_cfg = float(cfg)
             samples = spectrum_engine.sample_latents_spectrum(
                 mlx_model,
@@ -11097,7 +11118,7 @@ class SDMLX_KSamplerAdvanced:
             )
             return (image, latent_image)
         if is_qwen_speed_patch_selection(effective_patch):
-            print("SDMLX: acceleration-patch: off (not applicable)")
+            log_timing("SDMLX: acceleration-patch: off (not applicable)")
             effective_patch = SPEED_PATCH_NONE
         force_full_denoise = str(return_with_leftover_noise) != "enable"
         spectrum_preset = None
@@ -11136,7 +11157,7 @@ class SDMLX_KSamplerAdvanced:
                         )
         if spectrum_preset is None:
             if use_spectrum:
-                print(f"SDMLX: Spectrum mode: off ({spectrum_reason}).")
+                log_timing(f"SDMLX: Spectrum mode: off ({spectrum_reason}).")
             samples = sample_latents(
                 mlx_model,
                 positive,
@@ -11180,10 +11201,10 @@ class SDMLX_KSamplerAdvanced:
             from . import spectrum as spectrum_engine
 
             if isinstance(spectrum_acceleration_advanced, dict):
-                print("SDMLX: Spectrum mode: advanced.")
+                log_timing("SDMLX: Spectrum mode: advanced.")
             else:
                 terminal_label = spectrum_engine.terminal_profile_label(spectrum_label, spectrum_choice)
-                print(f"SDMLX: Spectrum mode: {terminal_label}.")
+                log_timing(f"SDMLX: Spectrum mode: {terminal_label}.")
             samples = spectrum_engine.sample_latents_spectrum(
                 mlx_model,
                 positive,
