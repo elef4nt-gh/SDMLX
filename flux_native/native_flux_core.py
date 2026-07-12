@@ -767,8 +767,6 @@ class FluxNativeTransformer:
         self.forecast_single_linear2_shape_blocks: set[int] | None = None
         self.forecast_single_linear2_shape_clamp = 0.0
         self.forecast_single_linear2_block_gain: dict[int, float] = {}
-        self.forecast_single_linear2_scout_plan: dict[int, tuple[str, set[int]]] = {}
-        self.forecast_single_linear2_scout_metrics: list[dict[str, float | int | str]] = []
         self.forecast_single_weather_latest: dict[int, dict[str, float | int]] = {}
         self.forecast_single_weather_metrics: list[dict[str, float | int]] = []
         self.forecast_single_linear2_partial_hits = 0
@@ -794,18 +792,7 @@ class FluxNativeTransformer:
         self.forecast_double_txt_step_gain: dict[int, float] = {}
         self.forecast_double_txt_history: dict[int, list[tuple[int, mx.array]]] = {}
         self.forecast_double_txt_hits: list[dict[str, float | int | str]] = []
-        self.token_scout_enabled = False
-        self.token_scout_double_blocks: set[int] = set()
-        self.token_scout_single_blocks: set[int] = set()
-        self.token_scout_txt_len = 0
-        self.token_scout_previous: dict[str, mx.array] = {}
-        self.token_scout_metrics: list[dict[str, float | int | str]] = []
-        self.attention_scout_enabled = False
-        self.attention_scout_steps: set[int] = set()
-        self.attention_scout_double_blocks: set[int] = set()
-        self.attention_scout_single_blocks: set[int] = set()
-        self.attention_scout_chunk = 512
-        self.attention_scout_metrics: list[dict[str, float | int | str]] = []
+        self.current_text_token_count = 0
         self.kontext_kv_cache_enabled = False
         self.kontext_kv_cache: dict[str, tuple[mx.array, mx.array]] = {}
         self.kontext_kv_cache_reference_tokens = 0
@@ -1304,156 +1291,6 @@ class FluxNativeTransformer:
         self.seacache_previous_residual = feature - initial_img[:, : feature.shape[1]]
         self.teacache_real_steps += 1
 
-    def token_scout_before_single(self, index: int, x: mx.array) -> mx.array | None:
-        if not self.token_scout_enabled:
-            return None
-        if index not in self.token_scout_single_blocks:
-            return None
-        if self.token_scout_txt_len <= 0:
-            return None
-        return x[:, : self.token_scout_txt_len]
-
-    def token_scout_probe(self, stream: str, block: int, before: mx.array, after: mx.array) -> None:
-        if not self.token_scout_enabled:
-            return
-        t0 = time.perf_counter()
-        before = before.astype(mx.float32)
-        after = after.astype(mx.float32)
-        mean_abs = mx.mean(mx.abs(after), axis=-1).reshape(-1)
-        before_abs = mx.mean(mx.abs(before), axis=-1).reshape(-1)
-        block_delta = mx.mean(mx.abs(after - before), axis=-1).reshape(-1)
-        block_rel = block_delta / (before_abs + 1e-6)
-        block_dot = mx.sum(after * before, axis=-1).reshape(-1)
-        block_norm = mx.sqrt(mx.sum(after * after, axis=-1) * mx.sum(before * before, axis=-1)).reshape(-1)
-        block_cos_dist = 1.0 - (block_dot / (block_norm + 1e-6))
-
-        key = f"{stream}:{block}"
-        previous = self.token_scout_previous.get(key)
-        if previous is None or previous.shape != after.shape:
-            step_delta = mx.zeros_like(block_delta)
-            step_rel = mx.zeros_like(block_delta)
-            step_cos_dist = mx.zeros_like(block_delta)
-        else:
-            previous_abs = mx.mean(mx.abs(previous), axis=-1).reshape(-1)
-            step_delta = mx.mean(mx.abs(after - previous), axis=-1).reshape(-1)
-            step_rel = step_delta / (previous_abs + 1e-6)
-            step_dot = mx.sum(after * previous, axis=-1).reshape(-1)
-            step_norm = mx.sqrt(mx.sum(after * after, axis=-1) * mx.sum(previous * previous, axis=-1)).reshape(-1)
-            step_cos_dist = 1.0 - (step_dot / (step_norm + 1e-6))
-
-        mx.eval(mean_abs, block_delta, block_rel, block_cos_dist, step_delta, step_rel, step_cos_dist, after)
-        mean_abs_values = mean_abs.tolist()
-        block_delta_values = block_delta.tolist()
-        block_rel_values = block_rel.tolist()
-        block_cos_values = block_cos_dist.tolist()
-        step_delta_values = step_delta.tolist()
-        step_rel_values = step_rel.tolist()
-        step_cos_values = step_cos_dist.tolist()
-        for token, values in enumerate(
-            zip(
-                mean_abs_values,
-                block_delta_values,
-                block_rel_values,
-                block_cos_values,
-                step_delta_values,
-                step_rel_values,
-                step_cos_values,
-            )
-        ):
-            (
-                token_mean_abs,
-                token_block_delta,
-                token_block_rel,
-                token_block_cos,
-                token_step_delta,
-                token_step_rel,
-                token_step_cos,
-            ) = values
-            self.token_scout_metrics.append(
-                {
-                    "step": self.forecast_step_index,
-                    "stream": stream,
-                    "block": block,
-                    "token": token,
-                    "mean_abs": float(token_mean_abs),
-                    "block_delta": float(token_block_delta),
-                    "block_rel": float(token_block_rel),
-                    "block_cos_dist": float(token_block_cos),
-                    "step_delta": float(token_step_delta),
-                    "step_rel": float(token_step_rel),
-                    "step_cos_dist": float(token_step_cos),
-                    "probe_s": time.perf_counter() - t0,
-                }
-            )
-        self.token_scout_previous[key] = after
-
-    def token_scout_report(self) -> list[dict[str, float | int | str]]:
-        return self.token_scout_metrics
-
-    def attention_scout_wants(self, stream: str, block: int) -> bool:
-        if not self.attention_scout_enabled:
-            return False
-        if self.forecast_step_index not in self.attention_scout_steps:
-            return False
-        if stream == "double_img_to_txt":
-            return block in self.attention_scout_double_blocks
-        if stream == "single_img_to_txt":
-            return block in self.attention_scout_single_blocks
-        return False
-
-    def attention_scout_probe(self, stream: str, block: int, q: mx.array, k: mx.array, txt_len: int) -> None:
-        if not self.attention_scout_wants(stream, block):
-            return
-        t0 = time.perf_counter()
-        seq_len = int(q.shape[2])
-        txt_len = int(txt_len)
-        if txt_len <= 0 or txt_len >= seq_len:
-            return
-        chunk_size = max(1, int(self.attention_scout_chunk))
-        scale = HEAD_DIM**-0.5
-        k_t = k.transpose(0, 1, 3, 2)
-        token_mass = mx.zeros((txt_len,), dtype=mx.float32)
-        query_rows = 0
-        for start in range(txt_len, seq_len, chunk_size):
-            stop = min(seq_len, start + chunk_size)
-            q_chunk = q[:, :, start:stop, :]
-            scores = (q_chunk * scale) @ k_t
-            attn = mx.softmax(scores, axis=-1)
-            txt_attn = attn[..., :txt_len].astype(mx.float32)
-            chunk_mass = mx.sum(txt_attn, axis=0)
-            chunk_mass = mx.sum(chunk_mass, axis=0)
-            chunk_mass = mx.sum(chunk_mass, axis=0)
-            token_mass = token_mass + chunk_mass
-            query_rows += HEADS * (stop - start)
-            mx.eval(token_mass)
-        if query_rows <= 0:
-            return
-        token_mass = token_mass / float(query_rows)
-        text_mass_fraction = mx.sum(token_mass)
-        token_share = token_mass / (text_mass_fraction + 1e-12)
-        mx.eval(token_mass, token_share, text_mass_fraction)
-        mass_values = token_mass.tolist()
-        share_values = token_share.tolist()
-        text_mass_value = float(text_mass_fraction.item())
-        probe_s = time.perf_counter() - t0
-        for token, (mass, share) in enumerate(zip(mass_values, share_values)):
-            self.attention_scout_metrics.append(
-                {
-                    "step": self.forecast_step_index,
-                    "stream": stream,
-                    "block": block,
-                    "token": token,
-                    "token_mass": float(mass),
-                    "token_share": float(share),
-                    "text_mass_fraction": text_mass_value,
-                    "query_rows": query_rows,
-                    "probe_s": probe_s,
-                }
-            )
-
-    def attention_scout_report(self) -> list[dict[str, float | int | str]]:
-        return self.attention_scout_metrics
-
     def reset_kontext_kv_cache(self) -> None:
         self.kontext_kv_cache = {}
         self.kontext_kv_cache_reference_tokens = 0
@@ -1609,7 +1446,7 @@ class FluxNativeTransformer:
         source_len = int(value.shape[1])
         if source_len == target_len:
             return value
-        current_txt_len = max(0, int(self.token_scout_txt_len))
+        current_txt_len = max(0, int(self.current_text_token_count))
         image_len = max(0, target_len - current_txt_len)
         source_txt_len = max(0, source_len - image_len)
         if image_len <= 0 or source_txt_len <= 0 or image_len > source_len:
@@ -1624,7 +1461,12 @@ class FluxNativeTransformer:
         return mx.concatenate([txt, img], axis=1)
 
     def raw_single_forecast_value(
-        self, history: list[tuple[int, mx.array]], mode: str
+        self,
+        history: list[tuple[int, mx.array]],
+        mode: str,
+        *,
+        index: int,
+        scope: str,
     ) -> tuple[mx.array | None, float]:
         if mode == "hold":
             if not history:
@@ -1645,110 +1487,6 @@ class FluxNativeTransformer:
             forecast_delta = self.clamp_single_forecast_delta(last_value, forecast_delta)
             return last_value + forecast_delta, forecast_gain
         return None, 0.0
-
-    def scout_single_linear2_forecast(
-        self,
-        index: int,
-        actual: mx.array,
-        norm_x: mx.array | None,
-        gate: mx.array | None = None,
-    ) -> None:
-        planned = self.forecast_single_linear2_scout_plan.get(self.forecast_step_index)
-        if planned is None:
-            return
-        mode, blocks = planned
-        if index not in blocks:
-            return
-        history = self.forecast_single_linear2_history.get(index, [])
-        forecast, forecast_gain = self.raw_single_forecast_value(history, mode)
-        if forecast is None:
-            return
-        optimal_gain = mx.array(0.0, dtype=mx.float32)
-        residual_optimal_gain = mx.array(0.0, dtype=mx.float32)
-        if mode == "linear" and len(history) >= 2:
-            previous_step, previous_value = history[-2]
-            last_step, last_value = history[-1]
-            step_delta = max(1, last_step - previous_step)
-            scale = (self.forecast_step_index - last_step) / step_delta
-            direction = (last_value.astype(mx.float32) - previous_value.astype(mx.float32)) * scale
-            target = actual.astype(mx.float32) - last_value.astype(mx.float32)
-            direction_energy = mx.sum(direction * direction)
-            optimal_gain = mx.sum(target * direction) / (direction_energy + 1e-6)
-            if gate is not None:
-                gate_f32 = gate[:, None].astype(mx.float32)
-                residual_direction = direction * gate_f32
-                residual_target = target * gate_f32
-                residual_energy = mx.sum(residual_direction * residual_direction)
-                residual_optimal_gain = mx.sum(residual_target * residual_direction) / (residual_energy + 1e-6)
-        forecast = self.shape_single_linear2_forecast(index, forecast, norm_x, gate)
-        actual_f32 = actual.astype(mx.float32)
-        forecast_f32 = forecast.astype(mx.float32)
-        delta = mx.abs(actual_f32 - forecast_f32)
-        actual_mean = mx.mean(mx.abs(actual_f32))
-        delta_mean = mx.mean(delta)
-        rel = delta_mean / (actual_mean + 1e-6)
-        txt_len = max(0, min(int(self.token_scout_txt_len), int(actual.shape[1])))
-        if txt_len > 0:
-            txt_delta = mx.mean(delta[:, :txt_len])
-            txt_abs = mx.mean(mx.abs(actual_f32[:, :txt_len]))
-            txt_rel = txt_delta / (txt_abs + 1e-6)
-        else:
-            txt_delta = mx.array(0.0, dtype=mx.float32)
-            txt_rel = mx.array(0.0, dtype=mx.float32)
-        if txt_len < int(actual.shape[1]):
-            img_delta = mx.mean(delta[:, txt_len:])
-            img_abs = mx.mean(mx.abs(actual_f32[:, txt_len:]))
-            img_rel = img_delta / (img_abs + 1e-6)
-        else:
-            img_delta = mx.array(0.0, dtype=mx.float32)
-            img_rel = mx.array(0.0, dtype=mx.float32)
-        if gate is not None:
-            gate_f32 = gate[:, None].astype(mx.float32)
-            actual_residual = actual_f32 * gate_f32
-            forecast_residual = forecast_f32 * gate_f32
-            residual_delta = mx.abs(actual_residual - forecast_residual)
-            residual_actual_mean = mx.mean(mx.abs(actual_residual))
-            residual_delta_mean = mx.mean(residual_delta)
-            residual_rel = residual_delta_mean / (residual_actual_mean + 1e-6)
-        else:
-            residual_actual_mean = mx.array(0.0, dtype=mx.float32)
-            residual_delta_mean = mx.array(0.0, dtype=mx.float32)
-            residual_rel = mx.array(0.0, dtype=mx.float32)
-        mx.eval(
-            actual_mean,
-            delta_mean,
-            rel,
-            txt_delta,
-            txt_rel,
-            img_delta,
-            img_rel,
-            residual_actual_mean,
-            residual_delta_mean,
-            residual_rel,
-            optimal_gain,
-            residual_optimal_gain,
-        )
-        self.forecast_single_linear2_scout_metrics.append(
-            {
-                "step": self.forecast_step_index,
-                "block": index,
-                "mode": mode,
-                "shape": self.forecast_single_linear2_shape,
-                "gain": forecast_gain,
-                "actual_mean_abs": float(actual_mean.item()),
-                "delta_mean_abs": float(delta_mean.item()),
-                "rel_l1": float(rel.item()),
-                "txt_delta_mean_abs": float(txt_delta.item()),
-                "txt_rel_l1": float(txt_rel.item()),
-                "img_delta_mean_abs": float(img_delta.item()),
-                "img_rel_l1": float(img_rel.item()),
-                "residual_actual_mean_abs": float(residual_actual_mean.item()),
-                "residual_delta_mean_abs": float(residual_delta_mean.item()),
-                "residual_rel_l1": float(residual_rel.item()),
-                "optimal_gain": float(optimal_gain.item()),
-                "residual_optimal_gain": float(residual_optimal_gain.item()),
-            }
-        )
 
     def single_storm_ref_for_weather_step(self, weather_step: int) -> float | None:
         rel_values = [
@@ -2169,7 +1907,7 @@ class FluxNativeTransformer:
         split = str(self.forecast_single_linear2_late_split or "all")
         if split == "all":
             return forecast
-        txt_len = max(0, min(int(self.token_scout_txt_len), int(actual.shape[1]), int(forecast.shape[1])))
+        txt_len = max(0, min(int(self.current_text_token_count), int(actual.shape[1]), int(forecast.shape[1])))
         if txt_len <= 0:
             return forecast
         if split == "img":
@@ -2179,7 +1917,7 @@ class FluxNativeTransformer:
         return forecast
 
     def partial_single_linear2_text_real(self, attn_mlp: mx.array, forecast: mx.array, prefix: str) -> mx.array:
-        txt_len = max(0, min(int(self.token_scout_txt_len), int(attn_mlp.shape[1]), int(forecast.shape[1])))
+        txt_len = max(0, min(int(self.current_text_token_count), int(attn_mlp.shape[1]), int(forecast.shape[1])))
         if txt_len <= 0:
             return forecast
         text_out = self.linear(attn_mlp[:, :txt_len], prefix)
@@ -2196,12 +1934,8 @@ class FluxNativeTransformer:
         if self.forecast_single_scope not in {"linear2", "attention_linear2", "linear2_late"}:
             return
         tracked_blocks = self.forecast_single_tracked_blocks()
-        scout_blocks = set()
-        for _, planned_blocks in self.forecast_single_linear2_scout_plan.values():
-            scout_blocks.update(planned_blocks)
-        if index not in tracked_blocks and index not in scout_blocks:
+        if index not in tracked_blocks:
             return
-        self.scout_single_linear2_forecast(index, value, norm_x, gate)
         history = self.forecast_single_linear2_history.setdefault(index, [])
         history.append((self.forecast_step_index, value))
         if len(history) > 2:
@@ -2755,7 +2489,6 @@ class FluxNativeTransformer:
                 img_modulation_dims=img_modulation_dims,
             )
         base = f"double_blocks.{index}"
-        txt_before_scout = txt if self.token_scout_enabled and index in self.token_scout_double_blocks else None
         t0 = time.perf_counter()
         if self.modulation_cache is not None and modulation_index is not None:
             img_mod, txt_mod = self.modulation_cache["double"][index]  # type: ignore[index]
@@ -2814,7 +2547,6 @@ class FluxNativeTransformer:
         k = mx.concatenate([txt_k, img_k], axis=2)
         v = mx.concatenate([txt_v, img_v], axis=2)
         q, k = apply_rope(q, k, rotary_emb)
-        self.attention_scout_probe("double_img_to_txt", index, q, k, int(txt.shape[1]))
         attn_out = from_heads(self.kontext_kv_attention("double", index, q, k, v, reference_tokens))
         if CAST_ATTENTION_OUT:
             attn_out = attn_out.astype(self.precision)
@@ -2854,8 +2586,6 @@ class FluxNativeTransformer:
             txt = txt.astype(self.precision)
         txt = nan_to_num_fp16(txt)
         self.profile_eval("double.txt_out_mlp", t0, txt)
-        if txt_before_scout is not None:
-            self.token_scout_probe("double_txt", index, txt_before_scout, txt)
         return img, txt
 
     def double_block_detail(
@@ -3037,7 +2767,6 @@ class FluxNativeTransformer:
                 modulation_dims=modulation_dims,
             )
         base = f"single_blocks.{index}"
-        txt_before_scout = self.token_scout_before_single(index, x)
         t0 = time.perf_counter()
         if self.modulation_cache is not None and modulation_index is not None:
             cached = self.modulation_cache["single"][index]  # type: ignore[index]
@@ -3053,8 +2782,6 @@ class FluxNativeTransformer:
             x = x + forecast_residual
             if CAST_BLOCK_OUTPUT:
                 x = x.astype(self.precision)
-            if txt_before_scout is not None:
-                self.token_scout_probe("single_txt", index, txt_before_scout, x[:, : self.token_scout_txt_len])
             return x
         t0 = time.perf_counter()
         forecast_linear2 = self.forecast_single_linear2(index, norm_x, gate)
@@ -3067,8 +2794,6 @@ class FluxNativeTransformer:
             self.profile_eval("single.linear2_forecast_early", t0, x)
             if index in self.shadow_single_blocks:
                 self.shadow_probe(f"single{index}.out", x)
-            if txt_before_scout is not None:
-                self.token_scout_probe("single_txt", index, txt_before_scout, x[:, : self.token_scout_txt_len])
             return x
         t0 = time.perf_counter()
         linear1 = self.linear(norm_x, f"{base}.linear1")
@@ -3083,7 +2808,6 @@ class FluxNativeTransformer:
         )
         v = as_heads(v)
         q, k = apply_rope(q, k, rotary_emb)
-        self.attention_scout_probe("single_img_to_txt", index, q, k, self.token_scout_txt_len)
         forecast_attention = self.forecast_single_attention(index)
         if forecast_attention is not None:
             attn_out = forecast_attention
@@ -3162,8 +2886,6 @@ class FluxNativeTransformer:
         x = nan_to_num_fp16(x)
         if index in self.shadow_single_blocks:
             self.shadow_probe(f"single{index}.out", x)
-        if txt_before_scout is not None:
-            self.token_scout_probe("single_txt", index, txt_before_scout, x[:, : self.token_scout_txt_len])
         return x
 
     def single_block_detail(
@@ -3448,7 +3170,7 @@ class FluxNativeTransformer:
                 mx.clear_cache()
 
         img = nan_to_num_flux_fp16(img)
-        self.token_scout_txt_len = int(txt.shape[1])
+        self.current_text_token_count = int(txt.shape[1])
         x = mx.concatenate([txt, img], axis=1)
         if use_reference_zero:
             txt_len = int(txt.shape[1])
@@ -3585,7 +3307,7 @@ class FluxNativeTransformer:
                 mx.clear_cache()
 
         img = nan_to_num_flux_fp16(img)
-        self.token_scout_txt_len = int(txt.shape[1])
+        self.current_text_token_count = int(txt.shape[1])
         x = mx.concatenate([txt, img], axis=1)
         if use_reference_zero:
             txt_len = int(txt.shape[1])

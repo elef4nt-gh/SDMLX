@@ -176,7 +176,7 @@ except ModuleNotFoundError as exc:
         "platformdirs",
         "piexif",
     )):
-        SDMLX_VERSION = "0.1.19"
+        SDMLX_VERSION = "0.1.20"
         NODE_CLASS_MAPPINGS = {
             node_name: _make_unavailable_node(node_name) for node_name in _NODE_DISPLAY_NAMES
         }

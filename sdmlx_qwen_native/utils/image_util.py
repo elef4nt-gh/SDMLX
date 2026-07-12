@@ -60,6 +60,7 @@ class ImageUtil:
         concept_heatmap: ConceptHeatmap | None = None,
         negative_prompt: str | None = None,
         init_metadata: dict | None = None,
+        latent: mx.array | None = None,
     ) -> GeneratedImage:
         image = ImageUtil._decoded_to_pil(decoded_latents)
         return GeneratedImage(
@@ -88,6 +89,7 @@ class ImageUtil:
             concept_heatmap=concept_heatmap,
             negative_prompt=negative_prompt,
             init_metadata=init_metadata,
+            latent=latent,
         )
 
     @staticmethod

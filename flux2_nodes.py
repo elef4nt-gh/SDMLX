@@ -6221,15 +6221,26 @@ class SDMLXFlux2KleinEnhancedEditSampler:
         return False
 
     @staticmethod
-    def _conditioning_refs_ordered(*conditionings: Any) -> list[dict[str, Any]]:
-        refs: list[dict[str, Any]] = []
-        for conditioning in conditionings:
-            if not isinstance(conditioning, dict):
+    def _conditioning_refs_ordered(positive: Any, negative: Any) -> list[dict[str, Any]]:
+        source = "conditioning_positive"
+        conditioning = positive
+        refs = positive.get("reference_latents") or [] if isinstance(positive, dict) else []
+        if not refs:
+            source = "conditioning_negative"
+            conditioning = negative
+            refs = negative.get("reference_latents") or [] if isinstance(negative, dict) else []
+
+        ordered: list[dict[str, Any]] = []
+        if not isinstance(conditioning, dict):
+            return ordered
+        for index, ref in enumerate(refs, start=1):
+            if not isinstance(ref, dict) or ref.get("latents") is None:
                 continue
-            for ref in conditioning.get("reference_latents") or []:
-                if isinstance(ref, dict) and ref.get("latents") is not None:
-                    refs.append(dict(ref))
-        return refs
+            item = dict(ref)
+            item["_sdmlx_reference_source"] = source
+            item["_sdmlx_reference_slot"] = index
+            ordered.append(item)
+        return ordered
 
     @staticmethod
     def _direct_references(
@@ -6239,13 +6250,22 @@ class SDMLXFlux2KleinEnhancedEditSampler:
     ) -> list[dict[str, Any]]:
         refs: list[dict[str, Any]] = []
         index = int(start_index)
-        for i in range(1, 9):
-            image = optional.get(f"reference_image_{i}")
+        for slot in range(1, 9):
+            image = optional.get(f"reference_image_{slot}")
             if image is None:
                 continue
-            refs.append(_flux2_enhanced_direct_reference(image, mlx_vae, index=index))
+            ref = _flux2_enhanced_direct_reference(image, mlx_vae, index=index)
+            ref["_sdmlx_reference_source"] = "direct"
+            ref["_sdmlx_reference_slot"] = slot
+            refs.append(ref)
             index += 1
         return refs
+
+    @staticmethod
+    def _finalize_reference_sequence(references: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for position, ref in enumerate(references, start=1):
+            ref["_sdmlx_reference_sequence"] = position
+        return references
 
     @staticmethod
     def _mask_keep_list(
@@ -6256,7 +6276,11 @@ class SDMLXFlux2KleinEnhancedEditSampler:
     ) -> list[np.ndarray | None]:
         out: list[np.ndarray | None] = []
         for idx, ref in enumerate(references):
-            mask = optional.get(f"subject_mask_{idx + 1}")
+            mask = None
+            if ref.get("_sdmlx_reference_source") == "direct":
+                slot = int(ref.get("_sdmlx_reference_slot") or 0)
+                if 1 <= slot <= 8:
+                    mask = optional.get(f"subject_mask_{slot}")
             count = ref_token_counts[idx] if idx < len(ref_token_counts) else 0
             out.append(_flux2_mask_keep_indices(mask, ref, count, threshold))
         return out
@@ -6393,6 +6417,7 @@ class SDMLXFlux2KleinEnhancedEditSampler:
 
         references = self._conditioning_refs_ordered(positive, negative)
         references.extend(self._direct_references(mlx_vae, len(references), optional))
+        self._finalize_reference_sequence(references)
         profiler.mark("references ready")
 
         supports_kv = bool(getattr(model.model_config, "supports_kv_cache", False))

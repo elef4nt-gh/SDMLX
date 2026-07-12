@@ -46,6 +46,7 @@ class GeneratedImage:
         concept_heatmap: ConceptHeatmap | None = None,
         negative_prompt: str | None = None,
         init_metadata: dict | None = None,
+        latent: mx.array | None = None,
     ):
         self.image = image
         self.model_config = model_config
@@ -72,6 +73,7 @@ class GeneratedImage:
         self.concept_heatmap = concept_heatmap
         self.negative_prompt = negative_prompt
         self.init_metadata = init_metadata
+        self.latent = latent
 
     def get_right_half(self) -> "GeneratedImage":
         # Calculate the coordinates for the right half
@@ -101,6 +103,7 @@ class GeneratedImage:
             depth_image_path=self.depth_image_path,
             concept_heatmap=self.concept_heatmap,
             init_metadata=self.init_metadata,
+            latent=self.latent,
         )
 
     def save(

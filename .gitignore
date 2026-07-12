@@ -30,8 +30,8 @@ temp/
 sdmlx_lora_schedule_curves.*
 
 # Local model/cache artifacts
-models/
-cache/
+/models/
+/cache/
 *.safetensors
 *.ckpt
 *.pt

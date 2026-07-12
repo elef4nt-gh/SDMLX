@@ -97,7 +97,7 @@ SDMLX's FLUX sampler uses an SDMLX MLX sampling loop with Euler-style flow updat
 
 | Component | Upstream source | License | Notes |
 | --- | --- | --- | --- |
-| mflux | [filipstrand/mflux](https://github.com/filipstrand/mflux) | MIT License, copyright (c) 2024 Filip Strand | Reference for FLUX configuration, sigma scheduling behavior and the local FLUX VAE code adapted into SDMLX. |
+| mflux | [filipstrand/mflux](https://github.com/filipstrand/mflux) | MIT License, copyright (c) 2026 Filip Strand | Reference for FLUX configuration, sigma scheduling behavior and the local FLUX VAE code adapted into SDMLX. The bundled license text is in `sdmlx_qwen_native/LICENSE.mflux`. |
 
 ## Qwen Runtime Reference
 
@@ -105,7 +105,7 @@ SDMLX's Qwen Image Edit 2511 path includes a local MLX runtime adapted from `mfl
 
 | Component | Upstream source | License / terms | Notes |
 | --- | --- | --- | --- |
-| mflux | [filipstrand/mflux](https://github.com/filipstrand/mflux) | MIT License, copyright (c) 2024 Filip Strand | Reference and adapted source base for the local Qwen MLX runtime. |
+| mflux | [filipstrand/mflux](https://github.com/filipstrand/mflux) | MIT License, copyright (c) 2026 Filip Strand | Reference and adapted source base for the local Qwen MLX runtime. The bundled license text is in `sdmlx_qwen_native/LICENSE.mflux`. |
 | Qwen Image Edit 2511 | `Qwen/qwen-image-edit-2511` | Check upstream model card before use or redistribution | Base model family for the Qwen Image Edit path. |
 | Qwen Image Edit 2511 8-bit MLX package | `mlx-community/qwen-image-edit-2511-8bit` | Check upstream package and base model terms | Default repo id for Qwen `.sdmlx` package manifests. |
 

@@ -55,7 +55,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.19"
+SDMLX_VERSION = "0.1.20"
 SDMLX_CACHE_VERSION = "adapter-v7"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -117,6 +117,7 @@ CONDITIONING_CACHE = {}
 CONDITIONING_GUARD_CACHE = {}
 COMPILED_STEP_DENOISERS = {}
 COMPILED_VAE_DECODERS = {}
+INPAINT_DETAILER_PREP_CACHE = {}
 TAESD_PREVIEWER_CACHE = {}
 SPEED_PATCH_FACTORS_CACHE = {}
 LORA_MODULES_CACHE = {}
@@ -3601,6 +3602,71 @@ def mapped_lora_factor_arrays(up, down, split_index):
     return up_np, down_np
 
 
+SDXL_LORA_UNET_ONLY = "unet_only"
+SDXL_LORA_CLIP_ONLY = "clip_only"
+SDXL_LORA_MIXED = "mixed"
+SDXL_LORA_INCOMPATIBLE = "incompatible"
+SDXL_LORA_CLASS_CACHE = {}
+
+
+def _lora_factor_pairs(state):
+    """Return Comfy/Kohya and Diffusers PEFT LoRA pairs in one orientation."""
+    pairs = []
+    suffixes = (
+        (".lora_down.weight", ".lora_up.weight", "down_up"),
+        (".lora_A.weight", ".lora_B.weight", "diffusers_ab"),
+        (".lora.down.weight", ".lora.up.weight", "diffusers_dot"),
+        ("_lora.down.weight", "_lora.up.weight", "diffusers_underscore"),
+    )
+    seen = set()
+    for down_suffix, up_suffix, layout in suffixes:
+        for key in state:
+            if not key.endswith(down_suffix):
+                continue
+            prefix = key[: -len(down_suffix)]
+            if prefix in seen:
+                continue
+            up_key = f"{prefix}{up_suffix}"
+            if up_key not in state:
+                continue
+            alpha = state.get(f"{prefix}.alpha")
+            if alpha is None:
+                alpha = state.get(f"{prefix}.lora_alpha")
+            seen.add(prefix)
+            pairs.append(
+                {
+                    "prefix": prefix,
+                    "down": state[key],
+                    "up": state[up_key],
+                    "alpha": alpha,
+                    "layout": layout,
+                }
+            )
+    return sorted(pairs, key=lambda item: item["prefix"])
+
+
+def _strip_peft_wrapper(prefix):
+    for wrapper in ("base_model.model.", "base_model."):
+        if prefix.startswith(wrapper):
+            return prefix[len(wrapper):]
+    return prefix
+
+
+def _sdxl_unet_diffusers_key(prefix):
+    prefix = _strip_peft_wrapper(str(prefix))
+    if prefix.startswith("lora_unet_"):
+        return lora_prefix_to_diffusers_key(prefix)
+    if prefix.startswith("unet."):
+        key = prefix[len("unet."):]
+        return key if key.endswith(".weight") else f"{key}.weight"
+    return None
+
+
+def _sdxl_clip_prefix(prefix):
+    prefix = _strip_peft_wrapper(str(prefix))
+    return prefix
+
+
 def load_lora_modules(path):
     identity = lora_file_identity(path)
     cache_key = (identity["path"], identity["size"], identity["mtime_ns"])
@@ -3613,29 +3679,26 @@ def load_lora_modules(path):
     modules = []
     skipped_prefixes = []
     text_prefixes = 0
-    prefixes = sorted(
-        key[: -len(".lora_down.weight")]
-        for key in state
-        if key.endswith(".lora_down.weight")
-    )
-    for prefix in prefixes:
-        if not prefix.startswith("lora_unet_"):
-            if prefix.startswith(("lora_te_", "lora_te1_", "lora_te2_")):
+    pairs = _lora_factor_pairs(state)
+    prefixes = [item["prefix"] for item in pairs]
+    layouts = set()
+    for pair in pairs:
+        prefix = pair["prefix"]
+        mapped_prefix = _strip_peft_wrapper(prefix)
+        diffusers_key = _sdxl_unet_diffusers_key(prefix)
+        if diffusers_key is None:
+            if mapped_prefix.startswith(("lora_te_", "lora_te1_", "lora_te2_", "text_encoder.", "text_encoder_2.")):
                 text_prefixes += 1
             else:
                 skipped_prefixes.append(prefix)
             continue
 
-        up = state.get(f"{prefix}.lora_up.weight")
-        down = state.get(f"{prefix}.lora_down.weight")
-        if up is None or down is None:
-            skipped_prefixes.append(prefix)
-            continue
-
+        up = pair["up"]
+        down = pair["down"]
         rank = int(down.shape[0])
-        alpha_tensor = state.get(f"{prefix}.alpha")
+        alpha_tensor = pair["alpha"]
         alpha = float(alpha_tensor.item()) if alpha_tensor is not None else float(rank)
-        diffusers_key = lora_prefix_to_diffusers_key(prefix)
+        layouts.add(pair["layout"])
         for target_key, split_index in diffusers_unet_key_to_sdmlx_targets(diffusers_key):
             factor_base = target_key[: -len(".weight")] if target_key.endswith(".weight") else target_key
             target_base = normalize_speed_patch_target_base(factor_base)
@@ -3656,8 +3719,69 @@ def load_lora_modules(path):
         "skipped_prefixes": skipped_prefixes,
         "text_prefixes": text_prefixes,
         "state_prefix_count": len(prefixes),
+        "layouts": sorted(layouts),
     }
     LORA_MODULES_CACHE[cache_key] = result
+    return result
+
+
+def classify_sdxl_lora(path):
+    identity = lora_file_identity(path)
+    cache_key = (identity["path"], identity["size"], identity["mtime_ns"], "sdxl_header_class_v1")
+    cached = SDXL_LORA_CLASS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    from safetensors import safe_open
+
+    with safe_open(path, framework="np") as handle:
+        keys = set(handle.keys())
+    suffixes = (
+        (".lora_down.weight", ".lora_up.weight", "down_up"),
+        (".lora_A.weight", ".lora_B.weight", "diffusers_ab"),
+        (".lora.down.weight", ".lora.up.weight", "diffusers_dot"),
+        ("_lora.down.weight", "_lora.up.weight", "diffusers_underscore"),
+    )
+    prefixes = []
+    seen = set()
+    layouts = set()
+    for down_suffix, up_suffix, layout in suffixes:
+        for key in keys:
+            if not key.endswith(down_suffix):
+                continue
+            prefix = key[: -len(down_suffix)]
+            if prefix in seen or f"{prefix}{up_suffix}" not in keys:
+                continue
+            seen.add(prefix)
+            prefixes.append(prefix)
+            layouts.add(layout)
+
+    unet_modules = 0
+    clip_modules = 0
+    for prefix in prefixes:
+        diffusers_key = _sdxl_unet_diffusers_key(prefix)
+        if diffusers_key is not None:
+            unet_modules += len(diffusers_unet_key_to_sdmlx_targets(diffusers_key))
+            continue
+        clip_role, target_key = sdxl_clip_lora_target_from_prefix(_sdxl_clip_prefix(prefix))
+        if clip_role is not None and target_key is not None:
+            clip_modules += 1
+    if unet_modules and clip_modules:
+        kind = SDXL_LORA_MIXED
+    elif unet_modules:
+        kind = SDXL_LORA_UNET_ONLY
+    elif clip_modules:
+        kind = SDXL_LORA_CLIP_ONLY
+    else:
+        kind = SDXL_LORA_INCOMPATIBLE
+    result = {
+        "kind": kind,
+        "unet_modules": unet_modules,
+        "clip_modules": clip_modules,
+        "identity": identity,
+        "layouts": sorted(layouts),
+    }
+    SDXL_LORA_CLASS_CACHE[cache_key] = result
     return result
 
 
@@ -3798,17 +3922,23 @@ def apply_loras_to_mapped_weights(mapped_weights, loras):
             lora_info = load_lora_modules(item["path"])
         applied = 0
         skipped = 0
+        first_missing_target = None
+        first_shape_error = None
         pending_eval = []
         for module in lora_info["modules"]:
             weight_key = f"{module['target_base']}.weight"
             if weight_key not in weight_map:
+                if first_missing_target is None:
+                    first_missing_target = weight_key
                 skipped += 1
                 continue
             base_weight = weight_map[weight_key]
             scale = strength * float(module["alpha"]) / float(module["rank"])
             try:
                 delta = lora_delta(module["up"], module["down"], base_weight.shape, mx.float32)
-            except Exception:
+            except Exception as exc:
+                if first_shape_error is None:
+                    first_shape_error = f"{weight_key}: {exc}"
                 skipped += 1
                 continue
             updated = (base_weight.astype(mx.float32) + delta * scale).astype(base_weight.dtype)
@@ -3837,16 +3967,32 @@ def apply_loras_to_mapped_weights(mapped_weights, loras):
                 "This is very likely an SD1.5/Flux/other model-family LoRA instead of SDXL."
             )
         if skipped > applied and not bool(item.get("allow_partial", False)):
+            details = []
+            if first_missing_target:
+                details.append(f"first missing target: {first_missing_target}")
+            if first_shape_error:
+                details.append(f"first shape mismatch: {first_shape_error}")
+            detail_text = f" ({'; '.join(details)})" if details else ""
             raise ValueError(
                 f"SDMLX: LoRA `{lora_name}` appears incompatible: {applied}/{module_count} modules applied, "
-                f"{skipped} target modules skipped. Check whether this LoRA is meant for SDXL."
+                f"{skipped} target modules skipped{detail_text}. Check whether this LoRA is meant for SDXL."
             )
         log_timing(
             f"SDMLX: LoRA {lora_name} applied "
             f"({applied} UNet modules, strength={strength:g})."
         )
         if lora_info["text_prefixes"]:
-            log_timing(f"SDMLX: LoRA contains {lora_info['text_prefixes']} text-encoder prefixes; currently only UNet is patched.")
+            clip_applied = int(item.get("clip_lora_applied") or 0)
+            if clip_applied > 0:
+                log_timing(
+                    f"SDMLX: LoRA `{lora_name}` text-encoder prefixes already applied to SDXL CLIP "
+                    f"({clip_applied} modules)."
+                )
+            else:
+                print(
+                    f"SDMLX: LoRA `{lora_name}` contains {lora_info['text_prefixes']} text-encoder prefixes; "
+                    "connect mlx_clip to SDMLX LoRA Loader before text encode to apply SDXL CLIP LoRA."
+                )
         if skipped or lora_info["skipped_prefixes"]:
             message = (
                 "SDMLX: LoRA partially skipped: "
@@ -3865,6 +4011,407 @@ def apply_loras_to_mapped_weights(mapped_weights, loras):
             }
         )
     return list(weight_map.items()), results
+
+
+SDXL_CLIP_LORA_MODULES_CACHE = {}
+
+
+def sdxl_clip_lora_target_from_prefix(prefix):
+    clip_role = None
+    body = None
+    if prefix.startswith("lora_te1_"):
+        clip_role = "clip_l"
+        body = prefix[len("lora_te1_"):]
+    elif prefix.startswith("lora_te2_"):
+        clip_role = "clip_g"
+        body = prefix[len("lora_te2_"):]
+    elif prefix.startswith("lora_te_"):
+        # Comfy maps bare lora_te_* to CLIP-L when an SDXL CLIP-L model exists.
+        clip_role = "clip_l"
+        body = prefix[len("lora_te_"):]
+    elif prefix.startswith("text_encoder_2."):
+        clip_role = "clip_g"
+        target = prefix[len("text_encoder_2."):]
+        return clip_role, target if target.endswith(".weight") else f"{target}.weight"
+    elif prefix.startswith("text_encoder."):
+        clip_role = "clip_l"
+        target = prefix[len("text_encoder."):]
+        return clip_role, target if target.endswith(".weight") else f"{target}.weight"
+    else:
+        return None, None
+
+    if body == "text_projection":
+        return clip_role, "text_projection.weight"
+
+    match = re.match(r"^text_model_encoder_layers_(\d+)_(.+)$", body)
+    if not match:
+        return clip_role, None
+    layer = int(match.group(1))
+    suffix = match.group(2)
+    replacements = {
+        "self_attn_k_proj": "self_attn.k_proj",
+        "self_attn_q_proj": "self_attn.q_proj",
+        "self_attn_v_proj": "self_attn.v_proj",
+        "self_attn_out_proj": "self_attn.out_proj",
+        "mlp_fc1": "mlp.fc1",
+        "mlp_fc2": "mlp.fc2",
+    }
+    mapped_suffix = replacements.get(suffix)
+    if mapped_suffix is None:
+        return clip_role, None
+    return clip_role, f"text_model.encoder.layers.{layer}.{mapped_suffix}.weight"
+
+
+def load_sdxl_clip_lora_modules(path):
+    identity = lora_file_identity(path)
+    cache_key = (identity["path"], identity["size"], identity["mtime_ns"], "sdxl_clip")
+    if cache_key in SDXL_CLIP_LORA_MODULES_CACHE:
+        return SDXL_CLIP_LORA_MODULES_CACHE[cache_key]
+
+    from comfy.utils import load_torch_file
+
+    state = load_torch_file(path, safe_load=True)
+    modules = []
+    skipped_prefixes = []
+    pairs = _lora_factor_pairs(state)
+    prefixes = [item["prefix"] for item in pairs]
+    layouts = set()
+    for pair in pairs:
+        prefix = pair["prefix"]
+        clip_role, target_key = sdxl_clip_lora_target_from_prefix(_sdxl_clip_prefix(prefix))
+        if clip_role is None:
+            continue
+        if target_key is None:
+            skipped_prefixes.append(prefix)
+            continue
+
+        up = pair["up"]
+        down = pair["down"]
+        rank = int(down.shape[0])
+        alpha_tensor = pair["alpha"]
+        alpha = float(alpha_tensor.item()) if alpha_tensor is not None else float(rank)
+        layouts.add(pair["layout"])
+        up_np, down_np = mapped_lora_factor_arrays(up, down, None)
+        modules.append(
+            {
+                "clip_role": clip_role,
+                "target_key": target_key,
+                "up": up_np,
+                "down": down_np,
+                "alpha": alpha,
+                "rank": int(down_np.shape[0]),
+            }
+        )
+
+    result = {
+        "identity": identity,
+        "modules": modules,
+        "skipped_prefixes": skipped_prefixes,
+        "state_prefix_count": len(prefixes),
+        "layouts": sorted(layouts),
+    }
+    SDXL_CLIP_LORA_MODULES_CACHE[cache_key] = result
+    return result
+
+
+def sdxl_clip_lora_stack_key(base_cache_key, clip_loras):
+    entries = []
+    for item in clip_loras or []:
+        identity = item.get("identity") or {}
+        entries.append(
+            (
+                item.get("name"),
+                identity.get("path"),
+                identity.get("size"),
+                identity.get("mtime_ns"),
+                round(float(item.get("strength", 0.0)), 6),
+            )
+        )
+    return (base_cache_key, "sdxl_clip_loras", tuple(entries))
+
+
+def apply_sdxl_clip_lora_to_mlx_clip(mlx_clip, lora_name, path, strength):
+    if not isinstance(mlx_clip, dict):
+        raise RuntimeError("SDMLX LoRA Loader SDXL CLIP path: expected an mlx_clip dictionary.")
+    clip_type = str(mlx_clip.get("type") or "sdxl").strip().lower()
+    if clip_type in {"flux1", "flux2-klein", "qwen-image-edit"}:
+        raise RuntimeError(
+            "SDMLX LoRA Loader SDXL CLIP path only supports SDXL mlx_clip handles. "
+            f"Received type={clip_type!r}."
+        )
+    if "clip_l" not in mlx_clip or "clip_g" not in mlx_clip:
+        raise RuntimeError("SDMLX LoRA Loader SDXL CLIP path: mlx_clip has no SDXL clip_l/clip_g weights.")
+
+    strength = float(strength)
+    lora_info = load_sdxl_clip_lora_modules(path)
+    modules = lora_info.get("modules", [])
+    if not modules or strength == 0.0:
+        reason = "no SDXL CLIP LoRA modules" if not modules else "strength=0"
+        log_timing(f"SDMLX: SDXL CLIP LoRA skipped for {lora_name} ({reason}).")
+        return mlx_clip, {
+            "name": lora_name,
+            "applied": 0,
+            "skipped": 0,
+            "modules": len(modules),
+            "reason": reason,
+        }
+
+    clip_l = dict(mlx_clip["clip_l"])
+    clip_g = dict(mlx_clip["clip_g"])
+    groups = {"clip_l": clip_l, "clip_g": clip_g}
+    applied = 0
+    skipped = 0
+    role_counts = {"clip_l": 0, "clip_g": 0}
+    first_missing_target = None
+    first_shape_error = None
+    pending_eval = []
+    for module in modules:
+        group = groups[module["clip_role"]]
+        weight_key = module["target_key"]
+        if weight_key not in group:
+            if first_missing_target is None:
+                first_missing_target = f"{module['clip_role']}.{weight_key}"
+            skipped += 1
+            continue
+        base_weight = group[weight_key]
+        scale = strength * float(module["alpha"]) / float(module["rank"])
+        try:
+            delta = lora_delta(module["up"], module["down"], base_weight.shape, mx.float32)
+        except Exception as exc:
+            if first_shape_error is None:
+                first_shape_error = f"{module['clip_role']}.{weight_key}: {exc}"
+            skipped += 1
+            continue
+        updated = (base_weight.astype(mx.float32) + delta * scale).astype(base_weight.dtype)
+        group[weight_key] = updated
+        pending_eval.append(updated)
+        applied += 1
+        role_counts[module["clip_role"]] += 1
+        if len(pending_eval) >= 24:
+            mx.eval(*pending_eval)
+            pending_eval.clear()
+    if pending_eval:
+        mx.eval(*pending_eval)
+
+    module_count = len(modules)
+    if applied == 0:
+        details = []
+        if first_missing_target:
+            details.append(f"first missing target: {first_missing_target}")
+        if first_shape_error:
+            details.append(f"first shape mismatch: {first_shape_error}")
+        detail_text = f" ({'; '.join(details)})" if details else ""
+        print(
+            f"SDMLX: SDXL CLIP LoRA `{lora_name}` was not applied: 0/{module_count} "
+            f"text-encoder modules match{detail_text}. Continuing with unpatched CLIP."
+        )
+        return mlx_clip, {
+            "name": lora_name,
+            "applied": 0,
+            "skipped": skipped,
+            "modules": module_count,
+            "reason": "no matching SDXL CLIP targets",
+        }
+
+    identity = lora_file_identity(path)
+    clip_loras = list(mlx_clip.get("clip_loras", []))
+    clip_loras.append(
+        {
+            "name": lora_name,
+            "path": os.path.abspath(path),
+            "strength": strength,
+            "identity": identity,
+        }
+    )
+    patched = {
+        **mlx_clip,
+        "type": "sdxl",
+        "clip_l": clip_l,
+        "clip_g": clip_g,
+        "clip_loras": clip_loras,
+        "cache_key": sdxl_clip_lora_stack_key(mlx_clip.get("cache_key"), clip_loras),
+    }
+    if skipped or lora_info["skipped_prefixes"]:
+        message = (
+            "SDMLX: SDXL CLIP LoRA partially skipped: "
+            f"{skipped} target weights, {len(lora_info['skipped_prefixes'])} prefixes."
+        )
+        if first_missing_target:
+            message += f" First missing: {first_missing_target}."
+        if first_shape_error:
+            message += f" First mismatch: {first_shape_error}."
+        print(message)
+    log_timing(
+        f"SDMLX: SDXL CLIP LoRA {lora_name} applied "
+        f"({applied}/{module_count}, L={role_counts['clip_l']}, G={role_counts['clip_g']}, strength={strength:g})."
+    )
+    return patched, {
+        "name": lora_name,
+        "applied": applied,
+        "skipped": skipped,
+        "modules": module_count,
+        "clip_l": role_counts["clip_l"],
+        "clip_g": role_counts["clip_g"],
+    }
+
+
+def _canonical_sdmlx_family(value):
+    family = str(value or "").strip().lower()
+    if family in {"qwen", "qwen-image", "qwen-image-edit", "qwen-image-2512", "qwen-image-edit-2511"}:
+        return "qwen"
+    if family in {"flux1", "flux.1", "dev", "kontext", "schnell"}:
+        return "flux1"
+    if family in {"flux2", "flux.2", "flux2-klein"}:
+        return "flux2-klein"
+    if family == "sdxl":
+        return "sdxl"
+    return family or "unknown"
+
+
+def sdmlx_runtime_family(handle):
+    if handle is None:
+        return "unknown"
+    if isinstance(handle, dict):
+        explicit = set()
+        for key in ("model_family", "base_model_family", "type"):
+            family = _canonical_sdmlx_family(handle.get(key))
+            if family in {"sdxl", "qwen", "flux1", "flux2-klein"}:
+                explicit.add(family)
+        if len(explicit) > 1:
+            raise RuntimeError(
+                "SDMLX: contradictory runtime family markers: " + ", ".join(sorted(explicit)) + "."
+            )
+        if explicit:
+            return next(iter(explicit))
+        if "weights" in handle and "cache_key" in handle:
+            return "sdxl"
+        return "unknown"
+    family = _canonical_sdmlx_family(getattr(handle, "model_family", None))
+    if family != "unknown":
+        return family
+    if handle.__class__.__name__ == "SDMLXFluxNativeModel":
+        return "flux1"
+    return "unknown"
+
+
+def require_sdmlx_family(handle, allowed, operation, role="model"):
+    allowed_set = {_canonical_sdmlx_family(value) for value in allowed}
+    family = sdmlx_runtime_family(handle)
+    if family not in allowed_set:
+        expected = ", ".join(sorted(allowed_set))
+        raise RuntimeError(f"{operation}: expected {role} family {expected}; received {family}.")
+    return family
+
+
+def sdmlx_conditioning_family(conditioning):
+    if isinstance(conditioning, dict):
+        family = sdmlx_runtime_family(conditioning)
+        if family != "unknown":
+            return family
+        if "cond" in conditioning and "pooled" in conditioning:
+            return "sdxl"
+        nested = conditioning.get("conditioning")
+        if nested is not None:
+            return sdmlx_conditioning_family(nested)
+        return "unknown"
+    if isinstance(conditioning, (list, tuple)):
+        families = {
+            family
+            for item in conditioning
+            if (family := sdmlx_conditioning_family(item)) != "unknown"
+        }
+        if len(families) > 1:
+            raise RuntimeError(
+                "SDMLX: contradictory conditioning families: " + ", ".join(sorted(families)) + "."
+            )
+        return next(iter(families)) if families else "unknown"
+    return "unknown"
+
+
+def require_sdmlx_runtime_pairing(
+    operation,
+    model,
+    *,
+    allowed,
+    vae=None,
+    positive=None,
+    negative=None,
+):
+    family = require_sdmlx_family(model, allowed, operation)
+    if vae is not None:
+        vae_family = require_sdmlx_family(vae, {family}, operation, role="VAE")
+        if vae_family != family:
+            raise RuntimeError(f"{operation}: model and VAE families do not match.")
+    for label, conditioning in (("positive conditioning", positive), ("negative conditioning", negative)):
+        if conditioning is None:
+            continue
+        conditioning_family = sdmlx_conditioning_family(conditioning)
+        if conditioning_family != "unknown" and conditioning_family != family:
+            raise RuntimeError(
+                f"{operation}: expected {label} family {family}; received {conditioning_family}."
+            )
+    return family
+
+
+def apply_sdxl_lora_contract(mlx_model, mlx_clip, lora_name, path, strength, schedule=None):
+    require_sdmlx_family(mlx_model, {"sdxl"}, "SDMLX LoRA Loader")
+    strength = float(strength)
+    classification = classify_sdxl_lora(path)
+    kind = classification["kind"]
+    if kind == SDXL_LORA_INCOMPATIBLE:
+        raise ValueError(
+            f"SDMLX: LoRA `{lora_name}` is incompatible with SDXL: no supported UNet or CLIP modules were found."
+        )
+    if schedule is not None and kind == SDXL_LORA_CLIP_ONLY:
+        raise ValueError(
+            f"SDMLX: LoRA `{lora_name}` is CLIP-only, but LoRA Scheduler controls only SDXL UNet weights."
+        )
+    if kind == SDXL_LORA_CLIP_ONLY and not isinstance(mlx_clip, dict):
+        raise ValueError(
+            f"SDMLX: LoRA `{lora_name}` is CLIP-only. Connect mlx_clip to the LoRA Loader before text encode."
+        )
+
+    patched_model = mlx_model
+    model_item = None
+    if kind in {SDXL_LORA_UNET_ONLY, SDXL_LORA_MIXED} and strength != 0.0:
+        model_item = {
+            "name": lora_name,
+            "path": os.path.abspath(path),
+            "strength_model": lora_strength_for_item(strength, schedule),
+            "identity": classification["identity"],
+            "sdxl_lora_kind": kind,
+        }
+        if schedule is not None:
+            model_item["schedule"] = schedule
+        model_loras = list(mlx_model.get("loras", []))
+        model_loras.append(model_item)
+        patched_model = {**mlx_model, "loras": model_loras}
+
+    patched_clip = mlx_clip
+    clip_result = {"applied": 0, "modules": classification["clip_modules"]}
+    if kind in {SDXL_LORA_CLIP_ONLY, SDXL_LORA_MIXED}:
+        if schedule is not None:
+            log_timing("SDMLX: scheduled mixed SDXL LoRA applies to UNet only; CLIP remains unchanged.")
+        elif isinstance(mlx_clip, dict):
+            require_sdmlx_family(mlx_clip, {"sdxl"}, "SDMLX LoRA Loader", role="CLIP")
+            patched_clip, clip_result = apply_sdxl_clip_lora_to_mlx_clip(
+                mlx_clip, lora_name, os.path.abspath(path), strength
+            )
+            if kind == SDXL_LORA_CLIP_ONLY and int(clip_result.get("applied") or 0) == 0:
+                raise ValueError(f"SDMLX: CLIP-only LoRA `{lora_name}` matched no connected SDXL CLIP weights.")
+            if model_item is not None:
+                model_item["clip_lora_applied"] = int(clip_result.get("applied") or 0)
+                model_item["clip_lora_modules"] = int(clip_result.get("modules") or 0)
+        else:
+            log_timing(
+                f"SDMLX: mixed LoRA `{lora_name}` applied to UNet; connect mlx_clip to apply its text-encoder modules."
+            )
+
+    return patched_model, patched_clip, {
+        **classification,
+        "clip_applied": int(clip_result.get("applied") or 0),
+        "model_added": model_item is not None,
+    }
 
 
 def checkpoint_file_content_digest(path, stat=None):
@@ -4225,6 +4772,7 @@ def refresh_cache_manifest_identity(package_path, identity):
         return False
     manifest.update(identity)
     manifest.setdefault("package_format", "sdmlx-package-v3")
+    manifest.setdefault("base_model_family", "sdxl")
     with open(manifest_path(package_path), "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -4415,6 +4963,7 @@ def write_cache_manifest(package_path, identity, components):
     manifest = {
         **identity,
         "package_format": "sdmlx-package-v3",
+        "base_model_family": "sdxl",
         "components": components,
     }
     with open(manifest_path(package_path), "w", encoding="utf-8") as handle:
@@ -4617,6 +5166,33 @@ def manifest_is_flux2_package(manifest):
     return family == "flux2-klein" or package_format == "sdmlx-flux2-klein-package-v1"
 
 
+def _sdxl_runtime_handles(unet, clip_l, clip_g, vae, cache_key):
+    return (
+        {"weights": unet, "cache_key": cache_key, "model_family": "sdxl"},
+        {"clip_l": clip_l, "clip_g": clip_g, "cache_key": cache_key, "type": "sdxl", "model_family": "sdxl"},
+        {"weights": vae, "cache_key": cache_key, "type": "sdxl", "model_family": "sdxl"},
+    )
+
+
+def _backfill_sdxl_manifest_family(package_path, manifest):
+    if not isinstance(manifest, dict):
+        return manifest
+    family = str(manifest.get("base_model_family") or manifest.get("model_family") or "").strip().lower()
+    if family and family != "sdxl":
+        raise RuntimeError(
+            f"SDMLX: Package {os.path.basename(package_path)} declares incompatible model family {family!r}."
+        )
+    if family == "sdxl":
+        return manifest
+    updated = dict(manifest)
+    updated["base_model_family"] = "sdxl"
+    with open(manifest_path(package_path), "w", encoding="utf-8") as handle:
+        json.dump(updated, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    mark_macos_package(package_path)
+    return updated
+
+
 def load_sdmlx_package(package_path, preload=False):
     manifest = read_cache_manifest(package_path)
     if manifest_is_qwen_package(manifest):
@@ -4639,6 +5215,7 @@ def load_sdmlx_package(package_path, preload=False):
         except Exception as exc:
             package_name = os.path.basename(package_path)
             raise RuntimeError(f"SDMLX: FLUX.2 Klein package {package_name} could not be loaded: {exc}") from exc
+    manifest = _backfill_sdxl_manifest_family(package_path, manifest)
     if manifest and manifest.get("cache_version") != SDMLX_CACHE_VERSION:
         package_name = os.path.basename(package_path)
         raise FileNotFoundError(
@@ -4669,9 +5246,9 @@ def load_sdmlx_package(package_path, preload=False):
         f"SDMLX STATUS: UNet={len(cached_unet)}, CLIP-L={len(cached_clip_l)}, "
         f"CLIP-G={len(cached_clip_g)}, VAE={len(cached_vae)}"
     )
-    mlx_model = {"weights": cached_unet, "cache_key": package_path}
-    mlx_clip = {"clip_l": cached_clip_l, "clip_g": cached_clip_g, "cache_key": package_path}
-    mlx_vae = {"weights": cached_vae, "cache_key": package_path}
+    mlx_model, mlx_clip, mlx_vae = _sdxl_runtime_handles(
+        cached_unet, cached_clip_l, cached_clip_g, cached_vae, package_path
+    )
     if preload:
         preload_mlx_model(mlx_model, mlx_clip, mlx_vae, fast_mode=True, compute_dtype="float16", vae_dtype="float32")
     return mlx_model, mlx_clip, mlx_vae
@@ -5024,6 +5601,7 @@ def clear_sdmlx_model_cache(kinds=None):
         COMPILED_STEP_DENOISERS.clear()
     if kinds is None or "vae" in kinds:
         COMPILED_VAE_DECODERS.clear()
+        INPAINT_DETAILER_PREP_CACHE.clear()
     release_mlx_cache_memory()
     return removed, freed
 
@@ -8228,9 +8806,9 @@ class SDMLX_LoaderUniversal:
             f"CLIP-L={len(groups['clip_l'])}, CLIP-G={len(groups['clip_g'])}, "
             f"VAE={len(groups['vae'])}"
         )
-        mlx_model = {"weights": groups["unet"], "cache_key": package_path}
-        mlx_clip = {"clip_l": groups["clip_l"], "clip_g": groups["clip_g"], "cache_key": package_path}
-        mlx_vae = {"weights": groups["vae"], "cache_key": package_path}
+        mlx_model, mlx_clip, mlx_vae = _sdxl_runtime_handles(
+            groups["unet"], groups["clip_l"], groups["clip_g"], groups["vae"], package_path
+        )
         if preload:
             preload_mlx_model(mlx_model, mlx_clip, mlx_vae, fast_mode=True, compute_dtype="float16", vae_dtype="float32")
         return (mlx_model, mlx_clip, mlx_vae)
@@ -8599,12 +9177,13 @@ class SDMLX_LoraLoader:
                 "enabled": ("BOOLEAN", {"default": True}),
             },
             "optional": {
+                "mlx_clip": ("mlx_clip",),
                 "lora_scheduler": ("sdmlx_schedule",),
             },
         }
 
-    RETURN_TYPES = (SDMLX_MODEL_TYPE,)
-    RETURN_NAMES = ("sdmlx_model",)
+    RETURN_TYPES = (SDMLX_MODEL_TYPE, "mlx_clip")
+    RETURN_NAMES = ("sdmlx_model", "mlx_clip")
     FUNCTION = "load_lora"
     CATEGORY = "SDMLX/LoRA"
 
@@ -8615,23 +9194,45 @@ class SDMLX_LoraLoader:
         strength=1.0,
         enabled=True,
         lora_scheduler=None,
+        mlx_clip=None,
     ):
         import folder_paths
 
         mlx_model = sdmlx_model
         if not enabled or not lora_name or lora_name == MULTI_LORA_NONE:
             log_timing(f"SDMLX: LoRA disabled: {lora_name}")
-            return (mlx_model,)
+            return (mlx_model, mlx_clip)
 
-        from .flux_nodes import SDMLXFluxNativeModel, _apply_flux_lora
+        from .flux_nodes import (
+            SDMLXFluxNativeModel,
+            _apply_flux1_clip_lora,
+            _flux1_lora_has_text_encoder_targets,
+            _apply_flux_lora,
+        )
+        model_family = require_sdmlx_family(
+            mlx_model,
+            {"sdxl", "qwen", "flux1", "flux2-klein"},
+            "SDMLX LoRA Loader",
+        )
 
         strength = float(strength)
         schedule = lora_scheduler if isinstance(lora_scheduler, dict) else None
         effective_strength_model = lora_strength_for_item(strength, schedule)
-        if isinstance(mlx_model, SDMLXFluxNativeModel):
+        if model_family == "flux1":
+            if not isinstance(mlx_model, SDMLXFluxNativeModel):
+                raise RuntimeError("SDMLX LoRA Loader: invalid FLUX.1 model handle.")
             if schedule is not None:
                 log_timing("SDMLX: LoRA schedule is not supported for FLUX; using the current effective strength.")
-            return (_apply_flux_lora(mlx_model, lora_name, effective_strength_model),)
+            patched_model = _apply_flux_lora(mlx_model, lora_name, effective_strength_model)
+            patched_clip = mlx_clip
+            if isinstance(mlx_clip, dict) and str(mlx_clip.get("type") or "").strip().lower() == "flux1":
+                patched_clip = _apply_flux1_clip_lora(mlx_clip, lora_name, effective_strength_model)
+            elif _flux1_lora_has_text_encoder_targets(lora_name):
+                log_timing(
+                    "SDMLX: FLUX.1 LoRA contains text-encoder keys; connect mlx_clip to "
+                    "SDMLX LoRA Loader before FLUX text encode to apply them."
+                )
+            return (patched_model, patched_clip)
 
         if hasattr(folder_paths, "get_full_path_or_raise"):
             path = folder_paths.get_full_path_or_raise("loras", lora_name)
@@ -8640,12 +9241,7 @@ class SDMLX_LoraLoader:
             if path is None:
                 raise FileNotFoundError(f"SDMLX: LoRA not found: {lora_name}")
 
-        try:
-            from .flux2_nodes import is_flux2_sdmlx_model
-        except Exception:
-            is_flux2_sdmlx_model = None
-
-        if is_flux2_sdmlx_model is not None and is_flux2_sdmlx_model(mlx_model):
+        if model_family == "flux2-klein":
             if schedule is not None:
                 log_timing("SDMLX: LoRA schedule is not supported for FLUX.2; using the current effective strength.")
             model_loras = list(mlx_model.get("loras", []))
@@ -8663,14 +9259,9 @@ class SDMLX_LoraLoader:
                 f"SDMLX: FLUX.2 LoRA stack extended: {lora_name} "
                 f"(strength={effective_strength_model:g}, total={len(model_loras)})."
             )
-            return (patched_model,)
+            return (patched_model, mlx_clip)
 
-        try:
-            from .qwen_nodes import is_qwen_sdmlx_model
-        except Exception:
-            is_qwen_sdmlx_model = None
-
-        if is_qwen_sdmlx_model is not None and is_qwen_sdmlx_model(mlx_model):
+        if model_family == "qwen":
             if schedule is not None:
                 log_timing("SDMLX: LoRA schedule is not supported for Qwen; using the current effective strength.")
             model_loras = list(mlx_model.get("loras", []))
@@ -8693,34 +9284,23 @@ class SDMLX_LoraLoader:
                 f"SDMLX: Qwen LoRA stack extended: {lora_name} "
                 f"(strength={effective_strength_model:g}, mod={mod_lora_scale:g}, total={len(model_loras)})."
             )
-            return (patched_model,)
+            return (patched_model, mlx_clip)
 
-        model_loras = list(mlx_model.get("loras", []))
-        if effective_strength_model != 0.0:
-            item = {
-                "name": lora_name,
-                "path": os.path.abspath(path),
-                "strength_model": effective_strength_model,
-                "identity": lora_file_identity(path),
-            }
-            if schedule is not None:
-                item["schedule"] = schedule
-            model_loras.append(item)
-        patched_model = {**mlx_model, "loras": model_loras}
-        schedule_text = ""
-        model_text = f"{effective_strength_model:g}"
-        if schedule is not None:
-            model_text = "schedule"
-            schedule_text = (
-                f", schedule={schedule['mode']}/{schedule['curve']} {schedule['start_percent']:g}-{schedule['end_percent']:g}, "
-                f"range={schedule['minimum_strength']:g}..{schedule['maximum_strength']:g}, "
-                f"strength ignored"
-            )
-        log_timing(
-            f"SDMLX: LoRA Stack erweitert: {lora_name} "
-            f"(strength={model_text}{schedule_text}, total={len(model_loras)})."
+        if effective_strength_model == 0.0:
+            return (mlx_model, mlx_clip)
+        patched_model, patched_clip, result = apply_sdxl_lora_contract(
+            mlx_model,
+            mlx_clip,
+            lora_name,
+            path,
+            strength,
+            schedule=schedule,
         )
-        return (patched_model,)
+        log_timing(
+            f"SDMLX: SDXL LoRA classified {result['kind']} "
+            f"(UNet={result['unet_modules']}, CLIP={result['clip_modules']})."
+        )
+        return (patched_model, patched_clip)
 
 
 MULTI_LORA_SLOT_COUNT = 12
@@ -8758,19 +9338,38 @@ class SDMLX_MultiLoraLoader:
             required[f"enabled_{index}"] = ("BOOLEAN", {"default": True, "socketless": True})
             required[f"lora_{index}"] = (loras, {"socketless": True})
             required[f"strength_{index}"] = ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05, "socketless": True})
-        return {"required": required}
+        return {
+            "required": required,
+            "optional": {
+                "mlx_clip": ("mlx_clip",),
+            },
+        }
 
-    RETURN_TYPES = (SDMLX_MODEL_TYPE,)
-    RETURN_NAMES = ("sdmlx_model",)
+    RETURN_TYPES = (SDMLX_MODEL_TYPE, "mlx_clip")
+    RETURN_NAMES = ("sdmlx_model", "mlx_clip")
     FUNCTION = "load_loras"
     CATEGORY = "SDMLX/LoRA"
 
     def load_loras(self, sdmlx_model, **kwargs):
-        from .flux_nodes import SDMLXFluxNativeModel, _apply_flux_lora
+        from .flux_nodes import (
+            SDMLXFluxNativeModel,
+            _apply_flux1_clip_lora,
+            _flux1_lora_has_text_encoder_targets,
+            _apply_flux_lora,
+        )
 
         mlx_model = sdmlx_model
-        if isinstance(mlx_model, SDMLXFluxNativeModel):
+        mlx_clip = kwargs.get("mlx_clip")
+        model_family = require_sdmlx_family(
+            mlx_model,
+            {"sdxl", "qwen", "flux1", "flux2-klein"},
+            "SDMLX Multi LoRA Loader",
+        )
+        if model_family == "flux1":
+            if not isinstance(mlx_model, SDMLXFluxNativeModel):
+                raise RuntimeError("SDMLX Multi LoRA Loader: invalid FLUX.1 model handle.")
             patched_model = mlx_model
+            patched_clip = mlx_clip
             added = []
             slot_count = int(kwargs.get("slot_count", 1))
             slot_count = max(1, min(MULTI_LORA_SLOT_COUNT, slot_count))
@@ -8784,19 +9383,21 @@ class SDMLX_MultiLoraLoader:
                 if strength_model == 0.0:
                     continue
                 patched_model = _apply_flux_lora(patched_model, lora_name, strength_model)
+                if isinstance(patched_clip, dict) and str(patched_clip.get("type") or "").strip().lower() == "flux1":
+                    patched_clip = _apply_flux1_clip_lora(patched_clip, lora_name, strength_model)
+                elif _flux1_lora_has_text_encoder_targets(lora_name):
+                    log_timing(
+                        "SDMLX: FLUX.1 LoRA contains text-encoder keys; connect mlx_clip to "
+                        "SDMLX Multi LoRA Loader before FLUX text encode to apply them."
+                    )
                 added.append(f"#{index} {lora_name} strength={strength_model:g}")
             if added:
                 log_timing(f"SDMLX: Multi LoRA FLUX stack extended ({len(added)} LoRAs): " + "; ".join(added))
             else:
                 log_timing("SDMLX: Multi LoRA Loader: no active LoRA selected.")
-            return (patched_model,)
+            return (patched_model, patched_clip)
 
-        try:
-            from .flux2_nodes import is_flux2_sdmlx_model
-        except Exception:
-            is_flux2_sdmlx_model = None
-
-        if is_flux2_sdmlx_model is not None and is_flux2_sdmlx_model(mlx_model):
+        if model_family == "flux2-klein":
             model_loras = list(mlx_model.get("loras", []))
             added = []
             slot_count = int(kwargs.get("slot_count", 1))
@@ -8825,14 +9426,9 @@ class SDMLX_MultiLoraLoader:
                 log_timing(f"SDMLX: Multi LoRA FLUX.2 stack extended ({len(added)} LoRAs): " + "; ".join(added))
             else:
                 log_timing("SDMLX: Multi LoRA Loader: no active LoRA selected.")
-            return (patched_model,)
+            return (patched_model, mlx_clip)
 
-        try:
-            from .qwen_nodes import is_qwen_sdmlx_model
-        except Exception:
-            is_qwen_sdmlx_model = None
-
-        if is_qwen_sdmlx_model is not None and is_qwen_sdmlx_model(mlx_model):
+        if model_family == "qwen":
             model_loras = list(mlx_model.get("loras", []))
             if str(mlx_model.get("qwen_variant") or "").strip().lower() == "qwen-image" and not mlx_model.get("qwen_lora_policy"):
                 mod_lora_scale = 1.0
@@ -8866,10 +9462,12 @@ class SDMLX_MultiLoraLoader:
                 log_timing(f"SDMLX: Multi LoRA Qwen stack extended ({len(added)} LoRAs): " + "; ".join(added))
             else:
                 log_timing("SDMLX: Multi LoRA Loader: no active LoRA selected.")
-            return (patched_model,)
+            return (patched_model, mlx_clip)
 
-        model_loras = list(mlx_model.get("loras", []))
-        added = []
+        require_sdmlx_family(mlx_model, {"sdxl"}, "SDMLX Multi LoRA Loader")
+        patched_model = mlx_model
+        patched_clip = mlx_clip
+        active = []
         slot_count = int(kwargs.get("slot_count", 1))
         slot_count = max(1, min(MULTI_LORA_SLOT_COUNT, slot_count))
 
@@ -8882,38 +9480,43 @@ class SDMLX_MultiLoraLoader:
             strength_model = float(kwargs.get(f"strength_{index}", 1.0))
             if strength_model == 0.0:
                 continue
-
             path = resolve_lora_path_or_raise(lora_name)
-            item = {
-                "name": lora_name,
-                "path": os.path.abspath(path),
-                "strength_model": strength_model,
-                "identity": lora_file_identity(path),
-            }
-            model_loras.append(item)
-            added.append(
-                {
-                    "slot": index,
-                    "name": lora_name,
-                    "strength": strength_model,
-                }
-            )
+            classification = classify_sdxl_lora(path)
+            if classification["kind"] == SDXL_LORA_INCOMPATIBLE:
+                raise ValueError(
+                    f"SDMLX: LoRA `{lora_name}` in slot {index} is incompatible with SDXL."
+                )
+            if classification["kind"] == SDXL_LORA_CLIP_ONLY and not isinstance(mlx_clip, dict):
+                raise ValueError(
+                    f"SDMLX: LoRA `{lora_name}` in slot {index} is CLIP-only. Connect mlx_clip first."
+                )
+            active.append((index, lora_name, path, strength_model))
 
-        patched_model = {**mlx_model, "loras": model_loras}
+        added = []
+        for index, lora_name, path, strength_model in active:
+            patched_model, patched_clip, result = apply_sdxl_lora_contract(
+                patched_model,
+                patched_clip,
+                lora_name,
+                path,
+                strength_model,
+            )
+            added.append({"slot": index, "name": lora_name, "strength": strength_model, "kind": result["kind"]})
+
         if added:
             details = []
             for item in added:
                 details.append(
-                    f"#{item['slot']} {item['name']} strength={item['strength']:g}"
+                    f"#{item['slot']} {item['name']} {item['kind']} strength={item['strength']:g}"
                 )
             log_timing(
                 "SDMLX: Multi LoRA stack extended "
-                f"({len(added)} LoRAs, total={len(model_loras)}): "
+                f"({len(added)} LoRAs, total={len(patched_model.get('loras', []))}): "
                 + "; ".join(details)
             )
         else:
             log_timing("SDMLX: Multi LoRA Loader: no active LoRA selected.")
-        return (patched_model,)
+        return (patched_model, patched_clip)
 
 
 class SDMLX_SpeedPatchConverter:
@@ -9611,9 +10214,9 @@ class SDMLX_CLIPTextEncode:
             cached = CONDITIONING_CACHE[conditioning_key]
             log_timing("SDMLX: CLIP conditioning loaded from RAM cache.")
             if isinstance(cached, dict):
-                return (cached,)
+                return ({**cached, "model_family": "sdxl"},)
             cond, pooled = cached
-            return ({"cond": cond, "pooled": pooled, "text": text},)
+            return ({"cond": cond, "pooled": pooled, "text": text, "model_family": "sdxl"},)
 
         def run_clip(data, is_g=False):
             if not data: return None
@@ -9632,7 +10235,7 @@ class SDMLX_CLIPTextEncode:
         cond = mx.concatenate([res_l.last_hidden_state, res_g.last_hidden_state], axis=2)
         pooled = res_g.pooled_output if hasattr(res_g, "pooled_output") else mx.zeros((1, 1280))
         mx.eval(cond, pooled)
-        conditioning = {"cond": cond, "pooled": pooled, "text": text}
+        conditioning = {"cond": cond, "pooled": pooled, "text": text, "model_family": "sdxl"}
         CONDITIONING_CACHE[conditioning_key] = conditioning
         log_timing(f"SDMLX: CLIP encode finished in {time.perf_counter() - start_time:.2f}s.")
         return (conditioning,)
@@ -9803,6 +10406,19 @@ class SDMLX_InpaintConditioning:
         noise_mask=True,
     ):
         start_time = time.perf_counter()
+        require_sdmlx_family(
+            mlx_vae,
+            {"sdxl"},
+            "SDMLX Inpaint Conditioning",
+            role="VAE",
+        )
+        for label, conditioning in (("positive", positive), ("negative", negative)):
+            family = sdmlx_conditioning_family(conditioning)
+            if family not in {"unknown", "sdxl"}:
+                raise RuntimeError(
+                    f"SDMLX Inpaint Conditioning: expected {label} conditioning family sdxl; "
+                    f"received {family}."
+                )
         if hasattr(pixels, "detach"):
             pixel_shape = tuple(pixels.shape)
             pixel_height = int(pixels.shape[1])
@@ -9812,38 +10428,6 @@ class SDMLX_InpaintConditioning:
             pixel_shape = tuple(pixels_np.shape)
             pixel_height = int(pixels_np.shape[1])
             pixel_width = int(pixels_np.shape[2])
-
-        try:
-            from .qwen_nodes import qwen_conditioning_has_entry, qwen_conditioning_with_reference_image
-        except Exception:
-            qwen_conditioning_has_entry = None
-            qwen_conditioning_with_reference_image = None
-
-        if qwen_conditioning_has_entry is not None and qwen_conditioning_has_entry(positive):
-            qwen_pixels = pixels if hasattr(pixels, "detach") else torch.from_numpy(get_numpy_array(pixels).astype(np.float32))
-            qwen_mask = mask if hasattr(mask, "detach") else torch.from_numpy(get_numpy_array(mask).astype(np.float32))
-            positive, _changed, reference_added, image_count = qwen_conditioning_with_reference_image(
-                positive,
-                qwen_pixels,
-                qwen_mask,
-            )
-            target_width, target_height = inpaint_work_size(pixel_width, pixel_height, multiple=16)
-            latent_width = max(1, int(target_width) // 8)
-            latent_height = max(1, int(target_height) // 8)
-            out = {
-                "samples": torch.zeros(
-                    (1, 16, latent_height, latent_width),
-                    dtype=torch.float32,
-                )
-            }
-            print(
-                "SDMLX: Inpaint conditioning created "
-                f"(image={pixel_shape}, qwen_reference={'added' if reference_added else 'existing'}, "
-                f"qwen_images={image_count}, target_size={target_width}x{target_height}, "
-                "mode=qwen_image_edit, mask=composite, "
-                f"{time.perf_counter() - start_time:.2f}s)."
-            )
-            return (positive, negative, out)
 
         mask_chw = mask_to_chw(mask, pixel_height, pixel_width)
         target_width, target_height = inpaint_work_size(pixel_width, pixel_height, multiple=64)
@@ -9969,6 +10553,66 @@ def detailer_guide_render_size(crop_w, crop_h, mask_bbox, guide_size, guide_size
     return max(1, render_w), max(1, render_h), float(upscale)
 
 
+def tensor_content_digest_for_cache(tensor):
+    if hasattr(tensor, "detach"):
+        arr = tensor.detach().cpu().contiguous().numpy()
+    elif isinstance(tensor, np.ndarray):
+        arr = np.ascontiguousarray(tensor)
+    else:
+        arr = np.ascontiguousarray(get_numpy_array(tensor))
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(str(tuple(arr.shape)).encode("utf-8"))
+    digest.update(str(arr.dtype).encode("utf-8"))
+    digest.update(arr.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def inpaint_detailer_prep_cache_key(
+    mlx_vae,
+    image_t,
+    mask_chw,
+    crop,
+    guide_size,
+    guide_size_for,
+    max_size,
+    resize_method,
+    soft_mask_amount,
+    max_megapixels,
+):
+    vae_cache_key = None
+    if isinstance(mlx_vae, dict):
+        vae_cache_key = mlx_vae.get("cache_key")
+    return (
+        "sdxl_inpaint_detailer_prep_v1",
+        repr(vae_cache_key),
+        tensor_content_digest_for_cache(image_t),
+        tensor_content_digest_for_cache(mask_chw),
+        round(float(crop), 6),
+        round(float(guide_size), 6),
+        bool(guide_size_for),
+        round(float(max_size), 6),
+        str(resize_method),
+        int(soft_mask_amount),
+        round(float(max_megapixels), 6),
+    )
+
+
+def get_inpaint_detailer_prep_cache(key):
+    cached = INPAINT_DETAILER_PREP_CACHE.get(key)
+    if cached is None:
+        return None
+    INPAINT_DETAILER_PREP_CACHE[key] = INPAINT_DETAILER_PREP_CACHE.pop(key)
+    log_timing("SDMLX: Inpaint Detailer prep loaded from RAM cache.")
+    return cached
+
+
+def store_inpaint_detailer_prep_cache(key, values, max_entries=3):
+    INPAINT_DETAILER_PREP_CACHE[key] = values
+    while len(INPAINT_DETAILER_PREP_CACHE) > max(1, int(max_entries)):
+        oldest = next(iter(INPAINT_DETAILER_PREP_CACHE))
+        INPAINT_DETAILER_PREP_CACHE.pop(oldest, None)
+
+
 class SDMLX_InpaintDetailer:
     @classmethod
     def INPUT_TYPES(s):
@@ -10042,6 +10686,14 @@ class SDMLX_InpaintDetailer:
     ):
         global TIMING_LOGS_ENABLED
         TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
+        require_sdmlx_runtime_pairing(
+            "SDMLX Inpaint Detailer",
+            mlx_model,
+            allowed={"sdxl"},
+            vae=mlx_vae,
+            positive=positive,
+            negative=negative,
+        )
         configure_mlx_memory_limits()
         start_time = time.perf_counter()
         fast_mode = True
@@ -10096,61 +10748,96 @@ class SDMLX_InpaintDetailer:
                 "Reduce crop/guide_size/max_size or intentionally increase max_megapixels."
             )
 
-        resize_start = time.perf_counter()
-        crop_render = resize_image_tensor(crop_image, render_w, render_h, resize_method)
-        resize_elapsed = time.perf_counter() - resize_start
-
-        mask_start = time.perf_counter()
         soft_mask_amount = int(soft_mask)
-        soft_mask_crop = render_mask
-        if soft_mask_amount > 0:
-            soft_mask_crop = sdmlx_tensor_gaussian_blur_mask(
-                soft_mask_crop[..., None],
-                soft_mask_amount,
-                10.0,
+        prep_cache_key = inpaint_detailer_prep_cache_key(
+            mlx_vae,
+            image_t,
+            mask_chw,
+            crop,
+            guide_size,
+            guide_size_for,
+            max_size,
+            resize_method,
+            soft_mask_amount,
+            max_megapixels,
+        )
+        cached_prep = get_inpaint_detailer_prep_cache(prep_cache_key)
+        if cached_prep is not None:
+            initial_latents = cached_prep["initial_latents"]
+            noise_mask = cached_prep["noise_mask"]
+            render_decode_crop = cached_prep["render_decode_crop"]
+            crop_info = dict(cached_prep["crop_info"])
+            resize_elapsed = 0.0
+            mask_elapsed = 0.0
+            pad_elapsed = 0.0
+            encode_elapsed = 0.0
+            prep_cache_status = "hit"
+        else:
+            prep_cache_status = "miss"
+            resize_start = time.perf_counter()
+            crop_render = resize_image_tensor(crop_image, render_w, render_h, resize_method)
+            resize_elapsed = time.perf_counter() - resize_start
+
+            mask_start = time.perf_counter()
+            soft_mask_crop = render_mask
+            if soft_mask_amount > 0:
+                soft_mask_crop = sdmlx_tensor_gaussian_blur_mask(
+                    soft_mask_crop[..., None],
+                    soft_mask_amount,
+                    10.0,
+                )
+                soft_mask_crop = torch.squeeze(soft_mask_crop, dim=-1)
+            soft_mask_crop = torch.clamp(soft_mask_crop, 0.0, 1.0).contiguous()
+            mask_elapsed = time.perf_counter() - mask_start
+
+            pad_start = time.perf_counter()
+            crop_up, _, render_decode_crop = pad_inpaint_pixels_and_mask(
+                crop_render,
+                target_width=work_w,
+                target_height=work_h,
+                pad_alignment=8,
             )
-            soft_mask_crop = torch.squeeze(soft_mask_crop, dim=-1)
-        soft_mask_crop = torch.clamp(soft_mask_crop, 0.0, 1.0).contiguous()
-        mask_elapsed = time.perf_counter() - mask_start
+            pad_elapsed = time.perf_counter() - pad_start
 
-        pad_start = time.perf_counter()
-        crop_up, _, render_decode_crop = pad_inpaint_pixels_and_mask(
-            crop_render,
-            target_width=work_w,
-            target_height=work_h,
-            pad_alignment=8,
-        )
-        pad_elapsed = time.perf_counter() - pad_start
+            encode_start = time.perf_counter()
+            initial_latents = encode_pixels_to_latents(mlx_vae, crop_up, "float32")
+            noise_mask = prepare_padded_latent_mask_from_crop(
+                soft_mask_crop,
+                render_w,
+                render_h,
+                render_decode_crop,
+                initial_latents.shape[1],
+                initial_latents.shape[2],
+            )
+            mx.eval(noise_mask)
+            encode_elapsed = time.perf_counter() - encode_start
 
-        encode_start = time.perf_counter()
-        initial_latents = encode_pixels_to_latents(mlx_vae, crop_up, "float32")
-        noise_mask = prepare_padded_latent_mask_from_crop(
-            soft_mask_crop,
-            render_w,
-            render_h,
-            render_decode_crop,
-            initial_latents.shape[1],
-            initial_latents.shape[2],
-        )
-        encode_elapsed = time.perf_counter() - encode_start
-
-        crop_info = {
-            "bbox": (x0, y0, x1, y1),
-            "raw_bbox": raw_crop_bbox,
-            "mask_bbox": mask_bbox,
-            "original_size": (width, height),
-            "crop_size": (crop_w, crop_h),
-            "target_size": (work_w, work_h),
-            "render_size": (render_w, render_h),
-            "preview_crop": render_decode_crop,
-            "crop": float(crop),
-            "crop_aspect": float(crop_aspect),
-            "guide_size": float(guide_size),
-            "guide_size_for": "mask_bbox" if guide_size_for else "crop_region",
-            "max_size": float(max_size),
-            "effective_scale_factor": effective_scale_factor,
-            "effective_scale_xy": (effective_scale_x, effective_scale_y),
-        }
+            crop_info = {
+                "bbox": (x0, y0, x1, y1),
+                "raw_bbox": raw_crop_bbox,
+                "mask_bbox": mask_bbox,
+                "original_size": (width, height),
+                "crop_size": (crop_w, crop_h),
+                "target_size": (work_w, work_h),
+                "render_size": (render_w, render_h),
+                "preview_crop": render_decode_crop,
+                "crop": float(crop),
+                "crop_aspect": float(crop_aspect),
+                "guide_size": float(guide_size),
+                "guide_size_for": "mask_bbox" if guide_size_for else "crop_region",
+                "max_size": float(max_size),
+                "effective_scale_factor": effective_scale_factor,
+                "effective_scale_xy": (effective_scale_x, effective_scale_y),
+            }
+            store_inpaint_detailer_prep_cache(
+                prep_cache_key,
+                {
+                    "initial_latents": initial_latents,
+                    "noise_mask": noise_mask,
+                    "render_decode_crop": render_decode_crop,
+                    "crop_info": dict(crop_info),
+                },
+            )
         sdxl_time_ids = None
         time_id_mode = "default"
 
@@ -10350,6 +11037,7 @@ class SDMLX_InpaintDetailer:
             f"soft_mask_strength={float(soft_mask_strength):g}, "
             f"composite_mask=full_crop_plus_crop_blend, crop_blend={crop_blend}, "
             f"preview={bool(preview)}, time_ids={time_id_mode}, "
+            f"prep_cache={prep_cache_status}, "
             f"mask={mask_elapsed:.2f}s, resize={resize_elapsed:.2f}s, pad={pad_elapsed:.2f}s, encode={encode_elapsed:.2f}s, "
             f"sample={sample_elapsed:.2f}s, decode={decode_elapsed:.2f}s/{decode_mode}, "
             f"composite={composite_elapsed:.2f}s, total={total_elapsed:.2f}s)."
@@ -10426,6 +11114,14 @@ class SDMLX_HiresFix:
     ):
         global TIMING_LOGS_ENABLED
         TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
+        require_sdmlx_runtime_pairing(
+            "SDMLX Hires Fix",
+            mlx_model,
+            allowed={"sdxl"},
+            vae=mlx_vae,
+            positive=positive,
+            negative=negative,
+        )
         configure_mlx_memory_limits()
         start_time = time.perf_counter()
         fast_mode = True
@@ -10649,6 +11345,14 @@ class SDMLX_TiledUpscale:
     ):
         global TIMING_LOGS_ENABLED
         TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
+        require_sdmlx_runtime_pairing(
+            "SDMLX Tiled Upscale",
+            mlx_model,
+            allowed={"sdxl"},
+            vae=mlx_vae,
+            positive=positive,
+            negative=negative,
+        )
         configure_mlx_memory_limits()
         start_time = time.perf_counter()
         fast_mode = True
@@ -10798,6 +11502,21 @@ class SDMLX_TiledUpscale:
         return (output,)
 
 
+def _validate_qwen_advanced_sampling(add_noise, start_at_step, end_at_step, steps, return_with_leftover_noise):
+    if int(start_at_step) > 0 or int(end_at_step) < int(steps):
+        raise RuntimeError(
+            "SDMLX Qwen: KSampler Advanced partial step ranges are not supported. "
+            "Use start_at_step=0 and end_at_step greater than or equal to steps."
+        )
+    if not bool(add_noise):
+        raise RuntimeError("SDMLX Qwen: KSampler Advanced requires add_noise=true.")
+    if str(return_with_leftover_noise) == "enable":
+        raise RuntimeError(
+            "SDMLX Qwen: KSampler Advanced leftover-noise output is not supported; "
+            "use return_with_leftover_noise=disable."
+        )
+
+
 class SDMLX_KSampler:
     @classmethod
     def INPUT_TYPES(s):
@@ -10857,6 +11576,14 @@ class SDMLX_KSampler:
         mlx_model = sdmlx_model
         global TIMING_LOGS_ENABLED
         TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
+        require_sdmlx_runtime_pairing(
+            "SDMLX KSampler",
+            mlx_model,
+            allowed={"sdxl", "qwen"},
+            vae=mlx_vae,
+            positive=positive,
+            negative=negative,
+        )
         fast_mode = True
         compute_dtype = "float16"
         latents = get_mlx_array(latent_image["samples"])
@@ -10885,7 +11612,7 @@ class SDMLX_KSampler:
                     "start-latent image content is not supported."
                 )
             qwen_width, qwen_height = latent_pixel_size(latent_image["samples"], fallback_width=width, fallback_height=height)
-            image = sample_qwen_image_edit(
+            image, qwen_latent = sample_qwen_image_edit(
                 mlx_model,
                 positive,
                 negative,
@@ -10897,8 +11624,9 @@ class SDMLX_KSampler:
                 scheduler,
                 effective_patch,
                 patch_strength,
+                latent_metadata=latent_image,
             )
-            return (image, latent_image)
+            return (image, qwen_latent)
         if is_qwen_speed_patch_selection(effective_patch):
             log_timing("SDMLX: acceleration-patch: off (not applicable)")
             effective_patch = SPEED_PATCH_NONE
@@ -11075,6 +11803,14 @@ class SDMLX_KSamplerAdvanced:
         mlx_model = sdmlx_model
         global TIMING_LOGS_ENABLED
         TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
+        require_sdmlx_runtime_pairing(
+            "SDMLX KSampler Advanced",
+            mlx_model,
+            allowed={"sdxl", "qwen"},
+            vae=mlx_vae,
+            positive=positive,
+            negative=negative,
+        )
         fast_mode = True
         compute_dtype = "float16"
         latents = get_mlx_array(latent_image["samples"])
@@ -11095,15 +11831,15 @@ class SDMLX_KSamplerAdvanced:
             is_qwen_sdmlx_model = None
             sample_qwen_image_edit = None
         if is_qwen_sdmlx_model is not None and is_qwen_sdmlx_model(mlx_model):
-            full_range = int(start_at_step) <= 0 and int(end_at_step) >= int(steps)
-            if not full_range or not bool(add_noise) or float(denoise) < 0.9999:
-                raise RuntimeError(
-                    "SDMLX Qwen: KSampler Advanced step ranges, disabled noise, "
-                    "and denoise below 1.0 are not supported yet. "
-                    "Use the normal SDMLX KSampler for Qwen."
-                )
+            _validate_qwen_advanced_sampling(
+                add_noise,
+                start_at_step,
+                end_at_step,
+                steps,
+                return_with_leftover_noise,
+            )
             qwen_width, qwen_height = latent_pixel_size(latent_image["samples"], fallback_width=width, fallback_height=height)
-            image = sample_qwen_image_edit(
+            image, qwen_latent = sample_qwen_image_edit(
                 mlx_model,
                 positive,
                 negative,
@@ -11115,8 +11851,9 @@ class SDMLX_KSamplerAdvanced:
                 scheduler,
                 effective_patch,
                 patch_strength,
+                latent_metadata=latent_image,
             )
-            return (image, latent_image)
+            return (image, qwen_latent)
         if is_qwen_speed_patch_selection(effective_patch):
             log_timing("SDMLX: acceleration-patch: off (not applicable)")
             effective_patch = SPEED_PATCH_NONE

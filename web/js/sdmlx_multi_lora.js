@@ -74,7 +74,7 @@ function setWidgetVisible(widget, visible) {
     widget.hidden = widget.sdmlxOriginal.hidden;
     widget.options.hidden = widget.sdmlxOriginal.optionsHidden;
   } else {
-    widget.type = `sdmlx-hidden:${widget.sdmlxOriginal.type}`;
+    widget.type = "hidden";
     widget.computeSize = () => [0, -4];
     widget.hidden = true;
     widget.options.hidden = true;

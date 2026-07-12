@@ -90,6 +90,10 @@ FLUX_SEACACHE_DEFAULT_END_FROM_TAIL_STEPS = 3
 FLUX_SEACACHE_DEFAULT_FINAL_GUARD = "last1"
 FLUX_SCHNELL_SEACACHE_STEP3_ENABLED = True
 KONTEXT_OFFSET_CACHE_FILL_STEP = 3
+FLUX1_QUANT_DENSE = "dense"
+FLUX1_QUANT_RAW_FP8 = "raw_fp8_unscaled"
+FLUX1_QUANT_SCALED_FP8 = "scaled_fp8"
+FLUX1_QUANT_GGUF = "gguf"
 FLUX_KONTEXT_BASE_RESOLUTIONS = [
     (672, 1568),
     (688, 1504),
@@ -170,6 +174,25 @@ class ModelConfig(Enum):
         self.alias = alias
         self.num_train_steps = num_train_steps
         self.max_sequence_length = max_sequence_length
+
+
+@dataclass(frozen=True)
+class Flux1CheckpointContract:
+    variant: str
+    model_family: str
+    quant_contract: str
+    fp8_mode: str
+    guidance_embed: bool
+    double_blocks: int
+    single_blocks: int
+    img_in_features: int
+    fp8_2d_weights: int = 0
+    scale_weights: int = 0
+    input_scales: int = 0
+
+    @property
+    def is_kontext(self) -> bool:
+        return self.variant == "kontext"
 
 
 class RuntimeConfig:
@@ -441,6 +464,8 @@ class SDMLXFluxNativeModel:
     acceleration_strength: float = 0.0
     model_family: str = "unknown"
     parent_transformer: FluxNativeTransformer | None = None
+    checkpoint_contract: Flux1CheckpointContract | None = None
+    source_path: Path | None = None
 
 
 def _diffusion_model_names() -> list[str]:
@@ -523,74 +548,162 @@ def _model_config_from_family(model_family: str) -> ModelConfig:
     return ModelConfig.FLUX1_SCHNELL
 
 
-def _model_family_from_name(model_name: str) -> str:
-    lower = model_name.lower()
-    if "dev" in lower:
-        return "dev"
-    if "schnell" in lower or "sch" in lower:
-        return "schnell"
-    return "unknown"
+def _flux1_block_indices(normalized_keys: set[str], prefix: str) -> set[int]:
+    indices: set[int] = set()
+    marker = f"{prefix}."
+    for key in normalized_keys:
+        if not key.startswith(marker):
+            continue
+        index_text = key[len(marker) :].split(".", 1)[0]
+        if index_text.isdigit():
+            indices.add(int(index_text))
+    return indices
 
 
-def _model_family_from_structure(path: Path) -> str:
-    try:
-        normalized_keys: list[str] = []
-        if path.suffix.lower() == ".gguf":
-            import gguf
+def _classify_flux1_checkpoint_contract(
+    *,
+    source_identity: str,
+    normalized_keys: set[str],
+    architecture: str = "",
+    is_gguf: bool = False,
+    fp8_2d_weights: int = 0,
+    scale_weights: int = 0,
+    input_scales: int = 0,
+    scaled_marker: bool = False,
+    img_in_features: int = 64,
+) -> Flux1CheckpointContract:
+    identity = f"{source_identity} {architecture}".strip().lower()
+    if any(token in identity for token in ("flux2", "flux.2", "flux-2", "klein", "qwen")):
+        raise RuntimeError("selected source is explicitly another model family")
 
-            reader = gguf.GGUFReader(str(path))
-            normalized_keys = [
-                normalized
-                for tensor in reader.tensors
-                if (normalized := native_flux_core.normalize_flux_weight_key(tensor.name)) is not None
-            ]
-        else:
-            with safe_open(str(path), framework="pt", device="cpu") as f:
-                normalized_keys = [
-                    normalized
-                    for key in f.keys()
-                    if (normalized := native_flux_core.normalize_flux_weight_key(key)) is not None
-                ]
-    except Exception as exc:
-        _flux_log(f"SDMLX FLUX Loader: model-family structure check failed for {path.name}: {exc}")
-        return "unknown"
-
-    has_guidance = any(key.startswith("guidance_in.") for key in normalized_keys)
+    double_blocks = len(_flux1_block_indices(normalized_keys, "double_blocks"))
+    single_blocks = len(_flux1_block_indices(normalized_keys, "single_blocks"))
+    has_img_in = "img_in.weight" in normalized_keys
     has_txt_in = "txt_in.weight" in normalized_keys
     has_final = any(key.startswith("final_layer.") for key in normalized_keys)
-    if has_guidance:
-        return "dev"
-    if has_txt_in and has_final:
-        return "schnell"
-    return "unknown"
-
-
-def _model_family_from_path(path: Path, model_name: str) -> str:
-    name_family = _model_family_from_name(model_name)
-    structure_family = _model_family_from_structure(path)
-    if structure_family == "unknown":
-        return name_family
-    if name_family not in {"unknown", structure_family}:
-        _flux_log(
-            "SDMLX FLUX Loader: "
-            f"model-family name/structure mismatch for {model_name}: "
-            f"name={name_family}, structure={structure_family}; using structure."
+    has_guidance = any(key.startswith("guidance_in.") for key in normalized_keys)
+    if not has_img_in or not has_txt_in or not has_final or (double_blocks, single_blocks) != (19, 38):
+        raise RuntimeError(
+            "checkpoint does not match the FLUX.1 19-double/38-single transformer contract"
         )
-    return structure_family
+    if int(img_in_features) != 64:
+        raise RuntimeError(
+            "checkpoint uses a nonstandard FLUX.1 img_in contract; Fill/Control full models are not supported"
+        )
+
+    model_family = "dev" if has_guidance else "schnell"
+    if model_family == "schnell":
+        variant = "schnell"
+    elif "kontext" in identity:
+        variant = "kontext"
+    else:
+        variant = "dev"
+
+    if is_gguf:
+        quant_contract = FLUX1_QUANT_GGUF
+        fp8_mode = "dequant"
+    elif fp8_2d_weights > 0 and (scaled_marker or scale_weights > 0):
+        quant_contract = FLUX1_QUANT_SCALED_FP8
+        fp8_mode = "dequant"
+    elif fp8_2d_weights > 0:
+        quant_contract = FLUX1_QUANT_RAW_FP8
+        fp8_mode = "native"
+    else:
+        quant_contract = FLUX1_QUANT_DENSE
+        fp8_mode = "dequant"
+
+    return Flux1CheckpointContract(
+        variant=variant,
+        model_family=model_family,
+        quant_contract=quant_contract,
+        fp8_mode=fp8_mode,
+        guidance_embed=has_guidance,
+        double_blocks=double_blocks,
+        single_blocks=single_blocks,
+        img_in_features=int(img_in_features),
+        fp8_2d_weights=int(fp8_2d_weights),
+        scale_weights=int(scale_weights),
+        input_scales=int(input_scales),
+    )
+
+
+def inspect_flux1_checkpoint_contract(
+    path: str | os.PathLike[str],
+    *,
+    source_name: str | None = None,
+) -> Flux1CheckpointContract:
+    candidate = Path(path)
+    if not candidate.is_file():
+        raise RuntimeError(f"FLUX.1 checkpoint does not exist: {candidate}")
+
+    normalized_keys: set[str] = set()
+    architecture = ""
+    fp8_2d_weights = 0
+    scale_weights = 0
+    input_scales = 0
+    scaled_marker = False
+    img_in_features = 64
+    is_gguf = candidate.suffix.lower() == ".gguf"
+
+    if is_gguf:
+        import gguf
+
+        reader = gguf.GGUFReader(str(candidate))
+        for tensor in reader.tensors:
+            normalized = native_flux_core.normalize_flux_weight_key(tensor.name)
+            if normalized is not None:
+                normalized_keys.add(normalized)
+    else:
+        try:
+            with safe_open(str(candidate), framework="pt", device="cpu") as handle:
+                metadata = handle.metadata() or {}
+                architecture = str(metadata.get("modelspec.architecture", ""))
+                for key in handle.keys():
+                    normalized = native_flux_core.normalize_flux_weight_key(key)
+                    if normalized is None:
+                        continue
+                    normalized_keys.add(normalized)
+                    tensor_slice = handle.get_slice(key)
+                    if normalized == "img_in.weight" and len(tensor_slice.get_shape()) == 2:
+                        img_in_features = int(tensor_slice.get_shape()[1])
+                    if native_flux_core._is_scaled_fp8_marker(normalized):
+                        scaled_marker = True
+                        continue
+                    if native_flux_core._scale_weight_layer(normalized) is not None:
+                        scale_weights += 1
+                        continue
+                    if native_flux_core._scale_input_layer(normalized) is not None:
+                        input_scales += 1
+                        continue
+                    if (
+                        tensor_slice.get_dtype().startswith("F8_")
+                        and normalized.endswith(".weight")
+                        and len(tensor_slice.get_shape()) == 2
+                    ):
+                        fp8_2d_weights += 1
+        except Exception as exc:
+            raise RuntimeError(f"could not inspect FLUX.1 checkpoint header: {candidate.name}") from exc
+
+    source_identity = f"{source_name or candidate.name} {candidate.name}"
+    return _classify_flux1_checkpoint_contract(
+        source_identity=source_identity,
+        normalized_keys=normalized_keys,
+        architecture=architecture,
+        is_gguf=is_gguf,
+        fp8_2d_weights=fp8_2d_weights,
+        scale_weights=scale_weights,
+        input_scales=input_scales,
+        scaled_marker=scaled_marker,
+        img_in_features=img_in_features,
+    )
 
 
 def is_flux1_checkpoint_file(path: str | os.PathLike[str]) -> bool:
-    candidate = Path(path)
-    if not candidate.is_file():
-        return False
-    lowered = f"{candidate.name} {candidate}".lower()
-    if "flux2" in lowered or "flux.2" in lowered or "klein" in lowered or "qwen" in lowered:
-        return False
-    structure_family = _model_family_from_structure(candidate)
-    if structure_family in {"dev", "schnell"}:
+    try:
+        inspect_flux1_checkpoint_contract(path)
         return True
-    has_flux1_signal = any(token in lowered for token in ("flux1", "flux.1", "flux-1", "schnell"))
-    return has_flux1_signal and _model_family_from_name(candidate.name) in {"dev", "schnell"}
+    except Exception:
+        return False
 
 
 def _vae_names() -> list[str]:
@@ -883,13 +996,6 @@ def _sdmlx_acceleration_cache_dir_for_patch(patch_path: Path) -> Path:
     return _sdmlx_acceleration_cache_dir()
 
 
-def _fp8_cache_path(source: Path) -> Path:
-    stat = source.stat()
-    cache_key = f"{source.name}:{stat.st_size}:{int(stat.st_mtime)}"
-    digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()[:12]
-    return NATIVE_ROOT / "model_cache" / f"{source.stem}-sdmlx-fp16-{digest}.safetensors"
-
-
 def _safe_cache_stem(value: str) -> str:
     keep = []
     for char in Path(value).stem:
@@ -984,27 +1090,6 @@ def _ensure_flux_acceleration_cache(source: Path, lora_name: str, strength: floa
     return cache_path
 
 
-def _ensure_fp8_transformer_cache(source: Path) -> Path:
-    if not native_flux_core._has_fp8_weights(source):
-        return source
-
-    cache_path = _fp8_cache_path(source)
-    if cache_path.exists() and cache_path.stat().st_size > 0:
-        _flux_log(f"SDMLX FLUX Cache: using cached fp16 transformer for FP8 model: {cache_path.name}")
-        return cache_path
-
-    _flux_log(
-        "SDMLX FLUX Cache: FP8 model detected; "
-        f"building fp16 transformer cache for {source.name}"
-    )
-    script = NATIVE_ROOT / "convert_flux_fp8_to_fp16_cache.py"
-    cmd = [sys.executable, str(script), str(source), str(cache_path)]
-    if not FLUX_VERBOSE_LOGS:
-        cmd.append("--quiet")
-    subprocess.run(cmd, check=True)
-    return cache_path
-
-
 def _load_prepared_flux_transformer(
     path: Path,
     *,
@@ -1036,17 +1121,47 @@ def _transformer_has_model_weights(transformer: FluxNativeTransformer) -> bool:
     )
 
 
+def _flux1_model_source_path(model: SDMLXFluxNativeModel) -> Path:
+    source_path = getattr(model, "source_path", None)
+    if source_path is not None:
+        return Path(source_path)
+    return _full_diffusion_model_path(model.name)
+
+
+def _flux1_model_contract(model: SDMLXFluxNativeModel) -> Flux1CheckpointContract:
+    contract = getattr(model, "checkpoint_contract", None)
+    if contract is None:
+        source_path = _flux1_model_source_path(model)
+        contract = inspect_flux1_checkpoint_contract(source_path, source_name=model.name)
+        model.checkpoint_contract = contract
+        model.source_path = source_path
+    return contract
+
+
+def _flux1_load_options(
+    contract: Flux1CheckpointContract,
+    load_path: Path,
+    *,
+    source_path: Path | None = None,
+) -> tuple[str, str]:
+    is_base_path = source_path is None or load_path.resolve() == source_path.resolve()
+    fp8_mode = contract.fp8_mode if is_base_path else "dequant"
+    drop_raw = "all" if load_path.suffix.lower() == ".gguf" else "off"
+    return fp8_mode, drop_raw
+
+
 def _ensure_flux_model_weights_loaded(model: SDMLXFluxNativeModel) -> None:
     if _transformer_has_model_weights(model.transformer):
         return
     load_path = Path(model.path)
-    is_gguf = load_path.suffix.lower() == ".gguf"
-    use_native_fp8 = False if is_gguf else native_flux_core._has_fp8_weights(load_path)
+    source_path = _flux1_model_source_path(model)
+    contract = _flux1_model_contract(model)
+    fp8_mode, drop_raw = _flux1_load_options(contract, load_path, source_path=source_path)
     transformer, casted, pretransposed, _load_s = _load_prepared_flux_transformer(
         load_path,
         precision=model.precision,
-        fp8_mode="native" if use_native_fp8 else "dequant",
-        drop_raw="all" if is_gguf else "off",
+        fp8_mode=fp8_mode,
+        drop_raw=drop_raw,
     )
     model.transformer = transformer
     model.casted_weights = casted
@@ -1109,7 +1224,6 @@ def _reset_transformer_runtime_state(transformer: FluxNativeTransformer) -> None
     transformer.forecast_single_linear2_history = {}
     transformer.forecast_single_linear2_norm_history = {}
     transformer.forecast_single_linear2_gate_history = {}
-    transformer.forecast_single_linear2_scout_metrics = []
     transformer.forecast_single_weather_latest = {}
     transformer.forecast_single_weather_metrics = []
     transformer.forecast_single_linear2_late_split = "all"
@@ -1124,12 +1238,7 @@ def _reset_transformer_runtime_state(transformer: FluxNativeTransformer) -> None
     transformer.forecast_double_img_mlp_hits = []
     transformer.forecast_double_txt_history = {}
     transformer.forecast_double_txt_hits = []
-    transformer.token_scout_enabled = False
-    transformer.token_scout_txt_len = 0
-    transformer.token_scout_previous = {}
-    transformer.token_scout_metrics = []
-    transformer.attention_scout_enabled = False
-    transformer.attention_scout_metrics = []
+    transformer.current_text_token_count = 0
     transformer.teacache_mode = "off"
     transformer.teacache_threshold = 0.08
     transformer.teacache_threshold_end = None
@@ -1438,6 +1547,17 @@ def _reference_latents_from_conditioning(conditioning: Any) -> tuple[list[Any], 
     if method is not None:
         method = str(method)
     return ref_latents, method
+
+
+def _validate_flux1_reference_contract(
+    checkpoint_contract: Flux1CheckpointContract,
+    reference_latents: list[Any],
+) -> bool:
+    if reference_latents and not checkpoint_contract.is_kontext:
+        raise RuntimeError("SDMLX FLUX Kontext image input requires a FLUX.1-Kontext model checkpoint.")
+    if len(reference_latents) > 1:
+        raise RuntimeError("SDMLX FLUX Kontext prototype currently supports one reference latent.")
+    return bool(reference_latents)
 
 
 def _latent_to_comfy(
@@ -2106,6 +2226,8 @@ def _clone_flux_model_for_patch(model: SDMLXFluxNativeModel) -> SDMLXFluxNativeM
         model.acceleration_strength,
         model.model_family,
         model.transformer,
+        model.checkpoint_contract,
+        model.source_path,
     )
 
 
@@ -2297,6 +2419,132 @@ def _apply_flux_lora(model: SDMLXFluxNativeModel, lora_name: str, strength: floa
     )
 
 
+def _flux1_lora_text_key_candidate(key: str) -> bool:
+    key = str(key)
+    return (
+        key.startswith("lora_te")
+        or key.startswith("text_encoder")
+        or key.startswith("text_encoders.")
+        or key.startswith("clip_l.")
+        or key.startswith("t5xxl.")
+        or ".text_encoder." in key
+        or ".text_encoders." in key
+    )
+
+
+def _flux1_lora_has_text_encoder_targets(lora_name: str) -> bool:
+    lora_path = _full_lora_path(lora_name)
+    if lora_path.suffix.lower() in {".safetensors", ".sft"}:
+        try:
+            with safe_open(str(lora_path), framework="np", device="cpu") as handle:
+                return any(_flux1_lora_text_key_candidate(key) for key in handle.keys())
+        except Exception:
+            return False
+    try:
+        state = comfy.utils.load_torch_file(str(lora_path), safe_load=True)
+    except Exception:
+        return False
+    try:
+        return any(_flux1_lora_text_key_candidate(key) for key in state.keys())
+    finally:
+        del state
+        _cleanup_after_lora_load()
+
+
+def _flux1_lora_identity_tuple(lora_path: Path) -> tuple[str, int | None, int | None]:
+    try:
+        stat = lora_path.stat()
+        return (str(lora_path), int(stat.st_size), int(stat.st_mtime_ns))
+    except OSError:
+        return (str(lora_path), None, None)
+
+
+def _apply_flux1_clip_lora(
+    mlx_clip: dict[str, Any] | None,
+    lora_name: str,
+    strength: float,
+) -> dict[str, Any] | None:
+    if not isinstance(mlx_clip, dict) or str(mlx_clip.get("type") or "").lower() != "flux1":
+        return mlx_clip
+    if float(strength) == 0.0:
+        return mlx_clip
+
+    lora_path = _full_lora_path(lora_name)
+    if not _flux1_lora_has_text_encoder_targets(lora_name):
+        return mlx_clip
+
+    clip = mlx_clip.get("clip")
+    if clip is None or not hasattr(clip, "cond_stage_model"):
+        _flux_log(f"SDMLX LoRA Loader: FLUX.1 CLIP LoRA skipped for {lora_name} (missing clip runtime).")
+        return mlx_clip
+
+    import comfy.lora  # noqa: WPS433
+    import comfy.lora_convert  # noqa: WPS433
+
+    key_map = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, {})
+    if not key_map:
+        _flux_log(f"SDMLX LoRA Loader: FLUX.1 CLIP LoRA skipped for {lora_name} (empty clip key map).")
+        return mlx_clip
+
+    state = comfy.utils.load_torch_file(str(lora_path), safe_load=True)
+    try:
+        converted = comfy.lora_convert.convert_lora(state)
+        loaded = comfy.lora.load_lora(converted, key_map, log_missing=False)
+        if not loaded:
+            _flux_log(
+                f"SDMLX LoRA Loader: FLUX.1 LoRA {lora_name} contains text-encoder keys, "
+                "but none match the connected FLUX CLIP/T5 pair."
+            )
+            return mlx_clip
+
+        new_clip = clip.clone()
+        applied = new_clip.add_patches(loaded, float(strength))
+        if not applied:
+            _flux_log(
+                f"SDMLX LoRA Loader: FLUX.1 CLIP LoRA skipped for {lora_name} "
+                "(Comfy clip patcher applied 0 modules)."
+            )
+            return mlx_clip
+
+        identity = _flux1_lora_identity_tuple(lora_path)
+        patched_clip = dict(mlx_clip)
+        patched_clip["clip"] = new_clip
+        clip_loras = list(patched_clip.get("clip_loras") or [])
+        clip_loras.append(
+            {
+                "name": str(lora_name),
+                "path": identity[0],
+                "size": identity[1],
+                "mtime_ns": identity[2],
+                "strength": float(strength),
+                "applied": len(applied),
+            }
+        )
+        patched_clip["clip_loras"] = clip_loras
+        patched_clip["cache_key"] = (
+            mlx_clip.get("cache_key"),
+            "flux1_clip_loras",
+            tuple(
+                (
+                    item.get("name"),
+                    item.get("path"),
+                    item.get("size"),
+                    item.get("mtime_ns"),
+                    round(float(item.get("strength") or 0.0), 6),
+                )
+                for item in clip_loras
+            ),
+        )
+        _flux_log(
+            f"SDMLX LoRA Loader: FLUX.1 CLIP LoRA applied "
+            f"({len(applied)} text modules, strength={float(strength):g})."
+        )
+        return patched_clip
+    finally:
+        del state
+        _cleanup_after_lora_load()
+
+
 def _apply_flux_acceleration_patch_runtime(
     model: SDMLXFluxNativeModel,
     selection: str,
@@ -2427,33 +2675,29 @@ class SDMLXFluxNativeLoader:
 def flux1_model_from_checkpoint(path: str | os.PathLike[str], name: str | None = None) -> SDMLXFluxNativeModel:
     path = Path(path)
     model_name = str(name or path.name)
-    if not is_flux1_checkpoint_file(path):
-        raise RuntimeError(f"SDMLX FLUX.1: unsupported diffusion model checkpoint: {model_name}")
+    try:
+        checkpoint_contract = inspect_flux1_checkpoint_contract(path, source_name=model_name)
+    except Exception as exc:
+        raise RuntimeError(f"SDMLX FLUX.1: unsupported diffusion model checkpoint: {model_name}") from exc
     Config.precision = mx.float16
     _configure_native_core()
-    model_family = _model_family_from_path(path, model_name)
+    model_family = checkpoint_contract.model_family
     model_config = _model_config_from_family(model_family)
-    is_gguf = path.suffix.lower() == ".gguf"
-    use_native_fp8 = False if is_gguf else native_flux_core._has_fp8_weights(path)
-    use_scaled_fp8 = bool(use_native_fp8 and native_flux_core._has_scaled_fp8_weights(path))
-    load_path = path if (is_gguf or use_native_fp8) else _ensure_fp8_transformer_cache(path)
-    # Scaled-FP8 is a Comfy quant contract, not the raw native-FP8 contract.
-    # On MPS Comfy disables native FP8 compute and materializes dense weights;
-    # doing the same here keeps FLUX.1 Kontext correctness ahead of speed.
-    effective_fp8_mode = "dequant" if use_scaled_fp8 else ("native" if use_native_fp8 else "dequant")
+    load_path = path
+    fp8_mode, drop_raw = _flux1_load_options(checkpoint_contract, load_path, source_path=path)
     transformer, casted, pretransposed, load_s = _load_prepared_flux_transformer(
         load_path,
         precision=Config.precision,
-        fp8_mode=effective_fp8_mode,
-        drop_raw="all" if is_gguf else "off",
+        fp8_mode=fp8_mode,
+        drop_raw=drop_raw,
     )
-    if is_gguf:
+    if checkpoint_contract.quant_contract == FLUX1_QUANT_GGUF:
         mx.clear_cache()
         gc.collect()
     _flux_log(
         "SDMLX FLUX Loader: "
         f"model={model_name}, family={model_family}, config={model_config.alias}, source={load_path.name}, "
-        f"mode={transformer.load_mode}, fp8={'scaled_dequant' if use_scaled_fp8 else ('native' if use_native_fp8 else 'dequant')}, "
+        f"mode={transformer.load_mode}, quant={checkpoint_contract.quant_contract}, "
         f"precision=fp16, casted={casted}, "
         f"pretransposed={pretransposed}, fp8_weights={len(transformer.fp8_weight_keys)}, "
         f"load={load_s:.2f}s"
@@ -2470,6 +2714,9 @@ def flux1_model_from_checkpoint(path: str | os.PathLike[str], name: str | None =
         None,
         0.0,
         model_family,
+        None,
+        checkpoint_contract,
+        path,
     )
 
 
@@ -2819,19 +3066,19 @@ class SDMLXFluxNativeSampler:
         _ensure_flux_model_weights_loaded(sdmlx_flux_model)
 
         model_config = sdmlx_flux_model.model_config
-        model_family = sdmlx_flux_model.model_family or _model_family_from_name(sdmlx_flux_model.name)
+        checkpoint_contract = _flux1_model_contract(sdmlx_flux_model)
+        model_family = checkpoint_contract.model_family
         acceleration_patch = str(acceleration_patch or FLUX_ACCEL_NONE)
         patch_strength = float(patch_strength)
         seacache_advanced_active = isinstance(seacache_advanced, dict)
         seacache_acceleration = bool(seacache_acceleration) or seacache_advanced_active
-        base_path = _full_diffusion_model_path(sdmlx_flux_model.name)
+        base_path = _flux1_model_source_path(sdmlx_flux_model)
         base_is_gguf = base_path.suffix.lower() == ".gguf"
         conditioning_reference_latents, _conditioning_reference_method = _reference_latents_from_conditioning(positive)
-        kontext_active = bool(conditioning_reference_latents)
-        if kontext_active and "kontext" not in sdmlx_flux_model.name.lower():
-            raise RuntimeError("SDMLX FLUX Kontext image input requires a FLUX.1-Kontext model checkpoint.")
-        if conditioning_reference_latents and len(conditioning_reference_latents) > 1:
-            raise RuntimeError("SDMLX FLUX Kontext prototype currently supports one reference latent.")
+        kontext_active = _validate_flux1_reference_contract(
+            checkpoint_contract,
+            conditioning_reference_latents,
+        )
         reference_latents_method = "offset"
         if kontext_active and acceleration_patch != FLUX_ACCEL_NONE and patch_strength != 0.0:
             _flux_notice("SDMLX FLUX acceleration-patch: off (Kontext image conditioning active)")
@@ -2861,10 +3108,15 @@ class SDMLXFluxNativeSampler:
             else:
                 load_path = _ensure_flux_acceleration_cache(base_path, acceleration_patch, patch_strength, debug=bool(debug))
                 if Path(sdmlx_flux_model.path).resolve() != load_path.resolve():
+                    patch_fp8_mode, _ = _flux1_load_options(
+                        checkpoint_contract,
+                        load_path,
+                        source_path=base_path,
+                    )
                     load_s = _replace_flux_model_transformer(
                         sdmlx_flux_model,
                         load_path,
-                        fp8_mode="dequant",
+                        fp8_mode=patch_fp8_mode,
                         acceleration_patch=acceleration_patch,
                         acceleration_strength=patch_strength,
                     )
@@ -2875,13 +3127,17 @@ class SDMLXFluxNativeSampler:
                             f"cache={load_path.name}, load={load_s:.2f}s"
                         )
         else:
-            restore_native_fp8 = native_flux_core._has_fp8_weights(base_path)
-            load_path = base_path if restore_native_fp8 else _ensure_fp8_transformer_cache(base_path)
+            load_path = base_path
             if sdmlx_flux_model.acceleration_patch and Path(sdmlx_flux_model.path).resolve() != load_path.resolve():
+                restore_fp8_mode, _ = _flux1_load_options(
+                    checkpoint_contract,
+                    load_path,
+                    source_path=base_path,
+                )
                 load_s = _replace_flux_model_transformer(
                     sdmlx_flux_model,
                     load_path,
-                    fp8_mode="native" if restore_native_fp8 else "dequant",
+                    fp8_mode=restore_fp8_mode,
                     acceleration_patch=None,
                     acceleration_strength=0.0,
                 )
@@ -3306,6 +3562,26 @@ class SDMLXFluxNativeSampler:
         return (out_latent,)
 
 
+def _flux_output_is_connected(prompt, unique_id, output_index):
+    if prompt is None or unique_id is None:
+        return True
+    source_id = str(unique_id)
+    try:
+        for node in prompt.values():
+            inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+            for value in inputs.values():
+                if (
+                    isinstance(value, (list, tuple))
+                    and len(value) >= 2
+                    and str(value[0]) == source_id
+                    and int(value[1]) == int(output_index)
+                ):
+                    return True
+    except Exception:
+        return True
+    return False
+
+
 class SDMLXFluxLUAAdapter:
     @classmethod
     def INPUT_TYPES(cls):
@@ -3328,6 +3604,10 @@ class SDMLXFluxLUAAdapter:
                     },
                 ),
             },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "prompt": "PROMPT",
+            },
         }
 
     RETURN_TYPES = ("IMAGE", "LATENT")
@@ -3335,7 +3615,18 @@ class SDMLXFluxLUAAdapter:
     FUNCTION = "upscale"
     CATEGORY = "SDMLX/Upscale"
 
-    def upscale(self, samples, mlx_vae, scale, device, dtype, enabled=True, weights_path=""):
+    def upscale(
+        self,
+        samples,
+        mlx_vae,
+        scale,
+        device,
+        dtype,
+        enabled=True,
+        weights_path="",
+        unique_id=None,
+        prompt=None,
+    ):
         if not isinstance(samples, dict) or "samples" not in samples:
             raise RuntimeError("SDMLX FLUX LUA Adapter expects a Comfy FLUX LATENT input.")
         head = "x4" if scale == "4x" else "x2"
@@ -3367,16 +3658,18 @@ class SDMLXFluxLUAAdapter:
             out_latent = dict(samples)
             out_latent.pop("sdmlx_lua_scale", None)
 
-        model_family = str(samples.get("sdmlx_flux_model_family", "unknown")).lower()
-        _apply_vae_cache_limit("pre_decode", model_family)
-        vae, _vae_name = _resolve_flux_vae(mlx_vae, "SDMLX FLUX LUA Adapter")
-        latents = _comfy_flux_latent_to_mx(out_latent, _dtype_from_name(VAE_DTYPE))
-        decoded = vae.decode(latents)
-        mx.eval(decoded)
-        image = _mlx_decoded_to_comfy_image(decoded)
-        del decoded, latents
-        _apply_vae_cache_limit("post_decode", model_family)
-        mx.eval(mx.zeros((1,), dtype=mx.float16))
+        image = None
+        if _flux_output_is_connected(prompt, unique_id, 0):
+            model_family = str(samples.get("sdmlx_flux_model_family", "unknown")).lower()
+            _apply_vae_cache_limit("pre_decode", model_family)
+            vae, _vae_name = _resolve_flux_vae(mlx_vae, "SDMLX FLUX LUA Adapter")
+            latents = _comfy_flux_latent_to_mx(out_latent, _dtype_from_name(VAE_DTYPE))
+            decoded = vae.decode(latents)
+            mx.eval(decoded)
+            image = _mlx_decoded_to_comfy_image(decoded)
+            del decoded, latents
+            _apply_vae_cache_limit("post_decode", model_family)
+            mx.eval(mx.zeros((1,), dtype=mx.float16))
 
         if enabled:
             print(f"SDMLX FLUX LUA Adapter: {head}")

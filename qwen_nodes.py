@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import hashlib
 import inspect
@@ -125,6 +126,19 @@ QWEN_AURAFLOW_DEFAULT_SHIFT = 3.1
 QWEN_ROOT_REQUIRED_DIRS = ("transformer", "text_encoder", "vae", "tokenizer")
 QWEN_FP16_QUANT_PARAMS_DEFAULT_REGEX = r"transformer\.transformer_blocks\.[0-9]+\.(attn|img_ff|txt_ff)\."
 QWEN_FP16_QUANT_PARAMS_QWEN_IMAGE_REGEX = r"transformer\.transformer_blocks\.[0-9]+\.(img_ff|txt_ff)\."
+QWEN_VARIANT_VERSIONS = {
+    "qwen-image-edit": "2511",
+    "qwen-image": "2512",
+}
+
+
+def _clear_qwen_reference_vae_cache() -> None:
+    try:
+        from sdmlx_qwen_native.models.qwen.variants.edit.qwen_edit_util import QwenEditUtil
+
+        QwenEditUtil.clear_image_conditioning_cache()
+    except Exception:
+        pass
 
 
 def _env_flag(name: str) -> bool:
@@ -249,12 +263,194 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
         handle.write("\n")
 
 
+def _normalize_qwen_variant(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower().replace("_", "-")
+    aliases = {
+        "qwen-image-edit": "qwen-image-edit",
+        "qwen-image-edit-2511": "qwen-image-edit",
+        "qwen-image": "qwen-image",
+        "qwen-image-2512": "qwen-image",
+    }
+    return aliases.get(normalized)
+
+
+def _normalize_qwen_version(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"2511", "qwen-image-edit-2511"}:
+        return "2511"
+    if normalized in {"2512", "qwen-image-2512"}:
+        return "2512"
+    return None
+
+
+def _qwen_identity_from_text(values: list[Any] | tuple[Any, ...]) -> tuple[str, str] | None:
+    text = " ".join(str(value or "") for value in values).lower().replace("_", "-")
+    has_2511 = "2511" in text or "qwen-image-edit" in text
+    has_2512 = "2512" in text
+    if has_2511 and has_2512:
+        raise RuntimeError(
+            "SDMLX Qwen: contradictory source identity contains both Qwen Image Edit 2511 and Qwen Image 2512 markers."
+        )
+    if has_2511:
+        return "qwen-image-edit", "2511"
+    if has_2512:
+        return "qwen-image", "2512"
+    return None
+
+
+def resolve_qwen_model_identity(
+    *,
+    manifest: dict[str, Any] | None = None,
+    transformer_keys: set[str] | list[str] | tuple[str, ...] | None = None,
+    source_identifiers: list[Any] | tuple[Any, ...] = (),
+    root_hint: str | os.PathLike[str] | None = None,
+) -> tuple[str, str]:
+    """Resolve 2511/Edit versus 2512/Image without cache-name guessing."""
+    manifest = manifest if isinstance(manifest, dict) else {}
+    raw_variant = manifest.get("qwen_variant")
+    raw_version = manifest.get("model_version")
+    manifest_variant = _normalize_qwen_variant(raw_variant)
+    manifest_version = _normalize_qwen_version(raw_version)
+    if raw_variant not in (None, "") and manifest_variant is None:
+        raise RuntimeError(f"SDMLX Qwen: unsupported qwen_variant in manifest: {raw_variant!r}.")
+    if raw_version not in (None, "") and manifest_version is None:
+        raise RuntimeError(f"SDMLX Qwen: unsupported model_version in manifest: {raw_version!r}.")
+    if manifest_variant and manifest_version:
+        expected_version = QWEN_VARIANT_VERSIONS[manifest_variant]
+        if manifest_version != expected_version:
+            raise RuntimeError(
+                "SDMLX Qwen: contradictory manifest identity: "
+                f"qwen_variant={manifest_variant!r} requires model_version={expected_version}, "
+                f"not {manifest_version}."
+            )
+    elif manifest_variant:
+        manifest_version = QWEN_VARIANT_VERSIONS[manifest_variant]
+    elif manifest_version:
+        manifest_variant = "qwen-image-edit" if manifest_version == "2511" else "qwen-image"
+
+    marker_identity = None
+    if transformer_keys and any(str(key).split(".")[-1] == "__index_timestep_zero__" for key in transformer_keys):
+        marker_identity = ("qwen-image-edit", "2511")
+    source_identity = _qwen_identity_from_text(tuple(source_identifiers))
+
+    manifest_identity = (
+        (manifest_variant, manifest_version)
+        if manifest_variant is not None and manifest_version is not None
+        else None
+    )
+    if manifest_identity is not None:
+        if marker_identity is not None and manifest_identity != marker_identity:
+            raise RuntimeError(
+                "SDMLX Qwen: manifest identifies Qwen Image 2512, but the transformer contains the 2511 Edit marker."
+            )
+        if source_identity is not None and manifest_identity != source_identity:
+            raise RuntimeError(
+                "SDMLX Qwen: manifest identity conflicts with the original checkpoint/repository identity."
+            )
+        return manifest_identity
+
+    if marker_identity is not None:
+        if source_identity is not None and source_identity != marker_identity:
+            raise RuntimeError(
+                "SDMLX Qwen: transformer structure identifies 2511 Edit, but the original source identifies 2512."
+            )
+        return marker_identity
+    if source_identity is not None:
+        return source_identity
+
+    weak_identity = _qwen_identity_from_text((root_hint,)) if root_hint is not None else None
+    if weak_identity is not None:
+        return weak_identity
+    raise RuntimeError(
+        "SDMLX Qwen: model identity is ambiguous. The package needs qwen_variant/model_version, "
+        "or the original checkpoint/repository identity must contain 2511/edit or 2512."
+    )
+
+
+def _qwen_transformer_identity_keys(root: Path) -> set[str]:
+    transformer_dir = root / "transformer"
+    identity_keys: set[str] = set()
+    for index_path in sorted(transformer_dir.glob("*.index.json")):
+        try:
+            weight_map = _read_json(index_path).get("weight_map") or {}
+            identity_keys.update(
+                key for key in weight_map if str(key).split(".")[-1] == "__index_timestep_zero__"
+            )
+        except Exception:
+            continue
+    if identity_keys:
+        return identity_keys
+    try:
+        from safetensors import safe_open
+
+        for tensor_path in sorted(transformer_dir.glob("*.safetensors")):
+            if tensor_path.name.startswith("._"):
+                continue
+            with safe_open(str(tensor_path), framework="np") as handle:
+                for key in handle.keys():
+                    if str(key).split(".")[-1] == "__index_timestep_zero__":
+                        identity_keys.add(str(key))
+    except Exception:
+        pass
+    return identity_keys
+
+
+def _qwen_root_source_identifiers(root: Path, name: str | None = None) -> list[str]:
+    identifiers = [str(name or "")]
+    for marker_name in (
+        "sdmlx_qwen_aio_root.json",
+        "sdmlx_qwen_split_root.json",
+        "sdmlx_qwen_prepared_cache.json",
+    ):
+        marker_path = root / marker_name
+        if not marker_path.is_file():
+            continue
+        try:
+            marker = _read_json(marker_path)
+        except Exception:
+            continue
+        identifiers.extend(
+            str(marker.get(key) or "")
+            for key in ("source_checkpoint", "source_root", "source_repo")
+        )
+    return identifiers
+
+
+def _qwen_identity_root_hint(root: Path) -> str | None:
+    if any(part.lower() in {"runtime-roots", "qwen-runtime-roots"} for part in root.parts):
+        return None
+    return str(root)
+
+
+def _backfill_qwen_manifest_identity(
+    package_path: Path,
+    manifest: dict[str, Any],
+    qwen_variant: str,
+    model_version: str,
+) -> dict[str, Any]:
+    if manifest.get("qwen_variant") and manifest.get("model_version"):
+        return manifest
+    updated = dict(manifest)
+    updated.setdefault("qwen_variant", qwen_variant)
+    updated.setdefault("model_version", model_version)
+    manifest_path = package_path / "manifest.json"
+    if manifest_path.is_file():
+        _write_json(manifest_path, updated)
+    return updated
+
+
 def is_qwen_manifest(manifest: dict[str, Any] | None) -> bool:
     if not isinstance(manifest, dict):
         return False
     family = str(manifest.get("model_family") or manifest.get("base_model_family") or "").strip().lower()
     package_format = str(manifest.get("package_format") or manifest.get("format") or "").strip().lower()
-    return family in {"qwen", QWEN_MODEL_FAMILY, "qwen-image-edit-2511"} or package_format == QWEN_PACKAGE_FORMAT
+    return family in {
+        "qwen",
+        QWEN_MODEL_FAMILY,
+        "qwen-image-edit-2511",
+        "qwen-image",
+        "qwen-image-2512",
+    } or package_format == QWEN_PACKAGE_FORMAT
 
 
 def is_qwen_sdmlx_model(model: Any) -> bool:
@@ -286,12 +482,29 @@ def qwen_model_from_root(model_path: str | os.PathLike[str], preload: bool = Fal
             "Expected transformer/, text_encoder/, vae/, and tokenizer/."
         )
     model_path_s = str(root.resolve())
-    model_id = f"{root.name} {name or ''}".lower()
-    qwen_variant = "qwen-image-edit" if "edit" in model_id or "2511" in model_id else "qwen-image"
+    manifest: dict[str, Any] = {}
+    manifest_path = root / "manifest.json"
+    if manifest_path.is_file():
+        candidate = _read_json(manifest_path)
+        if is_qwen_manifest(candidate):
+            manifest = candidate
+    source_identifiers = _qwen_root_source_identifiers(root, name=name)
+    source_identifiers.extend(
+        str(manifest.get(key) or "")
+        for key in ("source_root", "source_repo")
+    )
+    qwen_variant, model_version = resolve_qwen_model_identity(
+        manifest=manifest,
+        transformer_keys=_qwen_transformer_identity_keys(root),
+        source_identifiers=source_identifiers,
+        root_hint=_qwen_identity_root_hint(root),
+    )
+    if manifest:
+        _backfill_qwen_manifest_identity(root, manifest, qwen_variant, model_version)
     model = {
         "model_family": QWEN_MODEL_FAMILY,
         "qwen_variant": qwen_variant,
-        "model_version": QWEN_MODEL_VERSION,
+        "model_version": model_version,
         "model_path": model_path_s,
         "name": str(name or root.name),
         "cache_key": model_path_s,
@@ -654,6 +867,18 @@ def _qwen_runtime_root_from_split_files(
     else:
         _safe_symlink_or_copy(vae, root / "vae" / vae.name)
     _safe_symlink_or_copy(tokenizer, root / "tokenizer")
+    _write_json(
+        root / "sdmlx_qwen_split_root.json",
+        {
+            "runtime_root_format": "sdmlx-qwen-split-root-v1",
+            "source_checkpoint": str(transformer),
+            "source_identity": repr(_qwen_file_identity(transformer)),
+            "text_encoder": str(text_encoder),
+            "vae": str(vae),
+            "tokenizer": str(tokenizer),
+            "created_at": time.time(),
+        },
+    )
     return root
 
 
@@ -791,8 +1016,6 @@ def qwen_vae_from_file(vae_path: str | os.PathLike[str], name: str | None = None
 def qwen_model_from_manifest(package_path: str | os.PathLike[str], manifest: dict[str, Any], preload: bool = False):
     package_path = Path(package_path)
     manifest = _qwen_materialize_hf_package_if_needed(package_path, manifest)
-    manifest_family = str(manifest.get("model_family") or manifest.get("base_model_family") or QWEN_MODEL_FAMILY).strip().lower()
-    manifest_variant = str(manifest.get("qwen_variant") or "").strip().lower()
     model_path = manifest.get("model_path")
     components = manifest.get("components") or {}
     model_component = components.get("model") if isinstance(components, dict) else None
@@ -801,19 +1024,25 @@ def qwen_model_from_manifest(package_path: str | os.PathLike[str], manifest: dic
     model_path = str(model_path or manifest.get("source_repo") or QWEN_DEFAULT_MODEL)
     if model_path and not os.path.isabs(model_path) and not model_path.startswith(("mlx-community/", "Qwen/", "http")):
         model_path = str((package_path / model_path).resolve())
-    if manifest_variant not in {"qwen-image", "qwen-image-edit"}:
-        model_id = (
-            f"{manifest.get('model_version') or ''} "
-            f"{manifest.get('source_root') or ''} "
-            f"{manifest.get('source_repo') or ''} "
-            f"{package_path.name}"
-        ).lower()
-        manifest_variant = "qwen-image-edit" if "edit" in model_id or "2511" in model_id else "qwen-image"
+    local_root = Path(model_path).expanduser() if os.path.isabs(model_path) else None
+    transformer_keys = (
+        _qwen_transformer_identity_keys(local_root)
+        if local_root is not None and is_qwen_model_root(local_root)
+        else set()
+    )
+    qwen_variant, model_version = resolve_qwen_model_identity(
+        manifest=manifest,
+        transformer_keys=transformer_keys,
+        source_identifiers=(manifest.get("source_root"), manifest.get("source_repo")),
+        root_hint=package_path,
+    )
+    manifest = _backfill_qwen_manifest_identity(package_path, manifest, qwen_variant, model_version)
+    source_repo = manifest.get("source_repo") or model_path
 
     model = {
         "model_family": QWEN_MODEL_FAMILY,
-        "qwen_variant": manifest_variant if manifest_variant in {"qwen-image", "qwen-image-edit"} else ("qwen-image" if manifest_family == "qwen-image" else "qwen-image-edit"),
-        "model_version": str(manifest.get("model_version") or QWEN_MODEL_VERSION),
+        "qwen_variant": qwen_variant,
+        "model_version": model_version,
         "model_path": model_path,
         "cache_key": str(package_path),
         "package_path": str(package_path),
@@ -822,20 +1051,20 @@ def qwen_model_from_manifest(package_path: str | os.PathLike[str], manifest: dic
         "loras": list(manifest.get("loras") or []),
         "mod_lora_scale": float(manifest.get("mod_lora_scale") or 0.0),
         "recommendations": dict(manifest.get("recommendations") or {}),
-        "source_repo": manifest.get("source_repo") or QWEN_DEFAULT_MODEL,
+        "source_repo": source_repo,
     }
     clip_placeholder = {
         "type": QWEN_MODEL_FAMILY,
         "cache_key": str(package_path),
         "model_path": model_path,
-        "source_repo": manifest.get("source_repo") or QWEN_DEFAULT_MODEL,
+        "source_repo": source_repo,
         "unused": True,
     }
     vae_placeholder = {
         "type": QWEN_MODEL_FAMILY,
         "cache_key": str(package_path),
         "model_path": model_path,
-        "source_repo": manifest.get("source_repo") or QWEN_DEFAULT_MODEL,
+        "source_repo": source_repo,
         "unused": True,
     }
     if preload:
@@ -908,17 +1137,23 @@ def _qwen_materialize_hf_package_if_needed(package_path: Path, manifest: dict[st
 def create_qwen_dummy_package(
     package_path: str | os.PathLike[str],
     model_path: str | os.PathLike[str] | None = None,
-    source_repo: str = QWEN_DEFAULT_MODEL,
+    source_repo: str | None = None,
 ) -> Path:
     package_path = Path(package_path)
     package_path.mkdir(parents=True, exist_ok=True)
+    resolved_source = str(source_repo or model_path or QWEN_DEFAULT_MODEL)
+    qwen_variant, model_version = resolve_qwen_model_identity(
+        source_identifiers=(model_path, resolved_source),
+        root_hint=package_path,
+    )
     manifest = {
         "package_format": QWEN_PACKAGE_FORMAT,
         "model_family": QWEN_MODEL_FAMILY,
-        "model_version": QWEN_MODEL_VERSION,
+        "qwen_variant": qwen_variant,
+        "model_version": model_version,
         "runtime": "sdmlx_qwen_native",
-        "source_repo": source_repo,
-        "model_path": str(model_path) if model_path else source_repo,
+        "source_repo": resolved_source,
+        "model_path": str(model_path) if model_path else resolved_source,
         "mod_lora_scale": 0.0,
         "recommendations": {
             "steps": 4,
@@ -929,7 +1164,7 @@ def create_qwen_dummy_package(
         "components": {
             "model": {
                 "storage": "external_dir" if model_path else "huggingface_repo",
-                "path": str(model_path) if model_path else source_repo,
+                "path": str(model_path) if model_path else resolved_source,
             }
         },
     }
@@ -1478,12 +1713,23 @@ def _qwen_prepared_model_is_complete(cache_root: Path) -> bool:
 
 
 def _qwen_variant_and_version_from_root(source_root: Path) -> tuple[str, str]:
-    model_id = str(source_root).lower()
-    if "edit" in model_id or "2511" in model_id:
-        return "qwen-image-edit", "2511"
-    if "2512" in model_id:
-        return "qwen-image", "2512"
-    return "qwen-image", "2512"
+    manifest: dict[str, Any] = {}
+    manifest_path = source_root / "manifest.json"
+    if manifest_path.is_file():
+        candidate = _read_json(manifest_path)
+        if is_qwen_manifest(candidate):
+            manifest = candidate
+    source_identifiers = _qwen_root_source_identifiers(source_root)
+    source_identifiers.extend(
+        str(manifest.get(key) or "")
+        for key in ("source_root", "source_repo")
+    )
+    return resolve_qwen_model_identity(
+        manifest=manifest,
+        transformer_keys=_qwen_transformer_identity_keys(source_root),
+        source_identifiers=source_identifiers,
+        root_hint=_qwen_identity_root_hint(source_root),
+    )
 
 
 def _write_qwen_prepared_package_manifest(package_root: Path, source_root: Path) -> None:
@@ -1713,6 +1959,7 @@ def _load_qwen_model(
             f"time={float(bake_stats['seconds']):.2f}s)",
             verbose=True,
         )
+    _clear_qwen_reference_vae_cache()
     _QWEN_MODEL_CACHE.clear()
     _QWEN_MODEL_CACHE[cache_key] = model
     _qwen_log(f"SDMLX Qwen: model load={time.perf_counter() - t0:.2f}s", verbose=True)
@@ -1782,13 +2029,23 @@ def _load_qwen_vae(vae_root: str):
     from sdmlx_qwen_native.models.common.weights.loading.weight_loader import WeightLoader
     from sdmlx_qwen_native.models.qwen.model.qwen_vae.qwen_vae import QwenVAE
     from sdmlx_qwen_native.models.qwen.weights.qwen_weight_definition import QwenWeightDefinition
+    from mlx.utils import tree_flatten
 
     component = next(c for c in QwenWeightDefinition.get_components() if c.name == "vae")
     t0 = time.perf_counter()
     weights, _q_level, _version = WeightLoader._load_component(Path(vae_root), component)
     vae = QwenVAE()
-    vae.update(weights, strict=False)
+    expected = dict(tree_flatten(vae.parameters()))
+    loaded = dict(tree_flatten(weights))
+    missing = sorted(set(expected) - set(loaded))
+    if missing:
+        raise RuntimeError(
+            "SDMLX Qwen VAE: unsupported or incomplete weight mapping: "
+            f"missing={len(missing)} ({', '.join(missing[:3])})"
+        )
+    vae.update(weights, strict=True)
     mx.eval(vae.parameters())
+    _clear_qwen_reference_vae_cache()
     _QWEN_VAE_CACHE.clear()
     _QWEN_VAE_CACHE[cache_key] = vae
     _qwen_log(f"SDMLX Qwen VAE: load={time.perf_counter() - t0:.2f}s", verbose=True)
@@ -1825,7 +2082,7 @@ def _qwen_latent_to_mx(samples: Any) -> mx.array:
         latents = mx.transpose(latents, (0, 3, 1, 2))
     if latents.ndim not in (4, 5) or int(latents.shape[1]) != 16:
         raise RuntimeError(f"SDMLX Qwen VAE Decode: expected 16-channel Qwen latent, got shape {tuple(latents.shape)}.")
-    return latents.astype(mx.float32)
+    return latents
 
 
 def encode_qwen_image_with_vae(pixels: Any, mlx_vae: Any) -> dict[str, Any]:
@@ -1847,14 +2104,19 @@ def decode_qwen_latent_with_vae(mlx_latent: dict[str, Any], mlx_vae: Any) -> tor
     vae = _qwen_vae_from_placeholder(mlx_vae)
     latents = _qwen_latent_to_mx(mlx_latent["samples"])
     decoded = VAEUtil.decode(vae=vae, latent=latents)
-    decoded = mx.clip(decoded / 2.0 + 0.5, 0.0, 1.0)
-    if decoded.ndim == 5 and decoded.shape[2] == 1:
-        decoded = decoded[:, :, 0, :, :]
-    decoded = mx.transpose(decoded.astype(mx.float32), (0, 2, 3, 1))
-    mx.eval(decoded)
-    image = torch.from_numpy(np.array(decoded).astype(np.float32)).contiguous()
+    image = _qwen_decoded_to_image_tensor(decoded)
     _qwen_log(f"SDMLX Qwen VAE Decode: total={time.perf_counter() - t0:.3f}s", verbose=True)
     return image
+
+
+def _qwen_decoded_to_image_tensor(decoded: mx.array) -> torch.Tensor:
+    if decoded.ndim == 5 and decoded.shape[2] == 1:
+        decoded = decoded[:, :, 0, :, :]
+    decoded = mx.transpose(decoded, (0, 2, 3, 1))
+    decoded = mx.clip(((decoded / 2.0) + 0.5) * 255.0 + 0.5, 0.0, 255.0).astype(mx.uint8)
+    mx.eval(decoded)
+    image = np.array(decoded).astype(np.float32) / 255.0
+    return torch.from_numpy(image).contiguous()
 
 
 def _qwen_conditioning_entry(
@@ -2112,6 +2374,33 @@ def qwen_lora_specs_from_model(model: dict[str, Any]) -> list[tuple[str, float, 
     return specs
 
 
+def _qwen_sampling_conditioning(positive: Any, negative: Any) -> tuple[dict[str, Any], str, str, list[Any]]:
+    positive_entry = _extract_qwen_entry(positive)
+    if positive_entry is None:
+        raise RuntimeError("SDMLX Qwen: connect a Qwen Image Edit Conditioning node to the positive input.")
+    negative_entry = _extract_qwen_entry(negative)
+    prompt = str(positive_entry.get("prompt") or "")
+    negative_prompt = ""
+    if negative_entry is not None:
+        negative_prompt = str(negative_entry.get("prompt") or negative_entry.get("negative_prompt") or "")
+    return positive_entry, prompt, negative_prompt, list(positive_entry.get("images") or [])
+
+
+def _qwen_generated_latent_output(generated: Any, latent_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    generated_latent = getattr(generated, "latent", None)
+    if generated_latent is None:
+        raise RuntimeError("SDMLX Qwen: native runtime did not return the generated latent.")
+    latent_output = {
+        "samples": generated_latent,
+        "model_family": QWEN_MODEL_FAMILY,
+    }
+    if isinstance(latent_metadata, dict):
+        for key in ("sdmlx_decode_crop", "sdmlx_original_size", "sdmlx_padded_size"):
+            if key in latent_metadata:
+                latent_output[key] = latent_metadata[key]
+    return latent_output
+
+
 def sample_qwen_image_edit(
     sdmlx_model: dict[str, Any],
     positive: Any,
@@ -2124,34 +2413,15 @@ def sample_qwen_image_edit(
     scheduler: str,
     speed_patch: str | None,
     patch_strength: float = 1.0,
-) -> torch.Tensor:
-    positive_entry = _extract_qwen_entry(positive)
-    if positive_entry is None:
-        raise RuntimeError("SDMLX Qwen: connect a Qwen Image Edit Conditioning node to the positive input.")
-    negative_entry = _extract_qwen_entry(negative)
-    prompt = str(positive_entry.get("prompt") or "")
-    negative_prompt = ""
-    if negative_entry is not None and not negative_entry.get("images"):
-        negative_prompt = str(negative_entry.get("prompt") or negative_entry.get("negative_prompt") or "")
-    images = list(positive_entry.get("images") or [])
-    model_variant = str(sdmlx_model.get("qwen_variant") or "").strip().lower()
-    model_id = " ".join(
-        str(part or "")
-        for part in (
-            sdmlx_model.get("model_version"),
-            sdmlx_model.get("model_path"),
-            sdmlx_model.get("package_path"),
-            sdmlx_model.get("source_repo"),
-            sdmlx_model.get("name"),
-        )
-    ).lower()
-    if not model_variant:
-        model_variant = "qwen-image" if "2512" in model_id and "edit" not in model_id else "qwen-image-edit"
-    elif model_variant == "qwen-image" and images and ("edit" in model_id or "2511" in model_id):
-        # Older or hand-written manifests may mark a 2511/Edit package too broadly.
-        # Image conditioning is only valid for the Edit runtime, so recover here.
-        model_variant = "qwen-image-edit"
-    model_variant = "qwen-image" if model_variant == "qwen-image" else "qwen-image-edit"
+    latent_metadata: dict[str, Any] | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    positive_entry, prompt, negative_prompt, images = _qwen_sampling_conditioning(positive, negative)
+    model_variant, _model_version = resolve_qwen_model_identity(
+        manifest={
+            "qwen_variant": sdmlx_model.get("qwen_variant"),
+            "model_version": sdmlx_model.get("model_version"),
+        }
+    )
     is_txt2img = model_variant == "qwen-image" and not images
     if not images and not is_txt2img:
         raise RuntimeError("SDMLX Qwen: at least one conditioning image is required.")
@@ -2200,14 +2470,20 @@ def sample_qwen_image_edit(
         model_variant=model_variant,
     )
 
-    with tempfile.TemporaryDirectory(prefix="sdmlx_qwen_") as temp_dir:
-        temp_path = Path(temp_dir)
-        image_paths = []
-        for index, tensor in enumerate(images, start=1):
-            input_path = temp_path / f"input_{index}.png"
-            _image_tensor_to_pil(tensor).save(input_path)
-            image_paths.append(str(input_path))
-
+    pil_images = [_image_tensor_to_pil(tensor) for tensor in images]
+    generate_parameters = inspect.signature(model.generate_image).parameters
+    use_direct_images = bool(not is_txt2img and "images" in generate_parameters)
+    if not is_txt2img and not use_direct_images and "image_paths" not in generate_parameters:
+        raise RuntimeError(
+            "SDMLX Qwen: loaded runtime is Qwen Image, but the workflow is Qwen Image Edit. "
+            "Reload the correct Qwen Image Edit 2511 model or restart Comfy if the model cache was stale."
+        )
+    image_context = (
+        contextlib.nullcontext(None)
+        if is_txt2img or use_direct_images
+        else tempfile.TemporaryDirectory(prefix="sdmlx_qwen_")
+    )
+    with image_context as temp_dir:
         _qwen_log(
             "SDMLX Qwen: sampling "
             f"steps={int(steps)}, guidance={float(guidance):.3f}, scheduler={qwen_scheduler}"
@@ -2228,13 +2504,16 @@ def sample_qwen_image_edit(
             "negative_prompt": negative_prompt,
         }
         if not is_txt2img:
-            generate_kwargs["image_paths"] = image_paths
-        generate_parameters = inspect.signature(model.generate_image).parameters
-        if "image_paths" in generate_kwargs and "image_paths" not in generate_parameters:
-            raise RuntimeError(
-                "SDMLX Qwen: loaded runtime is Qwen Image, but the workflow is Qwen Image Edit. "
-                "Reload the correct Qwen Image Edit 2511 model or restart Comfy if the model cache was stale."
-            )
+            if use_direct_images:
+                generate_kwargs["images"] = pil_images
+            else:
+                temp_path = Path(temp_dir)
+                image_paths = []
+                for index, image in enumerate(pil_images, start=1):
+                    input_path = temp_path / f"input_{index}.png"
+                    image.save(input_path)
+                    image_paths.append(str(input_path))
+                generate_kwargs["image_paths"] = image_paths
         if "use_reference_latents" in generate_parameters:
             generate_kwargs["use_reference_latents"] = bool(positive_entry.get("reference_latents", False))
         if "use_picture_prefix" in generate_parameters:
@@ -2278,8 +2557,9 @@ def sample_qwen_image_edit(
     if inpaint_source is not None and inpaint_mask is not None:
         image = _apply_qwen_inpaint_mask(image, inpaint_source, inpaint_mask)
         _qwen_log("SDMLX Qwen: inpaint mask composite active", verbose=True)
+    latent_output = _qwen_generated_latent_output(generated, latent_metadata)
     _qwen_log(f"SDMLX Qwen: prompt executed in {sample_time + clear_time:.2f}s", verbose=True)
-    return image
+    return image, latent_output
 
 
 class SDMLXQwenImageEditConditioning:
