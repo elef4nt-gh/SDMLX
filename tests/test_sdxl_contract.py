@@ -128,5 +128,183 @@ class SDXLPackageAndFamilyTests(unittest.TestCase):
                 nodes._backfill_sdxl_manifest_family(str(package), manifest)
 
 
+class SDXLInpaintDetailerCompositeTests(unittest.TestCase):
+    def test_unmasked_pixels_remain_pixel_identical(self):
+        image = torch.arange(6 * 6 * 3, dtype=torch.float32).reshape(1, 6, 6, 3) / 108.0
+        rendered = torch.ones((1, 4, 4, 3), dtype=torch.float32)
+        mask = torch.zeros((1, 1, 4, 4), dtype=torch.float32)
+        mask[:, :, 1:3, 1:3] = 1.0
+
+        output, composite_mask = nodes.composite_inpaint_detailer_crop(
+            image,
+            rendered,
+            mask,
+            (1, 1, 5, 5),
+            crop_blend=0,
+        )
+
+        expected = image.clone()
+        expected[:, 2:4, 2:4, :] = 1.0
+        self.assertTrue(torch.equal(output, expected))
+        self.assertEqual(tuple(composite_mask.shape), (1, 4, 4, 1))
+        self.assertTrue(torch.equal(output[:, 1, 1:5, :], image[:, 1, 1:5, :]))
+
+    def test_crop_blend_feathers_the_input_mask_not_the_full_crop(self):
+        image = torch.zeros((1, 9, 9, 3), dtype=torch.float32)
+        rendered = torch.ones((1, 7, 7, 3), dtype=torch.float32)
+        mask = torch.zeros((1, 1, 7, 7), dtype=torch.float32)
+        mask[:, :, 3, 3] = 1.0
+
+        output, composite_mask = nodes.composite_inpaint_detailer_crop(
+            image,
+            rendered,
+            mask,
+            (1, 1, 8, 8),
+            crop_blend=1,
+        )
+
+        self.assertGreater(float(composite_mask[0, 3, 3, 0]), 0.0)
+        self.assertEqual(float(composite_mask[0, 0, 0, 0]), 0.0)
+        self.assertTrue(torch.equal(output[:, 0, :, :], image[:, 0, :, :]))
+        self.assertTrue(torch.equal(output[:, :, 0, :], image[:, :, 0, :]))
+
+
+class SDXLInpaintConditioningCompositeTests(unittest.TestCase):
+    def test_padding_continues_mask_that_touches_image_edge(self):
+        pixels = torch.zeros((1, 1010, 64, 3), dtype=torch.float32)
+        mask = torch.zeros((1, 1, 1010, 64), dtype=torch.float32)
+        mask[:, :, 900:, :] = 1.0
+
+        _, padded_mask, crop = nodes.pad_inpaint_pixels_and_mask(
+            pixels,
+            mask,
+            target_width=64,
+            target_height=1024,
+        )
+        grown = nodes.grow_mask_tensor(padded_mask, 4)
+        latent_mask = torch.nn.functional.interpolate(grown, size=(128, 8), mode="area")
+
+        self.assertEqual(crop, (0, 7, 64, 1010))
+        self.assertTrue(torch.equal(padded_mask[:, :, -7:, :], torch.ones((1, 1, 7, 64))))
+        self.assertEqual(float(latent_mask[0, 0, -1, 0]), 1.0)
+
+    def test_padding_stays_unmasked_when_mask_ends_before_image_edge(self):
+        pixels = torch.zeros((1, 1010, 64, 3), dtype=torch.float32)
+        mask = torch.zeros((1, 1, 1010, 64), dtype=torch.float32)
+        mask[:, :, 900:1000, :] = 1.0
+
+        _, padded_mask, _ = nodes.pad_inpaint_pixels_and_mask(
+            pixels,
+            mask,
+            target_width=64,
+            target_height=1024,
+        )
+
+        self.assertEqual(float(torch.max(padded_mask[:, :, -17:, :])), 0.0)
+
+    def test_conditioning_attaches_composite_metadata_only_with_noise_mask(self):
+        pixels = torch.rand((1, 64, 64, 3), dtype=torch.float32)
+        mask = torch.zeros((1, 64, 64), dtype=torch.float32)
+        mask[:, 20:44, 20:44] = 1.0
+        latents = torch.zeros((1, 8, 8, 4), dtype=torch.float32)
+        conditioning = {"model_family": "sdxl"}
+        vae = {"model_family": "sdxl"}
+
+        with mock.patch.object(nodes, "encode_pixels_to_latents", return_value=latents), mock.patch.object(
+            nodes,
+            "prepare_inpaint_mask",
+            return_value=torch.ones((1, 8, 8, 1), dtype=torch.float32),
+        ):
+            _, _, masked = nodes.SDMLX_InpaintConditioning().encode(
+                conditioning,
+                conditioning,
+                pixels,
+                vae,
+                mask,
+                noise_mask=True,
+            )
+            _, _, unmasked = nodes.SDMLX_InpaintConditioning().encode(
+                conditioning,
+                conditioning,
+                pixels,
+                vae,
+                mask,
+                noise_mask=False,
+            )
+
+        self.assertTrue(masked["sdmlx_inpaint_pixel_composite"])
+        self.assertTrue(torch.equal(masked["sdmlx_inpaint_source_image"], pixels))
+        self.assertEqual(tuple(masked["sdmlx_inpaint_source_mask"].shape), (1, 64, 64, 1))
+        self.assertNotIn("sdmlx_inpaint_pixel_composite", unmasked)
+        self.assertNotIn("sdmlx_inpaint_source_image", unmasked)
+        self.assertNotIn("sdmlx_inpaint_source_mask", unmasked)
+
+    def test_decode_composites_only_the_input_mask(self):
+        source = torch.arange(6 * 6 * 3, dtype=torch.float32).reshape(1, 6, 6, 3) / 108.0
+        decoded = torch.ones((1, 6, 6, 3), dtype=torch.float32)
+        mask = torch.zeros((1, 6, 6, 1), dtype=torch.float32)
+        mask[:, 2:4, 2:4, :] = 1.0
+        latent = {
+            "sdmlx_inpaint_pixel_composite": True,
+            "sdmlx_inpaint_source_image": source,
+            "sdmlx_inpaint_source_mask": mask,
+        }
+
+        output = nodes.composite_decoded_inpaint_image(decoded, latent)
+
+        expected = source.clone()
+        expected[:, 2:4, 2:4, :] = 1.0
+        self.assertTrue(torch.equal(output, expected))
+
+    def test_sdxl_decode_uses_inpaint_composite_metadata(self):
+        source = torch.zeros((1, 8, 8, 3), dtype=torch.float32)
+        source[:, :, :, 1] = 0.25
+        decoded = torch.ones((1, 8, 8, 3), dtype=torch.float32)
+        mask = torch.zeros((1, 8, 8, 1), dtype=torch.float32)
+        mask[:, 3:5, 3:5, :] = 1.0
+        latent = {
+            "samples": torch.zeros((1, 1, 1, 4), dtype=torch.float32),
+            "sdmlx_inpaint_pixel_composite": True,
+            "sdmlx_inpaint_source_image": source,
+            "sdmlx_inpaint_source_mask": mask,
+        }
+
+        with mock.patch.object(nodes, "decode_latents", return_value=decoded):
+            output = nodes.decode_mlx_latent_to_image(latent, {"model_family": "sdxl"})
+
+        expected = source.clone()
+        expected[:, 3:5, 3:5, :] = 1.0
+        self.assertTrue(torch.equal(output, expected))
+
+    def test_noise_mask_false_keeps_full_decode(self):
+        decoded = torch.rand((1, 4, 4, 3), dtype=torch.float32)
+        self.assertIs(nodes.composite_decoded_inpaint_image(decoded, {}), decoded)
+
+    def test_sampler_metadata_contract_preserves_inpaint_source(self):
+        source_image = torch.rand((1, 4, 4, 3), dtype=torch.float32)
+        source_mask = torch.rand((1, 4, 4, 1), dtype=torch.float32)
+        latent = {
+            "samples": object(),
+            "sdmlx_decode_crop": (0, 0, 4, 4),
+            "sdmlx_inpaint_pixel_composite": True,
+            "sdmlx_inpaint_source_image": source_image,
+            "sdmlx_inpaint_source_mask": source_mask,
+            "unrelated": "drop",
+        }
+
+        output = nodes.copy_sdmlx_latent_metadata(latent, {"samples": object()})
+
+        self.assertIs(output["sdmlx_inpaint_source_image"], source_image)
+        self.assertIs(output["sdmlx_inpaint_source_mask"], source_mask)
+        self.assertNotIn("unrelated", output)
+
+    def test_incomplete_composite_metadata_fails_clearly(self):
+        with self.assertRaisesRegex(RuntimeError, "metadata is incomplete"):
+            nodes.composite_decoded_inpaint_image(
+                torch.zeros((1, 4, 4, 3), dtype=torch.float32),
+                {"sdmlx_inpaint_pixel_composite": True},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

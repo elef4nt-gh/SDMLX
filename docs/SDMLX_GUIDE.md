@@ -223,11 +223,11 @@ The node supports classic `start_percent` / `end_percent` behavior and can also 
 
 `SDMLX Inpaint Conditioning` is the classic inpaint-style node. It takes image, mask, VAE and conditioning and returns conditioning plus latent data for the sampler.
 
-For soft transitions, use a mask blur node before it. SDMLX includes a Gaussian blur mask node for that purpose.
+With `noise_mask` enabled, the original image and mask travel with the latent so the final decode replaces only masked pixels. Unmasked pixels stay identical to the input instead of passing through a lossy VAE roundtrip. For soft transitions, use a mask blur node before it. SDMLX includes a Gaussian blur mask node for that purpose.
 
 ## Inpaint Detailer
 
-`SDMLX Inpaint Detailer` is a compact mask-detail workflow in one node. It crops the masked area, optionally renders it at a larger working size, samples it, decodes it, then inserts the full crop back into the original image.
+`SDMLX Inpaint Detailer` is a compact mask-detail workflow in one node. It crops the masked area, optionally renders it at a larger working size, samples it, decodes it, then inserts the result through the original image mask. The surrounding crop provides model context but does not replace unmasked source pixels.
 
 Important controls:
 
@@ -237,9 +237,9 @@ Important controls:
 - `max_size`: upper limit for the render size.
 - `soft_mask`: blur amount for the mask used during sampling.
 - `soft_mask_strength`: how strongly the soft mask affects differential diffusion.
-- `crop_blend`: final blend at the outside edge of the crop when inserting it back.
+- `crop_blend`: final feathering at the image-mask edge when inserting the result back.
 
-`soft_mask` and `soft_mask_strength` shape what the model is allowed to repaint during sampling. `crop_blend` is only the final paste edge for the returned crop.
+`soft_mask` and `soft_mask_strength` shape what the model is allowed to repaint during sampling. `crop_blend` affects only the final pixel-space composite; pixels outside that composite mask stay identical to the input image.
 
 ## Hires Fix And Tiled Upscale
 

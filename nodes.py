@@ -55,7 +55,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.20"
+SDMLX_VERSION = "0.1.21"
 SDMLX_CACHE_VERSION = "adapter-v7"
 
 if SDMLX_IMPORT_ERROR is None:
@@ -125,6 +125,14 @@ CONTROLNET_MODEL_CACHE = {}
 IPADAPTER_MODEL_CACHE = {}
 CLIP_VISION_MODEL_CACHE = {}
 INSIGHTFACE_MODEL_CACHE = {}
+SDMLX_LATENT_PASSTHROUGH_KEYS = (
+    "sdmlx_decode_crop",
+    "sdmlx_original_size",
+    "sdmlx_padded_size",
+    "sdmlx_inpaint_pixel_composite",
+    "sdmlx_inpaint_source_image",
+    "sdmlx_inpaint_source_mask",
+)
 def sdmlx_env_flag(name):
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -8042,7 +8050,7 @@ def pad_inpaint_pixels_and_mask(pixels, mask_chw=None, target_width=None, target
     pixels_nchw = torch.nn.functional.pad(pixels_nchw, (left, right, top, bottom), mode="replicate")
     pixels_t = pixels_nchw.permute(0, 2, 3, 1).contiguous()
     if mask_chw is not None:
-        mask_chw = torch.nn.functional.pad(mask_chw, (left, right, top, bottom), mode="constant", value=0.0)
+        mask_chw = torch.nn.functional.pad(mask_chw, (left, right, top, bottom), mode="replicate")
         mask_chw = mask_chw.contiguous()
     return pixels_t, mask_chw, (left, top, width, height)
 
@@ -8345,6 +8353,83 @@ def prepare_padded_latent_mask_from_crop(mask_crop, render_width, render_height,
     ]
     latent_mask = torch.clamp(latent_mask, 0.0, 1.0).permute(0, 2, 3, 1).contiguous()
     return mx.array(latent_mask.numpy()).astype(mx.float32)
+
+
+def composite_inpaint_detailer_crop(image, rendered_crop, mask_crop, bbox, crop_blend=0):
+    image_t = image.detach().cpu().float() if hasattr(image, "detach") else torch.from_numpy(
+        get_numpy_array(image).astype(np.float32)
+    )
+    rendered_t = rendered_crop.detach().cpu().float() if hasattr(rendered_crop, "detach") else torch.from_numpy(
+        get_numpy_array(rendered_crop).astype(np.float32)
+    )
+    if image_t.ndim != 4 or image_t.shape[-1] != 3:
+        raise ValueError(f"SDMLX Inpaint Detailer: IMAGE must be [B,H,W,3], got {tuple(image_t.shape)}.")
+    if rendered_t.ndim != 4 or rendered_t.shape[-1] != 3:
+        raise ValueError(
+            f"SDMLX Inpaint Detailer: rendered crop must be [B,H,W,3], got {tuple(rendered_t.shape)}."
+        )
+
+    x0, y0, x1, y1 = [int(value) for value in bbox]
+    crop_h = y1 - y0
+    crop_w = x1 - x0
+    if crop_h <= 0 or crop_w <= 0:
+        raise ValueError(f"SDMLX Inpaint Detailer: composite bbox is empty: {tuple(bbox)}.")
+    if tuple(rendered_t.shape[1:3]) != (crop_h, crop_w):
+        raise ValueError(
+            "SDMLX Inpaint Detailer: rendered crop does not match composite bbox: "
+            f"{tuple(rendered_t.shape[1:3])} vs {(crop_h, crop_w)}."
+        )
+
+    mask_t = mask_to_chw(mask_crop, crop_h, crop_w).permute(0, 2, 3, 1).contiguous()
+    crop_blend = int(crop_blend)
+    if crop_blend > 0:
+        mask_t = sdmlx_tensor_gaussian_blur_mask(mask_t, crop_blend, 10.0)
+    composite_mask = torch.clamp(mask_t, 0.0, 1.0).contiguous()
+
+    output = image_t.clone()
+    target = output[:, y0:y1, x0:x1, :]
+    if rendered_t.shape[0] != target.shape[0]:
+        rendered_t = rendered_t[:1].repeat(target.shape[0], 1, 1, 1)
+    if composite_mask.shape[0] != target.shape[0]:
+        composite_mask = composite_mask[:1].repeat(target.shape[0], 1, 1, 1)
+    output[:, y0:y1, x0:x1, :] = rendered_t * composite_mask + target * (1.0 - composite_mask)
+    return output, composite_mask
+
+
+def copy_sdmlx_latent_metadata(source, target):
+    for key in SDMLX_LATENT_PASSTHROUGH_KEYS:
+        if key in source:
+            target[key] = source[key]
+    return target
+
+
+def composite_decoded_inpaint_image(decoded, latent):
+    if not bool(latent.get("sdmlx_inpaint_pixel_composite", False)):
+        return decoded
+    source = latent.get("sdmlx_inpaint_source_image")
+    mask = latent.get("sdmlx_inpaint_source_mask")
+    if source is None or mask is None:
+        raise RuntimeError(
+            "SDMLX Inpaint Decode: pixel-composite metadata is incomplete; "
+            "the source image and mask must travel with the latent."
+        )
+    source_t = source.detach().cpu().float() if hasattr(source, "detach") else torch.from_numpy(
+        get_numpy_array(source).astype(np.float32)
+    )
+    if source_t.ndim != 4 or source_t.shape[-1] != 3:
+        raise ValueError(
+            f"SDMLX Inpaint Decode: source image must be [B,H,W,3], got {tuple(source_t.shape)}."
+        )
+    source_h = int(source_t.shape[1])
+    source_w = int(source_t.shape[2])
+    output, _ = composite_inpaint_detailer_crop(
+        source_t,
+        decoded,
+        mask,
+        (0, 0, source_w, source_h),
+        crop_blend=0,
+    )
+    return output
 
 
 def precision_dtype(name):
@@ -10420,18 +10505,27 @@ class SDMLX_InpaintConditioning:
                     f"received {family}."
                 )
         if hasattr(pixels, "detach"):
-            pixel_shape = tuple(pixels.shape)
-            pixel_height = int(pixels.shape[1])
-            pixel_width = int(pixels.shape[2])
+            source_pixels = pixels.detach().cpu().float()
         else:
-            pixels_np = get_numpy_array(pixels)
-            pixel_shape = tuple(pixels_np.shape)
-            pixel_height = int(pixels_np.shape[1])
-            pixel_width = int(pixels_np.shape[2])
+            source_pixels = torch.from_numpy(get_numpy_array(pixels).astype(np.float32))
+        if source_pixels.ndim != 4 or source_pixels.shape[-1] != 3:
+            raise ValueError(
+                f"SDMLX Inpaint Conditioning: IMAGE must be [B,H,W,3], got {tuple(source_pixels.shape)}."
+            )
+        source_pixels = torch.clamp(source_pixels, 0.0, 1.0).contiguous()
+        pixel_shape = tuple(source_pixels.shape)
+        pixel_height = int(source_pixels.shape[1])
+        pixel_width = int(source_pixels.shape[2])
 
         mask_chw = mask_to_chw(mask, pixel_height, pixel_width)
+        source_mask = mask_chw.permute(0, 2, 3, 1).contiguous()
         target_width, target_height = inpaint_work_size(pixel_width, pixel_height, multiple=64)
-        pixels, mask_chw, decode_crop = pad_inpaint_pixels_and_mask(pixels, mask_chw, target_width, target_height)
+        pixels, mask_chw, decode_crop = pad_inpaint_pixels_and_mask(
+            source_pixels,
+            mask_chw,
+            target_width,
+            target_height,
+        )
         padded = target_width != pixel_width or target_height != pixel_height
         work_width = target_width
         work_height = target_height
@@ -10450,6 +10544,9 @@ class SDMLX_InpaintConditioning:
                 latents.shape[1],
                 latents.shape[2],
             )
+            out["sdmlx_inpaint_pixel_composite"] = True
+            out["sdmlx_inpaint_source_image"] = source_pixels
+            out["sdmlx_inpaint_source_mask"] = source_mask
         print(
             "SDMLX: Inpaint conditioning created "
             f"(image={pixel_shape}, latent={tuple(latents.shape)}, "
@@ -10972,29 +11069,14 @@ class SDMLX_InpaintDetailer:
             :,
         ].contiguous()
         rendered_crop = resize_image_tensor(rendered_crop, crop_w, crop_h, resize_method)
-        composite_mask = torch.ones(
-            (rendered_crop.shape[0], crop_h, crop_w),
-            dtype=rendered_crop.dtype,
-            device=rendered_crop.device,
-        )
         crop_blend = int(crop_blend)
-        if crop_blend > 0:
-            border = min(crop_blend, max(0, crop_h // 2), max(0, crop_w // 2))
-            if border > 0:
-                composite_mask[:, :border, :] = 0.0
-                composite_mask[:, crop_h - border:, :] = 0.0
-                composite_mask[:, :, :border] = 0.0
-                composite_mask[:, :, crop_w - border:] = 0.0
-            composite_mask = sdmlx_tensor_gaussian_blur_mask(composite_mask[..., None], crop_blend, 10.0)
-            composite_mask = torch.squeeze(composite_mask, dim=-1)
-        composite_mask = torch.clamp(composite_mask, 0.0, 1.0).unsqueeze(-1).contiguous()
-
-        output = image_t.clone()
-        target = output[:, y0:y1, x0:x1, :]
-        if rendered_crop.shape[0] != target.shape[0]:
-            rendered_crop = rendered_crop[:1].repeat(target.shape[0], 1, 1, 1)
-            composite_mask = composite_mask[:1].repeat(target.shape[0], 1, 1, 1)
-        output[:, y0:y1, x0:x1, :] = rendered_crop * composite_mask + target * (1.0 - composite_mask)
+        output, composite_mask = composite_inpaint_detailer_crop(
+            image_t,
+            rendered_crop,
+            crop_mask,
+            (x0, y0, x1, y1),
+            crop_blend,
+        )
         composite_elapsed = time.perf_counter() - composite_start
 
         total_elapsed = time.perf_counter() - start_time
@@ -11035,7 +11117,7 @@ class SDMLX_InpaintDetailer:
             f"soft_mask={soft_mask_amount}, "
             f"sampler_mask={sampler_mask_mode}, differential_mask={differential_mode}, "
             f"soft_mask_strength={float(soft_mask_strength):g}, "
-            f"composite_mask=full_crop_plus_crop_blend, crop_blend={crop_blend}, "
+            f"composite_mask=input_mask_plus_feather, crop_blend={crop_blend}, "
             f"preview={bool(preview)}, time_ids={time_id_mode}, "
             f"prep_cache={prep_cache_status}, "
             f"mask={mask_elapsed:.2f}s, resize={resize_elapsed:.2f}s, pad={pad_elapsed:.2f}s, encode={encode_elapsed:.2f}s, "
@@ -11731,9 +11813,7 @@ class SDMLX_KSampler:
                 **spectrum_preset,
             )
         out = {"samples": samples}
-        for key in ("sdmlx_decode_crop", "sdmlx_original_size", "sdmlx_padded_size"):
-            if key in latent_image:
-                out[key] = latent_image[key]
+        copy_sdmlx_latent_metadata(latent_image, out)
         image = decode_mlx_latent_to_image(out, mlx_vae) if output_is_connected(prompt, unique_id, 0) else None
         return (image, out)
 
@@ -11968,9 +12048,7 @@ class SDMLX_KSamplerAdvanced:
                 **spectrum_preset,
             )
         out = {"samples": samples}
-        for key in ("sdmlx_decode_crop", "sdmlx_original_size", "sdmlx_padded_size"):
-            if key in latent_image:
-                out[key] = latent_image[key]
+        copy_sdmlx_latent_metadata(latent_image, out)
         image = decode_mlx_latent_to_image(out, mlx_vae) if output_is_connected(prompt, unique_id, 0) else None
         return (image, out)
 
@@ -12038,7 +12116,7 @@ def decode_mlx_latent_to_image(mlx_latent, mlx_vae):
             "SDMLX: Decode crop to original size "
             f"({padded_size[0]}x{padded_size[1]} -> {width}x{height}, offset={left},{top})."
         )
-    return image
+    return composite_decoded_inpaint_image(image, mlx_latent)
 
 
 class SDMLX_VAEDecode:
