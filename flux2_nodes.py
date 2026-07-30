@@ -1318,6 +1318,7 @@ def _flux2_find_tokenizer_donor(config_name: str, *, exclude: Path | None = None
 def _flux2_download_tokenizer_assets(package_path: Path, config_name: str) -> Path:
     try:
         from huggingface_hub import snapshot_download
+        from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
         from .sdmlx_asset_registry import flux2_asset_entry
     except Exception as exc:
         raise RuntimeError(
@@ -1340,23 +1341,35 @@ def _flux2_download_tokenizer_assets(package_path: Path, config_name: str) -> Pa
         "LICENSE*",
     ]
     try:
-        snapshot_download(
-            repo_id=entry.repo_id,
-            local_dir=str(package_path),
-            allow_patterns=allow_patterns,
-            ignore_patterns=[
-                ".git/*",
-                "text_encoder/*",
-                "transformer/*",
-                "vae/*",
-            ],
-        )
-    except TypeError:
-        snapshot_download(
-            repo_id=entry.repo_id,
-            local_dir=str(package_path),
-            allow_patterns=allow_patterns,
-        )
+        try:
+            snapshot_download(
+                repo_id=entry.repo_id,
+                local_dir=str(package_path),
+                allow_patterns=allow_patterns,
+                ignore_patterns=[
+                    ".git/*",
+                    "text_encoder/*",
+                    "transformer/*",
+                    "vae/*",
+                ],
+            )
+        except TypeError:
+            snapshot_download(
+                repo_id=entry.repo_id,
+                local_dir=str(package_path),
+                allow_patterns=allow_patterns,
+            )
+    except HfHubHTTPError as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if isinstance(exc, GatedRepoError) or status_code in {401, 403}:
+            raise RuntimeError(
+                "SDMLX FLUX.2 Klein conversion: Hugging Face access is required "
+                f"to download tokenizer/scheduler assets from {entry.repo_id}. "
+                "Accept the repository terms and authenticate Hugging Face in "
+                "the same Python environment that runs ComfyUI, then retry. "
+                "Git credentials and Xcode are not required."
+            ) from None
+        raise
     shutil.rmtree(package_path / ".cache", ignore_errors=True)
     tokenizer = package_path / "tokenizer"
     if not _flux2_tokenizer_has_chat_template(tokenizer):
@@ -4128,14 +4141,48 @@ def _flux2_text_encoder_uses_comfy_quant(path: Path) -> bool:
 
 def _flux2_text_encoder_cache_model_config_payload(model_config) -> dict[str, Any]:
     overrides = model_config.text_encoder_overrides or {}
+    hidden_size = int(overrides.get("hidden_size") or 0)
+    head_dim = int(overrides.get("head_dim") or _FLUX2_HEAD_DIM)
+    num_attention_heads = int(
+        overrides.get("num_attention_heads")
+        or (hidden_size // head_dim if hidden_size and head_dim else 0)
+    )
+    num_key_value_heads = int(
+        overrides.get("num_key_value_heads")
+        or (max(1, num_attention_heads // 4) if num_attention_heads else 0)
+    )
     return {
-        "model_name": str(getattr(model_config, "model_name", "")),
-        "hidden_size": int(overrides.get("hidden_size") or 0),
+        "hidden_size": hidden_size,
         "intermediate_size": int(overrides.get("intermediate_size") or 0),
         "num_hidden_layers": int(overrides.get("num_hidden_layers") or 0),
-        "num_attention_heads": int(overrides.get("num_attention_heads") or 0),
-        "num_key_value_heads": int(overrides.get("num_key_value_heads") or 0),
-        "head_dim": int(overrides.get("head_dim") or _FLUX2_HEAD_DIM),
+        "num_attention_heads": num_attention_heads,
+        "num_key_value_heads": num_key_value_heads,
+        "head_dim": head_dim,
+        "prepared_dtype": "bfloat16",
+    }
+
+
+def _flux2_text_encoder_cache_normalize_model_config(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    hidden_size = int(payload.get("hidden_size") or 0)
+    head_dim = int(payload.get("head_dim") or _FLUX2_HEAD_DIM)
+    num_attention_heads = int(
+        payload.get("num_attention_heads")
+        or (hidden_size // head_dim if hidden_size and head_dim else 0)
+    )
+    num_key_value_heads = int(
+        payload.get("num_key_value_heads")
+        or (max(1, num_attention_heads // 4) if num_attention_heads else 0)
+    )
+    return {
+        "hidden_size": hidden_size,
+        "intermediate_size": int(payload.get("intermediate_size") or 0),
+        "num_hidden_layers": int(payload.get("num_hidden_layers") or 0),
+        "num_attention_heads": num_attention_heads,
+        "num_key_value_heads": num_key_value_heads,
+        "head_dim": head_dim,
+        "prepared_dtype": str(payload.get("prepared_dtype") or "bfloat16"),
     }
 
 
@@ -4153,13 +4200,125 @@ def _flux2_text_encoder_cache_metadata(path: Path, model_config) -> dict[str, st
     }
 
 
+def _flux2_text_encoder_cache_key_payload(path: Path, model_config) -> dict[str, Any]:
+    identity = _flux2_file_identity(path)
+    return {
+        "cache_format": _FLUX2_TEXT_ENCODER_CACHE_FORMAT,
+        "source_size": int(identity["source_size"]),
+        "source_mtime_ns": int(identity["source_mtime_ns"]),
+        "source_content_digest": str(identity["source_content_digest"]),
+        "model_config": _flux2_text_encoder_cache_model_config_payload(model_config),
+    }
+
+
 def _flux2_text_encoder_cache_path(path: Path, model_config) -> Path:
-    metadata = _flux2_text_encoder_cache_metadata(path, model_config)
-    digest_source = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    key_payload = _flux2_text_encoder_cache_key_payload(path, model_config)
+    digest_source = json.dumps(key_payload, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:16]
     safe_stem = _flux2_safe_package_name(path)
     hidden = (model_config.text_encoder_overrides or {}).get("hidden_size") or "qwen3"
     return _flux2_text_encoder_prepared_cache_dir() / f"{safe_stem}-h{hidden}-{digest}" / "weights.safetensors"
+
+
+def _flux2_text_encoder_cache_source_matches(candidate: Any, expected: dict[str, Any]) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    try:
+        return (
+            int(candidate.get("source_size") or -1) == int(expected["source_size"])
+            and int(candidate.get("source_mtime_ns") or -1)
+            == int(expected["source_mtime_ns"])
+            and str(candidate.get("source_content_digest") or "")
+            == str(expected["source_content_digest"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _flux2_text_encoder_cache_manifest_matches(
+    manifest: Any,
+    source_identity: dict[str, Any],
+    model_config,
+) -> bool:
+    if not isinstance(manifest, dict):
+        return False
+    cache_format = str(manifest.get("cache_format") or manifest.get("format") or "")
+    if cache_format != _FLUX2_TEXT_ENCODER_CACHE_FORMAT:
+        return False
+    if not _flux2_text_encoder_cache_source_matches(
+        manifest.get("source_identity"),
+        source_identity,
+    ):
+        return False
+    actual_config = _flux2_text_encoder_cache_normalize_model_config(
+        manifest.get("model_config")
+    )
+    expected_config = _flux2_text_encoder_cache_model_config_payload(model_config)
+    return actual_config == expected_config
+
+
+def _flux2_text_encoder_cache_metadata_matches(
+    metadata: Any,
+    source_identity: dict[str, Any],
+    model_config,
+) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    if str(metadata.get("cache_format") or "") != _FLUX2_TEXT_ENCODER_CACHE_FORMAT:
+        return False
+    if not _flux2_text_encoder_cache_source_matches(metadata, source_identity):
+        return False
+    try:
+        actual_payload = json.loads(str(metadata.get("model_config") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    actual_config = _flux2_text_encoder_cache_normalize_model_config(actual_payload)
+    expected_config = _flux2_text_encoder_cache_model_config_payload(model_config)
+    return actual_config == expected_config
+
+
+def _flux2_text_encoder_cache_candidates(path: Path, model_config) -> list[Path]:
+    source_identity = _flux2_file_identity(path)
+    canonical_path = _flux2_text_encoder_cache_path(path, model_config)
+    candidates: dict[str, Path] = {}
+    if canonical_path.is_file() and canonical_path.stat().st_size > 0:
+        candidates[str(canonical_path.resolve())] = canonical_path
+
+    cache_root = _flux2_text_encoder_prepared_cache_dir()
+    for manifest_path in cache_root.glob("*/manifest.json"):
+        try:
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except Exception:
+            continue
+        if not _flux2_text_encoder_cache_manifest_matches(
+            manifest,
+            source_identity,
+            model_config,
+        ):
+            continue
+        cache_path = manifest_path.parent / "weights.safetensors"
+        try:
+            if not cache_path.is_file() or cache_path.stat().st_size <= 0:
+                continue
+            candidates[str(cache_path.resolve())] = cache_path
+        except OSError:
+            continue
+
+    def recency(cache_path: Path) -> tuple[int, str]:
+        try:
+            return cache_path.stat().st_mtime_ns, cache_path.parent.name
+        except OSError:
+            return 0, cache_path.parent.name
+
+    return sorted(candidates.values(), key=recency, reverse=True)
+
+
+def _flux2_resolve_text_encoder_cache_path(path: Path, model_config) -> Path:
+    candidates = _flux2_text_encoder_cache_candidates(path, model_config)
+    if candidates:
+        return candidates[0]
+    return _flux2_text_encoder_cache_path(path, model_config)
 
 
 def _flux2_text_encoder_cache_manifest_path(cache_path: Path) -> Path:
@@ -4172,7 +4331,10 @@ def _flux2_text_encoder_cache_manifest_entry(
     cache_path: Path | None = None,
 ) -> dict[str, Any]:
     source_path = source_path.expanduser().resolve()
-    cache_path = cache_path or _flux2_text_encoder_cache_path(source_path, model_config)
+    cache_path = cache_path or _flux2_resolve_text_encoder_cache_path(
+        source_path,
+        model_config,
+    )
     identity = _flux2_file_identity(source_path)
     return {
         "format": _FLUX2_TEXT_ENCODER_CACHE_MANIFEST_FORMAT,
@@ -4249,28 +4411,25 @@ def _flux2_flatten_weight_tree(tree: Any, prefix: str = "") -> dict[str, mx.arra
 
 
 def _flux2_load_prepared_text_encoder_cache(path: Path, model_config) -> dict[str, Any] | None:
-    cache_path = _flux2_text_encoder_cache_path(path, model_config)
-    if not cache_path.is_file() or cache_path.stat().st_size <= 0:
-        return None
-    expected_metadata = _flux2_text_encoder_cache_metadata(path, model_config)
-    try:
-        arrays, metadata = mx.load(str(cache_path), return_metadata=True)
-        metadata = metadata or {}
-        for key, expected in expected_metadata.items():
-            if str(metadata.get(key) or "") != str(expected):
-                return None
+    source_identity = _flux2_file_identity(path)
+    for cache_path in _flux2_text_encoder_cache_candidates(path, model_config):
         try:
-            _flux2_write_text_encoder_cache_manifest(path, model_config, cache_path)
+            arrays, metadata = mx.load(str(cache_path), return_metadata=True)
+            if not _flux2_text_encoder_cache_metadata_matches(
+                metadata or {},
+                source_identity,
+                model_config,
+            ):
+                continue
+            try:
+                _flux2_write_text_encoder_cache_manifest(path, model_config, cache_path)
+            except Exception:
+                pass
+            _flux2_log(f"SDMLX FLUX.2 Klein CLIP cache: hit {cache_path.parent.name}", verbose=True)
+            return tree_unflatten(list(dict(arrays.items()).items()))
         except Exception:
-            pass
-        _flux2_log(f"SDMLX FLUX.2 Klein CLIP cache: hit {cache_path.parent.name}", verbose=True)
-        return tree_unflatten(list(dict(arrays.items()).items()))
-    except Exception:
-        try:
-            cache_path.unlink()
-        except Exception:
-            pass
-        return None
+            continue
+    return None
 
 
 def _flux2_store_prepared_text_encoder_cache(path: Path, model_config, weights: dict[str, Any], elapsed_s: float) -> None:

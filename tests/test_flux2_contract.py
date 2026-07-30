@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import json
+import os
+import tempfile
+import traceback
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+import httpx
 import mlx.core as mx
+from huggingface_hub.errors import GatedRepoError
 
 from .. import flux2_nodes
 
@@ -15,6 +23,51 @@ def _reference(value: float) -> dict:
         "width": 32,
         "height": 32,
     }
+
+
+def _flux2_9b_config(model_name: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        model_name=model_name,
+        text_encoder_overrides={
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+        },
+    )
+
+
+def _write_legacy_text_encoder_cache(
+    cache_root: Path,
+    source_path: Path,
+    *,
+    entry_name: str,
+    model_name: str,
+    mtime_ns: int,
+) -> Path:
+    entry_root = cache_root / entry_name
+    entry_root.mkdir(parents=True)
+    cache_path = entry_root / "weights.safetensors"
+    cache_path.write_bytes(b"prepared-cache")
+    os.utime(cache_path, ns=(mtime_ns, mtime_ns))
+    manifest = {
+        "format": flux2_nodes._FLUX2_TEXT_ENCODER_CACHE_MANIFEST_FORMAT,
+        "kind": "prepared_text_encoder",
+        "model_family": flux2_nodes.FLUX2_MODEL_FAMILY,
+        "component": "text_encoder",
+        "cache_format": flux2_nodes._FLUX2_TEXT_ENCODER_CACHE_FORMAT,
+        "source_identity": flux2_nodes._flux2_file_identity(source_path),
+        "model_config": {
+            "model_name": model_name,
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "num_hidden_layers": 0,
+            "num_attention_heads": 0,
+            "num_key_value_heads": 0,
+            "head_dim": 128,
+        },
+    }
+    with (entry_root / "manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle)
+    return cache_path
 
 
 class Flux2EnhancedReferenceContractTests(unittest.TestCase):
@@ -112,6 +165,192 @@ class Flux2EnhancedReferenceContractTests(unittest.TestCase):
         self.assertEqual(state.double_map, {})
         self.assertEqual(state.single_map, {})
         self.assertEqual((state.text_scale, state.reference_scale), (1.0, 1.0))
+
+
+class Flux2PreparedTextEncoderCacheContractTests(unittest.TestCase):
+    def test_official_9b_variants_share_canonical_cache_key(self):
+        configs = [
+            _flux2_9b_config("black-forest-labs/FLUX.2-klein-base-9B"),
+            _flux2_9b_config("black-forest-labs/FLUX.2-klein-9B"),
+            _flux2_9b_config("black-forest-labs/FLUX.2-klein-9b-kv"),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "qwen_3_8b_fp8mixed.safetensors"
+            source.write_bytes(b"same-text-encoder")
+            cache_root = root / "cache"
+            with mock.patch.object(
+                flux2_nodes,
+                "_flux2_text_encoder_prepared_cache_dir",
+                return_value=cache_root,
+            ):
+                paths = {
+                    flux2_nodes._flux2_text_encoder_cache_path(source, config)
+                    for config in configs
+                }
+        self.assertEqual(len(paths), 1)
+
+    def test_legacy_resolution_selects_newest_matching_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "qwen_3_8b_fp8mixed.safetensors"
+            source.write_bytes(b"same-text-encoder")
+            cache_root = root / "cache"
+            older = _write_legacy_text_encoder_cache(
+                cache_root,
+                source,
+                entry_name="older",
+                model_name="black-forest-labs/FLUX.2-klein-base-9B",
+                mtime_ns=1_000_000_000,
+            )
+            newest = _write_legacy_text_encoder_cache(
+                cache_root,
+                source,
+                entry_name="newest",
+                model_name="black-forest-labs/FLUX.2-klein-9b-kv",
+                mtime_ns=3_000_000_000,
+            )
+            _write_legacy_text_encoder_cache(
+                cache_root,
+                source,
+                entry_name="middle",
+                model_name="black-forest-labs/FLUX.2-klein-9B",
+                mtime_ns=2_000_000_000,
+            )
+            with mock.patch.object(
+                flux2_nodes,
+                "_flux2_text_encoder_prepared_cache_dir",
+                return_value=cache_root,
+            ):
+                resolved = flux2_nodes._flux2_resolve_text_encoder_cache_path(
+                    source,
+                    _flux2_9b_config("black-forest-labs/FLUX.2-klein-9B"),
+                )
+        self.assertNotEqual(resolved, older)
+        self.assertEqual(resolved, newest)
+
+    def test_legacy_cache_metadata_is_valid_for_another_9b_variant(self):
+        source_identity = {
+            "source_size": 123,
+            "source_mtime_ns": 456,
+            "source_content_digest": "same-digest",
+        }
+        legacy_metadata = {
+            "cache_format": flux2_nodes._FLUX2_TEXT_ENCODER_CACHE_FORMAT,
+            "source_size": "123",
+            "source_mtime_ns": "456",
+            "source_content_digest": "same-digest",
+            "model_config": json.dumps(
+                {
+                    "model_name": "black-forest-labs/FLUX.2-klein-9b-kv",
+                    "hidden_size": 4096,
+                    "intermediate_size": 12288,
+                    "num_hidden_layers": 0,
+                    "num_attention_heads": 0,
+                    "num_key_value_heads": 0,
+                    "head_dim": 128,
+                }
+            ),
+        }
+        self.assertTrue(
+            flux2_nodes._flux2_text_encoder_cache_metadata_matches(
+                legacy_metadata,
+                source_identity,
+                _flux2_9b_config("black-forest-labs/FLUX.2-klein-base-9B"),
+            )
+        )
+
+    def test_changed_source_mtime_invalidates_legacy_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "encoder.safetensors"
+            source.write_bytes(b"same-source")
+            cache_root = root / "cache"
+            _write_legacy_text_encoder_cache(
+                cache_root,
+                source,
+                entry_name="legacy",
+                model_name="black-forest-labs/FLUX.2-klein-9B",
+                mtime_ns=1_000_000_000,
+            )
+            source_stat = source.stat()
+            os.utime(
+                source,
+                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns + 1),
+            )
+            with mock.patch.object(
+                flux2_nodes,
+                "_flux2_text_encoder_prepared_cache_dir",
+                return_value=cache_root,
+            ):
+                candidates = flux2_nodes._flux2_text_encoder_cache_candidates(
+                    source,
+                    _flux2_9b_config("black-forest-labs/FLUX.2-klein-9B"),
+                )
+        self.assertEqual(candidates, [])
+
+    def test_different_encoder_geometry_does_not_reuse_9b_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "encoder.safetensors"
+            source.write_bytes(b"same-source")
+            cache_root = root / "cache"
+            _write_legacy_text_encoder_cache(
+                cache_root,
+                source,
+                entry_name="nine-b",
+                model_name="black-forest-labs/FLUX.2-klein-9B",
+                mtime_ns=1_000_000_000,
+            )
+            config_4b = SimpleNamespace(
+                model_name="black-forest-labs/FLUX.2-klein-4B",
+                text_encoder_overrides={
+                    "hidden_size": 2560,
+                    "intermediate_size": 9728,
+                    "num_attention_heads": 32,
+                    "num_key_value_heads": 8,
+                    "head_dim": 128,
+                },
+            )
+            with mock.patch.object(
+                flux2_nodes,
+                "_flux2_text_encoder_prepared_cache_dir",
+                return_value=cache_root,
+            ):
+                candidates = flux2_nodes._flux2_text_encoder_cache_candidates(
+                    source,
+                    config_4b,
+                )
+        self.assertEqual(candidates, [])
+
+
+class Flux2PackageAccessContractTests(unittest.TestCase):
+    def test_gated_tokenizer_download_has_concise_actionable_error(self):
+        response = httpx.Response(
+            401,
+            request=httpx.Request(
+                "HEAD",
+                "https://huggingface.co/black-forest-labs/FLUX.2-klein-9B",
+            ),
+        )
+        gated = GatedRepoError("restricted", response=response)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch("huggingface_hub.snapshot_download", side_effect=gated):
+                try:
+                    flux2_nodes._flux2_download_tokenizer_assets(
+                        Path(temp_dir),
+                        "flux2-klein-9b",
+                    )
+                except RuntimeError as exc:
+                    rendered = "".join(traceback.format_exception(exc))
+                else:
+                    self.fail("gated download did not fail")
+
+        self.assertIn("Hugging Face access is required", rendered)
+        self.assertIn("black-forest-labs/FLUX.2-klein-9B", rendered)
+        self.assertIn("Git credentials and Xcode are not required", rendered)
+        self.assertNotIn("GatedRepoError", rendered)
 
 
 if __name__ == "__main__":

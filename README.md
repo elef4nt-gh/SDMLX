@@ -115,13 +115,37 @@ Restart ComfyUI after installing or updating.
 
 ### ComfyUI Desktop on macOS
 
-ComfyUI Desktop keeps its Python environment in `~/Documents/ComfyUI/.venv`. If SDMLX was installed from a ZIP or manual clone, install dependencies into that environment:
+ComfyUI Desktop paths vary by app version and installation. Find the
+`ComfyUI Base Folder Path` in the startup log and use the `.venv` inside that
+folder. If SDMLX was installed from a ZIP or manual clone, the general form is:
 
 ```bash
-~/Documents/ComfyUI/.venv/bin/pip3 install -r ~/Documents/ComfyUI/custom_nodes/SDMLX/requirements.txt
+COMFYUI_ROOT="/path/shown/as/ComfyUI Base Folder Path"
+"$COMFYUI_ROOT/.venv/bin/python3" -m pip install \
+  -r "$COMFYUI_ROOT/custom_nodes/SDMLX/requirements.txt"
 ```
 
 If the folder is named `SDMLX-main`, adjust the path accordingly.
+
+### Hugging Face access for gated models
+
+`huggingface_hub` is installed with SDMLX. Some official model repositories,
+including selected Black Forest Labs FLUX models, additionally require the
+repository terms to be accepted and a Hugging Face token to be available to
+the same Python environment that runs ComfyUI.
+
+After accepting the model terms on Hugging Face, set `COMFY_PYTHON` to
+ComfyUI's Python executable and run:
+
+```bash
+COMFY_PYTHON="/path/to/comfy/python3"
+"$COMFY_PYTHON" -c 'from getpass import getpass; from huggingface_hub import login; login(token=getpass("HF token: "), add_to_git_credential=False)'
+```
+
+The prompt keeps the token out of shell history and stores it only in the
+normal Hugging Face user cache. Git credentials, Xcode, and Apple developer
+tools are not required. Prebuilt `.sdmlx` packages that already contain their
+tokenizer and scheduler assets do not need this download step.
 
 ## Basic Usage
 

@@ -55,7 +55,7 @@ except ModuleNotFoundError as exc:
             "Install SDMLX on Apple Silicon with its package requirements."
         )
 
-SDMLX_VERSION = "0.1.21"
+SDMLX_VERSION = "0.1.22"
 SDMLX_CACHE_VERSION = "adapter-v7"
 
 if SDMLX_IMPORT_ERROR is None:
