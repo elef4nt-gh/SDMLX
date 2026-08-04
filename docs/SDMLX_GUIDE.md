@@ -219,15 +219,23 @@ The `control_type` names are simplified to describe the visual input:
 
 The node supports classic `start_percent` / `end_percent` behavior and can also accept an `SDMLX Scheduler` for curve-based strength changes.
 
+`repaint` expects a prepared RGB control image with the area to replace set to black. It does not read a Mask Editor alpha channel by itself. Use the original image and mask through `SDMLX Inpaint Conditioning`, and supply the separately prepared black-hole image as the ControlNet hint.
+
 ## Inpaint Conditioning
 
 `SDMLX Inpaint Conditioning` is the classic inpaint-style node. It takes image, mask, VAE and conditioning and returns conditioning plus latent data for the sampler.
 
 With `noise_mask` enabled, the original image and mask travel with the latent so the final decode replaces only masked pixels. Unmasked pixels stay identical to the input instead of passing through a lossy VAE roundtrip. For soft transitions, use a mask blur node before it. SDMLX includes a Gaussian blur mask node for that purpose.
 
+Images painted with Comfy's Mask Editor are handled as a source/mask pair. The intact companion image supplies RGB for VAE encode and the final pixel composite, while the painted file supplies the mask. This works automatically with `SDMLX LoadImage Scale`, `SDMLX Load Image Advanced`, and with a directly connected core `Load Image` whose image and mask outputs both feed `SDMLX Inpaint Conditioning`.
+
+If you insert image scaling, mask blur, or another node between loading and Inpaint Conditioning, use one of the SDMLX image loaders. They resolve the companion files before the image and mask take separate processing paths; automatic pairing of a core `Load Image` is intentionally limited to a direct dual connection.
+
 ## Inpaint Detailer
 
 `SDMLX Inpaint Detailer` is a compact mask-detail workflow in one node. It crops the masked area, optionally renders it at a larger working size, samples it, decodes it, then inserts the result through the original image mask. The surrounding crop provides model context but does not replace unmasked source pixels.
+
+The same Mask Editor source/mask pairing applies here. The intact companion image supplies the RGB structure for partial denoise, while the painted file supplies the mask.
 
 Important controls:
 
@@ -240,6 +248,8 @@ Important controls:
 - `crop_blend`: final feathering at the image-mask edge when inserting the result back.
 
 `soft_mask` and `soft_mask_strength` shape what the model is allowed to repaint during sampling. `crop_blend` affects only the final pixel-space composite; pixels outside that composite mask stay identical to the input image.
+
+`denoise=0.5` intentionally preserves substantial source structure. For a structural addition such as glasses, increase denoise when the model only refines the original eyes instead of creating the requested object.
 
 ## Hires Fix And Tiled Upscale
 

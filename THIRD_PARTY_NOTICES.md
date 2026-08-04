@@ -19,6 +19,7 @@ SDMLX Speed Patches are transformed LoRA/model factors mapped for the SDMLX MLX 
 | `lcm-lora-sdxl.sdmlxpatch` | `latent-consistency/lcm-lora-sdxl` | `openrail++` | The related code repository may use a different software license; the model weights are governed by the model-card license. |
 | `Hyper-SDXL-8steps-CFG-lora.sdmlxpatch` | `ByteDance/Hyper-SD` | CreativeML Open RAIL++-M / upstream model-card terms | OpenRAIL licenses include use-based restrictions. |
 | `Hyper-SDXL-12steps-CFG-lora.sdmlxpatch` | `ByteDance/Hyper-SD` | CreativeML Open RAIL++-M / upstream model-card terms | OpenRAIL licenses include use-based restrictions. |
+| `Hyper-Flux.1-Dev-4-step-Lora.sdmlxpatch` | [`Lingyuzhou/Hyper_Flux.1_Dev_4_step_Lora`](https://huggingface.co/Lingyuzhou/Hyper_Flux.1_Dev_4_step_Lora) | No substantive upstream license grant is documented: Hugging Face metadata says `license: 123` and the included `LICENSE` file is empty (checked 2026-08-04) | License status is unresolved. Do not assume redistribution or commercial-use rights; verify the upstream terms or obtain permission. Use is also subject to applicable FLUX.1 Dev terms. |
 | `Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.sdmlxpatch` | `lightx2v/Qwen-Image-Edit-2511-Lightning` | Check upstream model card before redistribution or commercial use | SDMLX treats this as a LoRA-backed acceleration patch for Qwen Image Edit 2511. |
 
 ## Optional Auto-Downloaded Models

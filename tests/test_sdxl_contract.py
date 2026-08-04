@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 import torch
+from PIL import Image
 from safetensors.torch import save_file
 
 from .. import nodes
@@ -126,6 +127,188 @@ class SDXLPackageAndFamilyTests(unittest.TestCase):
             manifest = {"package_format": "sdmlx-package-v3", "base_model_family": "qwen"}
             with self.assertRaisesRegex(RuntimeError, "incompatible model family"):
                 nodes._backfill_sdxl_manifest_family(str(package), manifest)
+
+
+class SDXLMaskEditorSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _write_mask_editor_pair(self, suffix="123.png"):
+        masked_path = self.root / f"clipspace-painted-masked-{suffix}"
+        painted_path = self.root / f"clipspace-painted-{suffix}"
+
+        masked = Image.new("RGBA", (4, 4), (255, 0, 0, 255))
+        alpha = Image.new("L", (4, 4), 255)
+        alpha.putpixel((1, 1), 0)
+        alpha.putpixel((2, 1), 0)
+        alpha.putpixel((1, 2), 0)
+        alpha.putpixel((2, 2), 0)
+        masked.putalpha(alpha)
+        masked.save(masked_path)
+        Image.new("RGB", (4, 4), (0, 0, 255)).save(painted_path)
+        return masked_path, painted_path
+
+    def test_resolves_existing_mask_editor_companion_only(self):
+        masked_path, painted_path = self._write_mask_editor_pair()
+        rgb_path, mask_path = nodes.resolve_comfy_mask_editor_sources(masked_path)
+        self.assertEqual(rgb_path, painted_path)
+        self.assertEqual(mask_path, masked_path)
+
+        ordinary = self.root / "ordinary.png"
+        Image.new("RGB", (4, 4), (1, 2, 3)).save(ordinary)
+        self.assertEqual(nodes.resolve_comfy_mask_editor_sources(ordinary), (ordinary, ordinary))
+
+        missing = self.root / "clipspace-painted-masked-missing.png"
+        Image.new("RGBA", (4, 4), (1, 2, 3, 255)).save(missing)
+        self.assertEqual(nodes.resolve_comfy_mask_editor_sources(missing), (missing, missing))
+
+    def test_loader_uses_companion_rgb_and_selected_alpha(self):
+        masked_path, _ = self._write_mask_editor_pair()
+        image, mask = nodes.load_comfy_image_rgb_and_mask(masked_path)
+
+        self.assertEqual(tuple(image.shape), (1, 4, 4, 3))
+        self.assertEqual(tuple(mask.shape), (1, 4, 4))
+        self.assertTrue(torch.equal(image[..., 0], torch.zeros((1, 4, 4))))
+        self.assertTrue(torch.equal(image[..., 1], torch.zeros((1, 4, 4))))
+        self.assertTrue(torch.equal(image[..., 2], torch.ones((1, 4, 4))))
+        self.assertEqual(float(mask[0, 1, 1]), 1.0)
+        self.assertEqual(float(mask[0, 0, 0]), 0.0)
+
+    def test_companion_content_participates_in_cache_digest(self):
+        masked_path, painted_path = self._write_mask_editor_pair()
+        before = nodes.comfy_image_source_digest(masked_path)
+        Image.new("RGB", (4, 4), (0, 255, 0)).save(painted_path)
+        after = nodes.comfy_image_source_digest(masked_path)
+        self.assertNotEqual(before, after)
+
+    def test_resolver_accepts_only_paired_direct_core_load_image(self):
+        prompt = {
+            "6": {
+                "class_type": "LoadImage",
+                "inputs": {"image": "clipspace-painted-masked-123.png [input]"},
+            },
+            "9": {
+                "class_type": "SDMLX_InpaintDetailer",
+                "inputs": {"image": ["6", 0], "mask": ["6", 1]},
+            },
+        }
+        self.assertEqual(
+            nodes.paired_mask_editor_image_selection(prompt, "9"),
+            "clipspace-painted-masked-123.png [input]",
+        )
+        prompt["13"] = {
+            "class_type": "SDMLX_InpaintConditioning",
+            "inputs": {"pixels": ["6", 0], "mask": ["6", 1]},
+        }
+        self.assertEqual(
+            nodes.paired_mask_editor_image_selection(
+                prompt,
+                "13",
+                image_input_name="pixels",
+            ),
+            "clipspace-painted-masked-123.png [input]",
+        )
+
+        prompt["9"]["inputs"]["mask"] = ["7", 0]
+        self.assertIsNone(nodes.paired_mask_editor_image_selection(prompt, "9"))
+        prompt["9"]["inputs"]["mask"] = ["6", 1]
+        prompt["6"]["class_type"] = "ImageScale"
+        self.assertIsNone(nodes.paired_mask_editor_image_selection(prompt, "9"))
+
+    def test_resolver_restores_companion_without_touching_ordinary_input(self):
+        masked_path, _ = self._write_mask_editor_pair()
+        prompt = {
+            "6": {
+                "class_type": "LoadImage",
+                "inputs": {"image": "clipspace-painted-masked-123.png [input]"},
+            },
+            "9": {
+                "class_type": "SDMLX_InpaintDetailer",
+                "inputs": {"image": ["6", 0], "mask": ["6", 1]},
+            },
+        }
+        broken = torch.zeros((1, 4, 4, 3), dtype=torch.float32)
+        broken[..., 0] = 1.0
+        restored, used_companion = nodes.restore_paired_mask_editor_source(
+            broken,
+            prompt,
+            "9",
+            path_resolver=lambda _selection: masked_path,
+        )
+        self.assertTrue(used_companion)
+        self.assertTrue(torch.equal(restored[..., 2], torch.ones((1, 4, 4))))
+
+        unchanged, used_companion = nodes.restore_paired_mask_editor_source(
+            broken,
+            None,
+            None,
+            path_resolver=lambda _selection: masked_path,
+        )
+        self.assertFalse(used_companion)
+        self.assertIs(unchanged, broken)
+
+    def test_detailer_declares_hidden_graph_inputs(self):
+        hidden = nodes.SDMLX_InpaintDetailer.INPUT_TYPES()["hidden"]
+        self.assertEqual(hidden, {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"})
+
+    def test_inpaint_conditioning_declares_hidden_graph_inputs(self):
+        hidden = nodes.SDMLX_InpaintConditioning.INPUT_TYPES()["hidden"]
+        self.assertEqual(hidden, {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"})
+
+    def test_inpaint_conditioning_uses_companion_rgb_for_encode_and_composite(self):
+        import folder_paths
+
+        masked_path, _ = self._write_mask_editor_pair()
+        prompt = {
+            "2": {
+                "class_type": "LoadImage",
+                "inputs": {"image": "clipspace-painted-masked-123.png [input]"},
+            },
+            "13": {
+                "class_type": "SDMLX_InpaintConditioning",
+                "inputs": {"pixels": ["2", 0], "mask": ["2", 1]},
+            },
+        }
+        broken = torch.zeros((1, 4, 4, 3), dtype=torch.float32)
+        broken[..., 0] = 1.0
+        mask = torch.ones((1, 4, 4), dtype=torch.float32)
+        latents = torch.zeros((1, 8, 8, 4), dtype=torch.float32)
+        conditioning = {"model_family": "sdxl"}
+        vae = {"model_family": "sdxl"}
+
+        with mock.patch.object(
+            folder_paths,
+            "get_annotated_filepath",
+            return_value=str(masked_path),
+        ), mock.patch.object(
+            nodes,
+            "encode_pixels_to_latents",
+            return_value=latents,
+        ) as encode_mock, mock.patch.object(
+            nodes,
+            "prepare_inpaint_mask",
+            return_value=torch.ones((1, 8, 8, 1), dtype=torch.float32),
+        ):
+            _, _, output = nodes.SDMLX_InpaintConditioning().encode(
+                conditioning,
+                conditioning,
+                broken,
+                vae,
+                mask,
+                noise_mask=True,
+                unique_id="13",
+                prompt=prompt,
+            )
+
+        encoded_pixels = encode_mock.call_args.args[1]
+        self.assertTrue(torch.equal(encoded_pixels[..., 0], torch.zeros((1, 64, 64))))
+        self.assertTrue(torch.equal(encoded_pixels[..., 1], torch.zeros((1, 64, 64))))
+        self.assertTrue(torch.equal(encoded_pixels[..., 2], torch.ones((1, 64, 64))))
+        self.assertTrue(torch.equal(output["sdmlx_inpaint_source_image"][..., 2], torch.ones((1, 4, 4))))
 
 
 class SDXLInpaintDetailerCompositeTests(unittest.TestCase):

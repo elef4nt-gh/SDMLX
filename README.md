@@ -205,11 +205,21 @@ SDMLX can use MLX-mapped Speed Patches derived from common SDXL speed LoRAs and 
 - LCM LoRA SDXL
 - Hyper-SD SDXL
 
+FLUX.1 Dev additionally supports the optional
+`Hyper-Flux.1-Dev-4-step-Lora.sdmlxpatch` acceleration package.
+
 The sampler can list downloaded patches directly. The Speed Patch Converter node remains available for users who want to convert supported local speed LoRAs themselves.
 
 Qwen Lightning LoRAs and merged Lightning checkpoints are supported in the Qwen paths. When a clean merged Lightning checkpoint is available, it is usually the simplest fast route; separate Lightning LoRAs also work but can cost a little extra runtime.
 
 Important: Speed Patches are model-derived assets. Their licenses are not replaced by the SDMLX code license. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+The upstream repository for the Hyper FLUX.1 Dev 4-step asset currently does
+not publish a substantive license grant: its Hugging Face metadata says
+`license: 123`, while the included `LICENSE` file is empty. SDMLX therefore
+does not represent that redistribution or commercial-use rights have been
+granted. Verify the upstream terms or obtain permission before relying on that
+asset beyond use allowed by applicable platform and FLUX.1 Dev terms.
 
 ## Spectrum Acceleration
 

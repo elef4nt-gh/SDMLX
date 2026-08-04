@@ -8439,6 +8439,171 @@ def precision_dtype(name):
 # --- NODES ---
 
 
+def resolve_comfy_mask_editor_sources(image_path):
+    mask_path = Path(image_path)
+    prefix = "clipspace-painted-masked-"
+    if not mask_path.name.startswith(prefix):
+        return mask_path, mask_path
+
+    companion_name = "clipspace-painted-" + mask_path.name[len(prefix):]
+    rgb_path = mask_path.with_name(companion_name)
+    if not rgb_path.is_file():
+        return mask_path, mask_path
+    return rgb_path, mask_path
+
+
+def load_comfy_image_rgb_and_mask(image_path):
+    import node_helpers
+    from PIL import ImageOps
+
+    rgb_path, mask_path = resolve_comfy_mask_editor_sources(image_path)
+    mask_image = node_helpers.pillow(Image.open, str(mask_path))
+    rgb_image = mask_image
+    if rgb_path != mask_path:
+        rgb_image = node_helpers.pillow(Image.open, str(rgb_path))
+
+    try:
+        mask_frame_count = int(getattr(mask_image, "n_frames", 1))
+        rgb_frame_count = int(getattr(rgb_image, "n_frames", 1))
+        if rgb_frame_count != mask_frame_count:
+            raise ValueError(
+                "SDMLX Load Image: Comfy Mask Editor RGB and mask files have "
+                f"different frame counts ({rgb_frame_count} vs {mask_frame_count})."
+            )
+
+        output_images = []
+        output_masks = []
+        width = None
+        height = None
+        for frame_index in range(mask_frame_count):
+            node_helpers.pillow(mask_image.seek, frame_index)
+            mask_frame = node_helpers.pillow(ImageOps.exif_transpose, mask_image.copy())
+            if rgb_image is mask_image:
+                rgb_frame = mask_frame
+            else:
+                node_helpers.pillow(rgb_image.seek, frame_index)
+                rgb_frame = node_helpers.pillow(ImageOps.exif_transpose, rgb_image.copy())
+
+            rgb = rgb_frame.convert("RGB")
+            if rgb.size != mask_frame.size:
+                raise ValueError(
+                    "SDMLX Load Image: Comfy Mask Editor RGB and mask files have "
+                    f"different dimensions ({rgb.size} vs {mask_frame.size})."
+                )
+            if width is None:
+                width, height = rgb.size
+            if rgb.size != (width, height):
+                continue
+
+            image_np = np.array(rgb).astype(np.float32) / 255.0
+            image_tensor = torch.from_numpy(image_np)[None,]
+            if "A" in mask_frame.getbands():
+                mask_np = np.array(mask_frame.getchannel("A")).astype(np.float32) / 255.0
+                mask_tensor = 1.0 - torch.from_numpy(mask_np)
+            else:
+                mask_tensor = torch.zeros((height, width), dtype=torch.float32, device="cpu")
+
+            output_images.append(image_tensor)
+            output_masks.append(mask_tensor.unsqueeze(0))
+    finally:
+        if rgb_image is not mask_image:
+            rgb_image.close()
+        mask_image.close()
+
+    if not output_images:
+        raise ValueError(f"SDMLX Load Image: no readable image frames in {mask_path}")
+    return torch.cat(output_images, dim=0), torch.cat(output_masks, dim=0)
+
+
+def comfy_image_source_digest(image_path):
+    rgb_path, mask_path = resolve_comfy_mask_editor_sources(image_path)
+    paths = [mask_path]
+    if rgb_path != mask_path:
+        paths.append(rgb_path)
+    digest = hashlib.sha256()
+    for path in paths:
+        with open(path, "rb") as handle:
+            digest.update(handle.read())
+    return digest.hexdigest()
+
+
+def _prompt_node(prompt, node_id):
+    if not isinstance(prompt, dict) or node_id is None:
+        return None
+    node = prompt.get(str(node_id))
+    if node is None:
+        node = prompt.get(node_id)
+    return node if isinstance(node, dict) else None
+
+
+def paired_mask_editor_image_selection(
+    prompt,
+    unique_id,
+    image_input_name="image",
+    mask_input_name="mask",
+):
+    consumer_node = _prompt_node(prompt, unique_id)
+    if consumer_node is None:
+        return None
+    inputs = consumer_node.get("inputs")
+    if not isinstance(inputs, dict):
+        return None
+    image_link = inputs.get(image_input_name)
+    mask_link = inputs.get(mask_input_name)
+    if not (
+        isinstance(image_link, (list, tuple))
+        and len(image_link) >= 2
+        and isinstance(mask_link, (list, tuple))
+        and len(mask_link) >= 2
+        and str(image_link[0]) == str(mask_link[0])
+        and int(image_link[1]) == 0
+        and int(mask_link[1]) == 1
+    ):
+        return None
+
+    source_node = _prompt_node(prompt, image_link[0])
+    if source_node is None or source_node.get("class_type") != "LoadImage":
+        return None
+    source_inputs = source_node.get("inputs")
+    if not isinstance(source_inputs, dict):
+        return None
+    selection = source_inputs.get("image")
+    return selection if isinstance(selection, str) else None
+
+
+def restore_paired_mask_editor_source(
+    image,
+    prompt,
+    unique_id,
+    image_input_name="image",
+    mask_input_name="mask",
+    path_resolver=None,
+):
+    selection = paired_mask_editor_image_selection(
+        prompt,
+        unique_id,
+        image_input_name=image_input_name,
+        mask_input_name=mask_input_name,
+    )
+    if selection is None:
+        return image, False
+    if path_resolver is None:
+        import folder_paths
+
+        path_resolver = folder_paths.get_annotated_filepath
+    selected_path = Path(path_resolver(selection))
+    rgb_path, mask_path = resolve_comfy_mask_editor_sources(selected_path)
+    if rgb_path == mask_path:
+        return image, False
+
+    restored, _ = load_comfy_image_rgb_and_mask(selected_path)
+    if tuple(restored.shape) != tuple(image.shape):
+        return image, False
+    if torch.is_tensor(image):
+        restored = restored.to(device=image.device, dtype=image.dtype)
+    return restored, True
+
+
 class SDMLX_LoadImageAdvanced:
     upscale_methods = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"]
     scale_modes = ["original", "megapixels", "max_side", "fixed", "scale_by"]
@@ -8527,43 +8692,13 @@ class SDMLX_LoadImageAdvanced:
     def _load_like_comfy(image):
         import comfy.model_management
         import folder_paths
-        import node_helpers
-        from PIL import ImageOps, ImageSequence
 
         image_path = folder_paths.get_annotated_filepath(image)
         dtype = comfy.model_management.intermediate_dtype()
         device = comfy.model_management.intermediate_device()
-
-        img = node_helpers.pillow(Image.open, image_path)
-        output_images = []
-        output_masks = []
-        w, h = None, None
-
-        for frame in ImageSequence.Iterator(img):
-            frame = node_helpers.pillow(ImageOps.exif_transpose, frame)
-            rgb = frame.convert("RGB")
-
-            if len(output_images) == 0:
-                w, h = rgb.size
-            if rgb.size[0] != w or rgb.size[1] != h:
-                continue
-
-            image_np = np.array(rgb).astype(np.float32) / 255.0
-            image_tensor = torch.from_numpy(image_np)[None,]
-            if "A" in frame.getbands():
-                mask_np = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
-                mask_tensor = 1.0 - torch.from_numpy(mask_np)
-            else:
-                mask_tensor = torch.zeros((h, w), dtype=torch.float32, device="cpu")
-
-            output_images.append(image_tensor.to(dtype=dtype))
-            output_masks.append(mask_tensor.unsqueeze(0).to(dtype=dtype))
-
-        if not output_images:
-            raise ValueError(f"SDMLX Load Image Advanced: no readable image frames in {image_path}")
-
-        output_image = torch.cat(output_images, dim=0).to(device=device, dtype=dtype)
-        output_mask = torch.cat(output_masks, dim=0).to(device=device, dtype=dtype)
+        output_image, output_mask = load_comfy_image_rgb_and_mask(image_path)
+        output_image = output_image.to(device=device, dtype=dtype)
+        output_mask = output_mask.to(device=device, dtype=dtype)
         return output_image, output_mask
 
     @staticmethod
@@ -8634,8 +8769,7 @@ class SDMLX_LoadImageAdvanced:
 
         image_path = folder_paths.get_annotated_filepath(image)
         m = hashlib.sha256()
-        with open(image_path, "rb") as f:
-            m.update(f.read())
+        m.update(comfy_image_source_digest(image_path).encode("ascii"))
         params = json.dumps({
             "scale_mode": scale_mode,
             "upscale_method": upscale_method,
@@ -10474,6 +10608,9 @@ class SDMLX_InpaintConditioning:
             "mlx_vae": ("mlx_vae",),
             "mask": ("MASK",),
             "noise_mask": ("BOOLEAN", {"default": True}),
+        }, "hidden": {
+            "unique_id": "UNIQUE_ID",
+            "prompt": "PROMPT",
         }}
 
     RETURN_TYPES = ("mlx_conditioning", "mlx_conditioning", "LATENT")
@@ -10489,6 +10626,8 @@ class SDMLX_InpaintConditioning:
         mlx_vae,
         mask,
         noise_mask=True,
+        unique_id=None,
+        prompt=None,
     ):
         start_time = time.perf_counter()
         require_sdmlx_family(
@@ -10512,6 +10651,12 @@ class SDMLX_InpaintConditioning:
             raise ValueError(
                 f"SDMLX Inpaint Conditioning: IMAGE must be [B,H,W,3], got {tuple(source_pixels.shape)}."
             )
+        source_pixels, _ = restore_paired_mask_editor_source(
+            source_pixels,
+            prompt,
+            unique_id,
+            image_input_name="pixels",
+        )
         source_pixels = torch.clamp(source_pixels, 0.0, 1.0).contiguous()
         pixel_shape = tuple(source_pixels.shape)
         pixel_height = int(source_pixels.shape[1])
@@ -10743,6 +10888,9 @@ class SDMLX_InpaintDetailer:
         }, "optional": {
             "speed_patch_input": ("sdmlx_speed_patch",),
             "spectrum_acceleration_advanced": ("sdmlx_spectrum_acceleration",),
+        }, "hidden": {
+            "unique_id": "UNIQUE_ID",
+            "prompt": "PROMPT",
         }}
 
     RETURN_TYPES = ("IMAGE",)
@@ -10780,6 +10928,8 @@ class SDMLX_InpaintDetailer:
         preview,
         speed_patch_input=None,
         spectrum_acceleration_advanced=None,
+        unique_id=None,
+        prompt=None,
     ):
         global TIMING_LOGS_ENABLED
         TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
@@ -10800,6 +10950,11 @@ class SDMLX_InpaintDetailer:
         image_t = image.detach().cpu().float() if hasattr(image, "detach") else torch.from_numpy(get_numpy_array(image).astype(np.float32))
         if image_t.ndim != 4 or image_t.shape[-1] != 3:
             raise ValueError(f"SDMLX Inpaint Detailer: IMAGE must be [B,H,W,3], got {tuple(image_t.shape)}.")
+        image_t, _ = restore_paired_mask_editor_source(
+            image_t,
+            prompt,
+            unique_id,
+        )
         height = int(image_t.shape[1])
         width = int(image_t.shape[2])
         mask_chw = mask_to_chw(mask, height, width)
