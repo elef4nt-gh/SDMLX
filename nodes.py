@@ -6375,11 +6375,11 @@ def controlnet_residuals_for_step(
     return down_sum, mid_sum
 
 
-def get_step_denoiser(cache_key, unet, compute_dtype, use_cfg, use_compiled):
+def get_step_denoiser(cache_key, unet, compute_dtype, use_cfg, use_compiled, seq_len=None):
     if not use_compiled:
         return None
 
-    key = (cache_key, "step_denoise", compute_dtype, bool(use_cfg))
+    key = (cache_key, "step_denoise", compute_dtype, bool(use_cfg), seq_len)
     if key not in COMPILED_STEP_DENOISERS:
         dtype = precision_dtype(compute_dtype)
 
@@ -7461,25 +7461,44 @@ def sample_latents(
                 "SDMLX: Note: FaceID Portrait uses non-linear weight type(s) "
                 f"({', '.join(non_linear_weight_types)}). Linear is the most stable starting point."
             )
+    cfg_two_pass = False
+    pos_cond = pos_pooled = neg_cond = neg_pooled = None
     if use_cfg:
         pos_cond, neg_cond = positive["cond"], negative["cond"]
         if pos_cond.shape[1] != neg_cond.shape[1]:
-            # Independent CLIPTextEncode calls for positive/negative can land on a different
-            # chunk count each (see pad_cond_sequence_to_length) -- reconcile before batching.
-            target_len = max(pos_cond.shape[1], neg_cond.shape[1])
-            pos_cond = pad_cond_sequence_to_length(pos_cond, target_len)
-            neg_cond = pad_cond_sequence_to_length(neg_cond, target_len)
-        context = mx.concatenate([pos_cond, neg_cond], axis=0)
-        pooled = mx.concatenate([positive["pooled"], negative["pooled"]], axis=0)
-        t_ids = mx.concatenate([time_id] * 2, axis=0)
+            if ip_adapters or controlnets or profile_unet:
+                # IP-Adapter/ControlNet/profiling all assume a single batched pos+neg UNet
+                # call; padding by repeating the shorter sequence's last chunk keeps that
+                # working, at the cost of over-representing whatever real prompt content ends
+                # up in the repeated chunk (see the "fully dressed" investigation).
+                target_len = max(pos_cond.shape[1], neg_cond.shape[1])
+                pos_cond = pad_cond_sequence_to_length(pos_cond, target_len)
+                neg_cond = pad_cond_sequence_to_length(neg_cond, target_len)
+            else:
+                # ComfyUI parity: run positive and negative as two independent UNet calls
+                # instead of forcing them into one batch, so neither prompt gets padded with
+                # repeated content that would otherwise dominate the result.
+                cfg_two_pass = True
+                pos_pooled, neg_pooled = positive["pooled"], negative["pooled"]
+        if not cfg_two_pass:
+            context = mx.concatenate([pos_cond, neg_cond], axis=0)
+            pooled = mx.concatenate([positive["pooled"], negative["pooled"]], axis=0)
+            t_ids = mx.concatenate([time_id] * 2, axis=0)
     else:
         context = positive["cond"]
         pooled = positive["pooled"]
         t_ids = time_id
 
-    context = context.astype(dtype)
-    pooled = pooled.astype(dtype)
-    t_ids = t_ids.astype(dtype)
+    if cfg_two_pass:
+        pos_cond = pos_cond.astype(dtype)
+        neg_cond = neg_cond.astype(dtype)
+        pos_pooled = pos_pooled.astype(dtype)
+        neg_pooled = neg_pooled.astype(dtype)
+        t_ids = time_id.astype(dtype)
+    else:
+        context = context.astype(dtype)
+        pooled = pooled.astype(dtype)
+        t_ids = t_ids.astype(dtype)
     cfg_value = mx.array(cfg, dtype=mx.float32)
     denoise = max(0.0, min(1.0, float(denoise)))
     advanced_step_range = start_at_step is not None or end_at_step is not None
@@ -7522,14 +7541,31 @@ def sample_latents(
             2 if use_cfg else 1,
             dtype,
         )
-    mx.eval(context, pooled, t_ids)
-    step_denoiser = get_step_denoiser(
-        denoiser_key,
-        unet,
-        compute_dtype,
-        use_cfg,
-        effective_compile_step,
-    )
+    step_denoiser_pos = step_denoiser_neg = None
+    if cfg_two_pass:
+        mx.eval(pos_cond, neg_cond, pos_pooled, neg_pooled, t_ids)
+        log_timing(
+            "SDMLX: CFG mismatch: positive/negative conditioning lengths differ "
+            f"({pos_cond.shape[1]} vs {neg_cond.shape[1]} tokens) -- running two independent "
+            "UNet passes per step instead of padding either prompt with repeated content."
+        )
+        step_denoiser_pos = get_step_denoiser(
+            denoiser_key, unet, compute_dtype, False, effective_compile_step, seq_len=pos_cond.shape[1]
+        )
+        step_denoiser_neg = get_step_denoiser(
+            denoiser_key, unet, compute_dtype, False, effective_compile_step, seq_len=neg_cond.shape[1]
+        )
+        step_denoiser = None
+    else:
+        mx.eval(context, pooled, t_ids)
+        step_denoiser = get_step_denoiser(
+            denoiser_key,
+            unet,
+            compute_dtype,
+            use_cfg,
+            effective_compile_step,
+            seq_len=context.shape[1],
+        )
     ip_adapter_kv_layers = 0
     if ip_adapters:
         patched = ensure_unet_ipadapter_wrapped(unet)
@@ -7659,7 +7695,10 @@ def sample_latents(
                 f"(strength={differential_mask_strength:g})."
             )
 
-    guard_supported = use_cfg and not dynamic_step_context and not profile_unet and not controlnets and mask is None
+    guard_supported = (
+        use_cfg and not dynamic_step_context and not profile_unet and not controlnets
+        and mask is None and not cfg_two_pass
+    )
     guard_auto_supported = guard_supported and not conditioning_texts_identical(positive, negative)
     diagnostic_metrics = None
     guard_first_noise_pred = None
@@ -7698,6 +7737,8 @@ def sample_latents(
                 reasons.append("ControlNet")
             if mask is not None:
                 reasons.append("inpaint mask")
+            if cfg_two_pass:
+                reasons.append("CFG two-pass (pos/neg length mismatch)")
             print(f"SDMLX Conditioning Diagnostics: skipped ({', '.join(reasons) or 'unsupported path'}).")
     if guard_auto_supported:
         guard_key = (
@@ -7736,6 +7777,24 @@ def sample_latents(
                 SDMLX_IPADAPTER_CONTEXT["use_cfg"] = use_cfg
             if scheduled_loras:
                 SDMLX_LORA_CONTEXT["step_percent"] = step_percent
+        if cfg_two_pass:
+            if step_denoiser_pos is not None:
+                eps_pos = step_denoiser_pos(latents_in, timestep, pos_cond, pos_pooled, t_ids, cfg_value)
+                eps_neg = step_denoiser_neg(latents_in, timestep, neg_cond, neg_pooled, t_ids, cfg_value)
+            else:
+                x_model_single = latents_in.astype(dtype) if compute_dtype == "float16" else latents_in
+                t_in_single = mx.broadcast_to(timestep, [len(latents_in)])
+                eps_pos = unet(
+                    x_model_single, timestep=t_in_single, encoder_x=pos_cond, text_time=(pos_pooled, t_ids)
+                ).astype(mx.float32)
+                eps_neg = unet(
+                    x_model_single, timestep=t_in_single, encoder_x=neg_cond, text_time=(neg_pooled, t_ids)
+                ).astype(mx.float32)
+            noise_pred_two_pass = eps_neg + cfg_value * (eps_pos - eps_neg)
+            if nan_diagnostics:
+                warn_if_nonfinite_mx_array("UNet noise prediction", noise_pred_two_pass)
+                warn_if_nonfinite_mx_array("CFG noise prediction", noise_pred_two_pass)
+            return noise_pred_two_pass
         if step_denoiser is not None and not step_has_control:
             return step_denoiser(latents_in, timestep, context, pooled, t_ids, cfg_value)
 
