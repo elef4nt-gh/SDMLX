@@ -566,7 +566,14 @@ def sample_latents_spectrum(
     time_id = mx.array([time_id_values])
     use_cfg = cfg > 1.0 and not force_no_cfg
     if use_cfg:
-        context = mx.concatenate([positive["cond"], negative["cond"]], axis=0)
+        pos_cond, neg_cond = positive["cond"], negative["cond"]
+        if pos_cond.shape[1] != neg_cond.shape[1]:
+            # Independent CLIPTextEncode calls for positive/negative can land on a different
+            # chunk count each -- reconcile before batching (see core.pad_cond_sequence_to_length).
+            target_len = max(pos_cond.shape[1], neg_cond.shape[1])
+            pos_cond = core.pad_cond_sequence_to_length(pos_cond, target_len)
+            neg_cond = core.pad_cond_sequence_to_length(neg_cond, target_len)
+        context = mx.concatenate([pos_cond, neg_cond], axis=0)
         pooled = mx.concatenate([positive["pooled"], negative["pooled"]], axis=0)
         t_ids = mx.concatenate([time_id] * 2, axis=0)
     else:
@@ -1144,7 +1151,7 @@ def sample_latents_spectrum(
                 mx.eval(noise_pred)
 
             denoised_latents = None
-            if mask is not None or preview or sampler_name == "dpmpp_2m":
+            if mask is not None or preview or sampler_name in ("dpmpp_2m", "dpmpp_2m_sde"):
                 denoised_latents = core.denoised_latents_estimate(latents, noise_pred, step_scale, step_sigma)
             if mask is not None:
                 denoised_latents = denoised_latents * step_mask + initial_latents * (1.0 - step_mask)
@@ -1165,6 +1172,17 @@ def sample_latents_spectrum(
                 latents = core.heun_sampler_step(latents, noise_pred, step_sigma, next_sigma, denoise_next)
             elif sampler_name == "dpmpp_2m":
                 latents = core.dpmpp_2m_sampler_step(
+                    latents,
+                    denoised_latents,
+                    old_dpmpp_denoised,
+                    step_sigma,
+                    next_sigma,
+                    old_dpmpp_sigma,
+                )
+                old_dpmpp_denoised = denoised_latents
+                old_dpmpp_sigma = core.mx_scalar_float(step_sigma)
+            elif sampler_name == "dpmpp_2m_sde":
+                latents = core.dpmpp_2m_sde_sampler_step(
                     latents,
                     denoised_latents,
                     old_dpmpp_denoised,

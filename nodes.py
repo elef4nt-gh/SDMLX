@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+from .mlx_sd.prompt_weighting import tokenize_with_weights, tokenize_with_weights_chunks
+
 SDMLX_IMPORT_ERROR = None
 
 try:
@@ -115,6 +117,7 @@ MODEL_CACHE_META = {}
 TOKENIZER_CACHE = {}
 CONDITIONING_CACHE = {}
 CONDITIONING_GUARD_CACHE = {}
+EMPTY_CONDITIONING_CACHE = {}
 COMPILED_STEP_DENOISERS = {}
 COMPILED_VAE_DECODERS = {}
 INPAINT_DETAILER_PREP_CACHE = {}
@@ -152,6 +155,7 @@ SDMLX_CONDITIONING_DIAGNOSTICS = SDMLX_CONDITIONING_DIAGNOSTICS_MODE in {
     "full",
     "all",
 }
+SDMLX_EMPHASIS_DIAGNOSTICS = sdmlx_env_flag("SDMLX_EMPHASIS_DIAGNOSTICS")
 SDMLX_SAFE_MODE = sdmlx_env_flag("SDMLX_SAFE_MODE")
 SDMLX_DISABLE_STEP_COMPILE = SDMLX_SAFE_MODE or sdmlx_env_flag("SDMLX_DISABLE_STEP_COMPILE")
 SDMLX_DISABLE_FAST_ATTENTION = SDMLX_SAFE_MODE or sdmlx_env_flag("SDMLX_DISABLE_FAST_ATTENTION")
@@ -159,7 +163,7 @@ SDMLX_CONDITIONING_GUARD = not sdmlx_env_flag("SDMLX_DISABLE_CONDITIONING_GUARD"
 SDMLX_NAN_DIAGNOSTICS = sdmlx_env_flag("SDMLX_NAN_DIAGNOSTICS")
 SDMLX_CONDITIONING_DIAGNOSTICS_HEADER_PRINTED = False
 TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
-CONDITIONING_CACHE_VERSION = "shared-tokenizer-v2"
+CONDITIONING_CACHE_VERSION = "prompt-weights-v4"
 MEMORY_CACHE_POLICY = {
     "mode": "balanced",
     "reserve_gb": None,
@@ -190,7 +194,7 @@ SDXL_SIZE_PRESETS = [
 ]
 SIZE_PRESETS = ["Custom"] + SDXL_SIZE_PRESETS
 SCHEDULERS = ["normal", "karras", "exponential", "sgm_uniform", "simple"]
-SAMPLERS = ["euler", "euler_ancestral", "heun", "dpmpp_2m", "lcm"]
+SAMPLERS = ["euler", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "lcm"]
 TILED_UPSCALE_SCALE_OPTIONS = ["1.5x", "2x", "3x", "4x", "custom"]
 MASK_DETAILER_SCALE_OPTIONS = ["1.5x", "2x", "3x", "4x"]
 HIRES_RESIZE_METHODS = ["lanczos", "bicubic", "bilinear"]
@@ -5588,6 +5592,9 @@ def evict_model_cache_key(key):
     MODEL_CACHE.pop(key, None)
     if meta.get("kind") == "unet" and isinstance(key, tuple) and key:
         clear_compiled_step_denoisers_for_source(key[0])
+    if meta.get("kind") == "clip" and isinstance(key, tuple) and key:
+        for empty_key in [k for k in EMPTY_CONDITIONING_CACHE if k[0] == key[0]]:
+            EMPTY_CONDITIONING_CACHE.pop(empty_key, None)
     release_mlx_cache_memory()
     return meta
 
@@ -6125,7 +6132,7 @@ def scheduler_step_plan(sampler, steps, scheduler_name, sampler_name):
             dt = -sigma
             noise_scale = sigma_prev
             out_scale = 1.0 / math.sqrt(sigma_prev2 + 1.0)
-        elif sampler_name in ("euler", "heun", "dpmpp_2m"):
+        elif sampler_name in ("euler", "heun", "dpmpp_2m", "dpmpp_2m_sde"):
             scale = math.sqrt(sigma2 + 1.0)
             dt = sigma_prev - sigma
             noise_scale = 0.0
@@ -6260,6 +6267,45 @@ def dpmpp_2m_sampler_step(latents, denoised, old_denoised, sigma, sigma_next, ol
     return normalized_latents(next_unscaled, sigma_next)
 
 
+def dpmpp_2m_sde_sampler_step(latents, denoised, old_denoised, sigma, sigma_next, old_sigma, eta=1.0, s_noise=1.0):
+    """DPM-Solver++(2M) SDE, midpoint variant -- the same reference algorithm ComfyUI's own
+    "dpmpp_2m_sde" sampler uses. Like `dpmpp_2m_sampler_step`, this is a linear multistep
+    method (it reuses the previous step's `denoised` estimate for a second-order correction),
+    but replaces the deterministic ODE step with an exponential-integrator SDE step that
+    injects fresh per-step noise -- the stochastic counterpart to `dpmpp_2m`, similar in spirit
+    to how `SimpleEulerAncestralSampler` adds per-step noise on top of the deterministic Euler
+    step. Noise is drawn directly per step rather than through a seeded Brownian-bridge sampler,
+    so -- like this project's existing `euler_ancestral` -- results are deterministic for a
+    given seed but won't bit-match stock ComfyUI's own dpmpp_2m_sde output for the same seed.
+    """
+    sigma_value = max(mx_scalar_float(sigma), 1e-12)
+    sigma_next_value = max(mx_scalar_float(sigma_next), 0.0)
+    if sigma_next_value <= 0.0:
+        return normalized_latents(denoised, sigma_next)
+
+    h = max(math.log(sigma_value / sigma_next_value), 1e-12)
+    eta_h = eta * h
+    decay_weight = math.exp(-eta_h)
+    denoised_weight = -math.expm1(-h - eta_h)
+
+    latents_unscaled = unscaled_latents(latents, sigma)
+    next_unscaled = (sigma_next_value / sigma_value) * decay_weight * latents_unscaled + denoised_weight * denoised
+
+    if old_denoised is not None and old_sigma is not None:
+        old_sigma_value = max(float(old_sigma), sigma_value + 1e-12)
+        h_last = max(math.log(old_sigma_value / sigma_value), 1e-12)
+        r = h_last / h
+        next_unscaled = next_unscaled + 0.5 * denoised_weight * (1.0 / r) * (denoised - old_denoised)
+
+    if eta > 0.0:
+        noise_variance = max(-math.expm1(-2.0 * eta_h), 0.0)
+        if noise_variance > 0.0:
+            noise = mx.random.normal(latents.shape).astype(latents.dtype)
+            next_unscaled = next_unscaled + noise * (sigma_next_value * math.sqrt(noise_variance) * s_noise)
+
+    return normalized_latents(next_unscaled, sigma_next)
+
+
 def noise_latents_at_sigma(latents, noise, sigma):
     sigma2 = sigma * sigma
     return (latents + noise * sigma) * mx.rsqrt(sigma2 + 1.0)
@@ -6329,11 +6375,11 @@ def controlnet_residuals_for_step(
     return down_sum, mid_sum
 
 
-def get_step_denoiser(cache_key, unet, compute_dtype, use_cfg, use_compiled):
+def get_step_denoiser(cache_key, unet, compute_dtype, use_cfg, use_compiled, seq_len=None):
     if not use_compiled:
         return None
 
-    key = (cache_key, "step_denoise", compute_dtype, bool(use_cfg))
+    key = (cache_key, "step_denoise", compute_dtype, bool(use_cfg), seq_len)
     if key not in COMPILED_STEP_DENOISERS:
         dtype = precision_dtype(compute_dtype)
 
@@ -6926,43 +6972,145 @@ def profiled_unet_forward(unet, x, timestep, encoder_x, pooled, time_ids, profil
     return timed_eval("out", finish, profile, "out")
 
 
+def _select_conditioning_layer(output, use_last_layer):
+    if use_last_layer:
+        return output.last_hidden_state
+    if output.hidden_states and len(output.hidden_states) >= 2:
+        return output.hidden_states[-2]
+    return output.last_hidden_state
+
+
+def _blend_toward_empty(hidden, weight_rows, empty, label=""):
+    """Blend `hidden` toward/away from `empty` per-token by `weight_rows` (a list of
+    per-sequence python weight lists, one row per batch item). Skips the blend entirely
+    when every weight is 1.0 so plain unweighted prompts stay bit-identical -- the blend
+    is a no-op in exact arithmetic but not under fp16 rounding."""
+    flat = [w for row in weight_rows for w in row]
+    non_unity = [w for w in flat if w != 1.0]
+    if not non_unity:
+        if SDMLX_EMPHASIS_DIAGNOSTICS:
+            print(f"SDMLX Emphasis Diagnostics [{label}]: all weights == 1.0, blend skipped.")
+        return hidden
+    weights = mx.array(weight_rows, dtype=mx.float32)[:, :, None]
+    blended = (empty + weights * (hidden - empty)).astype(hidden.dtype)
+    if SDMLX_EMPHASIS_DIAGNOSTICS:
+        delta_norm = mlx_rms(blended.astype(mx.float32) - hidden.astype(mx.float32))
+        hidden_norm = mlx_rms(hidden.astype(mx.float32))
+        mx.eval(delta_norm, hidden_norm)
+        print(
+            f"SDMLX Emphasis Diagnostics [{label}]: {len(non_unity)}/{len(flat)} tokens weighted "
+            f"(min={min(non_unity):.3f}, max={max(non_unity):.3f}), "
+            f"blend_delta_rms={mlx_scalar_float(delta_norm):.6f}, hidden_rms={mlx_scalar_float(hidden_norm):.6f}"
+        )
+    return blended
+
+
+def get_empty_conditioning_hidden(cache_key, clip_model, tokenizer, is_g, use_last_layer):
+    """The encoding of an empty prompt through `clip_model`, at the same layer used for
+    conditioning. This is the baseline that emphasis-weighted token embeddings are blended
+    toward/away from in `SDMLX_CLIPTextEncode.encode`, matching ComfyUI's default emphasis
+    behavior."""
+    key = (
+        cache_key,
+        "clip_g" if is_g else "clip_l",
+        "last" if use_last_layer else "penultimate",
+    )
+    cached = EMPTY_CONDITIONING_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ids, _weights = tokenize_with_weights(tokenizer, "")
+    tokens = mx.array([ids])
+    output = clip_model(tokens)
+    hidden = _select_conditioning_layer(output, use_last_layer)
+    mx.eval(hidden)
+    EMPTY_CONDITIONING_CACHE[key] = hidden
+    return hidden
+
+
+def pad_cond_sequence_to_length(cond, target_len, chunk_size=77):
+    """Pad a (1, seq, dim) conditioning tensor up to `target_len` along the sequence axis by
+    repeating its own final chunk_size-token chunk as many times as needed. Used when positive
+    and negative conditioning were produced by two independent CLIPTextEncode calls (so neither
+    knew the other's length) and ended up with a different number of 77-token chunks -- SDMLX
+    batches positive+negative into one UNet forward call, which requires matching sequence
+    lengths. Repeating the sequence's own last chunk keeps the padding in-distribution (real
+    CLIP output, not zeros) without needing tokenizer/CLIP access at this point in the pipeline.
+    """
+    current_len = cond.shape[1]
+    if current_len >= target_len:
+        return cond
+    last_chunk = cond[:, -chunk_size:, :]
+    pad_chunks = []
+    remaining = target_len - current_len
+    while remaining > 0:
+        take = min(chunk_size, remaining)
+        pad_chunks.append(last_chunk[:, :take, :])
+        remaining -= take
+    return mx.concatenate([cond] + pad_chunks, axis=1)
+
+
 def encode_text_pair(mlx_clip, positive_text, negative_text, conditioning_mode="normal"):
     cache_key = (CONDITIONING_CACHE_VERSION, mlx_clip["cache_key"], positive_text, negative_text, conditioning_mode)
     if cache_key in CONDITIONING_CACHE:
         pos, neg = CONDITIONING_CACHE[cache_key]
         log_timing("SDMLX: Text pair loaded from RAM cache.")
+        if SDMLX_EMPHASIS_DIAGNOSTICS:
+            print(f"SDMLX Emphasis Diagnostics [cache]: HIT (positive_text len={len(positive_text)})")
         return pos, neg
+    if SDMLX_EMPHASIS_DIAGNOSTICS:
+        print(f"SDMLX Emphasis Diagnostics [cache]: MISS, computing fresh (positive_text len={len(positive_text)})")
 
     clip_l = get_clip_model(mlx_clip["cache_key"], mlx_clip["clip_l"], is_g=False)
     clip_g = get_clip_model(mlx_clip["cache_key"], mlx_clip["clip_g"], is_g=True)
     tokenizer_l = get_clip_l_tokenizer()
     tokenizer_g = get_clip_g_tokenizer()
-    tokens_l = mx.array(
-        tokenizer_l(
-            [positive_text, negative_text],
-            padding="max_length",
-            max_length=77,
-            truncation=True,
-            return_tensors="np",
-        )["input_ids"]
-    )
-    tokens_g = mx.array(
-        tokenizer_g(
-            [positive_text, negative_text],
-            padding="max_length",
-            max_length=77,
-            truncation=True,
-            return_tensors="np",
-        )["input_ids"]
-    )
+    use_last_g = conditioning_mode == "clip_g_last"
 
-    output_l = clip_l(tokens_l)
-    output_g = clip_g(tokens_g)
-    hidden_l = output_l.hidden_states[-2] if output_l.hidden_states and len(output_l.hidden_states) >= 2 else output_l.last_hidden_state
-    if conditioning_mode == "clip_g_last":
-        hidden_g = output_g.last_hidden_state
-    else:
-        hidden_g = output_g.hidden_states[-2] if output_g.hidden_states and len(output_g.hidden_states) >= 2 else output_g.last_hidden_state
+    # Prompts longer than one 77-token CLIP window are split into multiple windows here
+    # (matching ComfyUI's own handling of long prompts) rather than silently truncated.
+    # Positive and negative are padded to the same chunk count with empty (all-pad) chunks
+    # so they can still be batched together into one CLIP forward call per chunk.
+    chunks_l_pos = tokenize_with_weights_chunks(tokenizer_l, positive_text)
+    chunks_l_neg = tokenize_with_weights_chunks(tokenizer_l, negative_text)
+    chunks_g_pos = tokenize_with_weights_chunks(tokenizer_g, positive_text)
+    chunks_g_neg = tokenize_with_weights_chunks(tokenizer_g, negative_text)
+    num_chunks = max(len(chunks_l_pos), len(chunks_l_neg), len(chunks_g_pos), len(chunks_g_neg))
+    empty_chunk_l = tokenize_with_weights_chunks(tokenizer_l, "")[0]
+    empty_chunk_g = tokenize_with_weights_chunks(tokenizer_g, "")[0]
+    chunks_l_pos += [empty_chunk_l] * (num_chunks - len(chunks_l_pos))
+    chunks_l_neg += [empty_chunk_l] * (num_chunks - len(chunks_l_neg))
+    chunks_g_pos += [empty_chunk_g] * (num_chunks - len(chunks_g_pos))
+    chunks_g_neg += [empty_chunk_g] * (num_chunks - len(chunks_g_neg))
+
+    # Emphasis syntax -- (text:weight)/(text)/[text] -- blends each token's contextualized
+    # embedding toward/away from its embedding in an unweighted ("empty prompt") encoding,
+    # by that token's weight. Unweighted tokens have weight 1.0, which is a no-op here.
+    empty_l = get_empty_conditioning_hidden(mlx_clip["cache_key"], clip_l, tokenizer_l, is_g=False, use_last_layer=False)
+    empty_g = get_empty_conditioning_hidden(mlx_clip["cache_key"], clip_g, tokenizer_g, is_g=True, use_last_layer=use_last_g)
+
+    hidden_l_chunks = []
+    hidden_g_chunks = []
+    pooled = None
+    for i in range(num_chunks):
+        ids_l_pos, w_l_pos = chunks_l_pos[i]
+        ids_l_neg, w_l_neg = chunks_l_neg[i]
+        ids_g_pos, w_g_pos = chunks_g_pos[i]
+        ids_g_neg, w_g_neg = chunks_g_neg[i]
+
+        output_l = clip_l(mx.array([ids_l_pos, ids_l_neg]))
+        output_g = clip_g(mx.array([ids_g_pos, ids_g_neg]))
+        hidden_l = _select_conditioning_layer(output_l, use_last_layer=False)
+        hidden_g = _select_conditioning_layer(output_g, use_last_layer=use_last_g)
+        hidden_l_chunks.append(_blend_toward_empty(hidden_l, [w_l_pos, w_l_neg], empty_l, label=f"pair/clip_l/chunk{i}"))
+        hidden_g_chunks.append(_blend_toward_empty(hidden_g, [w_g_pos, w_g_neg], empty_g, label=f"pair/clip_g/chunk{i}"))
+
+        if i == 0:
+            # ComfyUI parity: the pooled (SDXL vector) embedding always comes from the
+            # first chunk only, regardless of how many chunks the sequence has.
+            pooled = output_g.pooled_output if hasattr(output_g, "pooled_output") else mx.zeros((2, 1280))
+
+    hidden_l = mx.concatenate(hidden_l_chunks, axis=1)
+    hidden_g = mx.concatenate(hidden_g_chunks, axis=1)
 
     if conditioning_mode == "clip_l_only":
         hidden_g = mx.zeros_like(hidden_g)
@@ -6970,7 +7118,6 @@ def encode_text_pair(mlx_clip, positive_text, negative_text, conditioning_mode="
         hidden_l = mx.zeros_like(hidden_l)
 
     cond = mx.concatenate([hidden_l, hidden_g], axis=2)
-    pooled = output_g.pooled_output if hasattr(output_g, "pooled_output") else mx.zeros((2, 1280))
     if conditioning_mode == "zero_pooled":
         pooled = mx.zeros_like(pooled)
     mx.eval(cond, pooled)
@@ -7314,18 +7461,44 @@ def sample_latents(
                 "SDMLX: Note: FaceID Portrait uses non-linear weight type(s) "
                 f"({', '.join(non_linear_weight_types)}). Linear is the most stable starting point."
             )
+    cfg_two_pass = False
+    pos_cond = pos_pooled = neg_cond = neg_pooled = None
     if use_cfg:
-        context = mx.concatenate([positive["cond"], negative["cond"]], axis=0)
-        pooled = mx.concatenate([positive["pooled"], negative["pooled"]], axis=0)
-        t_ids = mx.concatenate([time_id] * 2, axis=0)
+        pos_cond, neg_cond = positive["cond"], negative["cond"]
+        if pos_cond.shape[1] != neg_cond.shape[1]:
+            if ip_adapters or controlnets or profile_unet:
+                # IP-Adapter/ControlNet/profiling all assume a single batched pos+neg UNet
+                # call; padding by repeating the shorter sequence's last chunk keeps that
+                # working, at the cost of over-representing whatever real prompt content ends
+                # up in the repeated chunk (see the "fully dressed" investigation).
+                target_len = max(pos_cond.shape[1], neg_cond.shape[1])
+                pos_cond = pad_cond_sequence_to_length(pos_cond, target_len)
+                neg_cond = pad_cond_sequence_to_length(neg_cond, target_len)
+            else:
+                # ComfyUI parity: run positive and negative as two independent UNet calls
+                # instead of forcing them into one batch, so neither prompt gets padded with
+                # repeated content that would otherwise dominate the result.
+                cfg_two_pass = True
+                pos_pooled, neg_pooled = positive["pooled"], negative["pooled"]
+        if not cfg_two_pass:
+            context = mx.concatenate([pos_cond, neg_cond], axis=0)
+            pooled = mx.concatenate([positive["pooled"], negative["pooled"]], axis=0)
+            t_ids = mx.concatenate([time_id] * 2, axis=0)
     else:
         context = positive["cond"]
         pooled = positive["pooled"]
         t_ids = time_id
 
-    context = context.astype(dtype)
-    pooled = pooled.astype(dtype)
-    t_ids = t_ids.astype(dtype)
+    if cfg_two_pass:
+        pos_cond = pos_cond.astype(dtype)
+        neg_cond = neg_cond.astype(dtype)
+        pos_pooled = pos_pooled.astype(dtype)
+        neg_pooled = neg_pooled.astype(dtype)
+        t_ids = time_id.astype(dtype)
+    else:
+        context = context.astype(dtype)
+        pooled = pooled.astype(dtype)
+        t_ids = t_ids.astype(dtype)
     cfg_value = mx.array(cfg, dtype=mx.float32)
     denoise = max(0.0, min(1.0, float(denoise)))
     advanced_step_range = start_at_step is not None or end_at_step is not None
@@ -7368,14 +7541,31 @@ def sample_latents(
             2 if use_cfg else 1,
             dtype,
         )
-    mx.eval(context, pooled, t_ids)
-    step_denoiser = get_step_denoiser(
-        denoiser_key,
-        unet,
-        compute_dtype,
-        use_cfg,
-        effective_compile_step,
-    )
+    step_denoiser_pos = step_denoiser_neg = None
+    if cfg_two_pass:
+        mx.eval(pos_cond, neg_cond, pos_pooled, neg_pooled, t_ids)
+        log_timing(
+            "SDMLX: CFG mismatch: positive/negative conditioning lengths differ "
+            f"({pos_cond.shape[1]} vs {neg_cond.shape[1]} tokens) -- running two independent "
+            "UNet passes per step instead of padding either prompt with repeated content."
+        )
+        step_denoiser_pos = get_step_denoiser(
+            denoiser_key, unet, compute_dtype, False, effective_compile_step, seq_len=pos_cond.shape[1]
+        )
+        step_denoiser_neg = get_step_denoiser(
+            denoiser_key, unet, compute_dtype, False, effective_compile_step, seq_len=neg_cond.shape[1]
+        )
+        step_denoiser = None
+    else:
+        mx.eval(context, pooled, t_ids)
+        step_denoiser = get_step_denoiser(
+            denoiser_key,
+            unet,
+            compute_dtype,
+            use_cfg,
+            effective_compile_step,
+            seq_len=context.shape[1],
+        )
     ip_adapter_kv_layers = 0
     if ip_adapters:
         patched = ensure_unet_ipadapter_wrapped(unet)
@@ -7505,7 +7695,10 @@ def sample_latents(
                 f"(strength={differential_mask_strength:g})."
             )
 
-    guard_supported = use_cfg and not dynamic_step_context and not profile_unet and not controlnets and mask is None
+    guard_supported = (
+        use_cfg and not dynamic_step_context and not profile_unet and not controlnets
+        and mask is None and not cfg_two_pass
+    )
     guard_auto_supported = guard_supported and not conditioning_texts_identical(positive, negative)
     diagnostic_metrics = None
     guard_first_noise_pred = None
@@ -7544,6 +7737,8 @@ def sample_latents(
                 reasons.append("ControlNet")
             if mask is not None:
                 reasons.append("inpaint mask")
+            if cfg_two_pass:
+                reasons.append("CFG two-pass (pos/neg length mismatch)")
             print(f"SDMLX Conditioning Diagnostics: skipped ({', '.join(reasons) or 'unsupported path'}).")
     if guard_auto_supported:
         guard_key = (
@@ -7582,6 +7777,24 @@ def sample_latents(
                 SDMLX_IPADAPTER_CONTEXT["use_cfg"] = use_cfg
             if scheduled_loras:
                 SDMLX_LORA_CONTEXT["step_percent"] = step_percent
+        if cfg_two_pass:
+            if step_denoiser_pos is not None:
+                eps_pos = step_denoiser_pos(latents_in, timestep, pos_cond, pos_pooled, t_ids, cfg_value)
+                eps_neg = step_denoiser_neg(latents_in, timestep, neg_cond, neg_pooled, t_ids, cfg_value)
+            else:
+                x_model_single = latents_in.astype(dtype) if compute_dtype == "float16" else latents_in
+                t_in_single = mx.broadcast_to(timestep, [len(latents_in)])
+                eps_pos = unet(
+                    x_model_single, timestep=t_in_single, encoder_x=pos_cond, text_time=(pos_pooled, t_ids)
+                ).astype(mx.float32)
+                eps_neg = unet(
+                    x_model_single, timestep=t_in_single, encoder_x=neg_cond, text_time=(neg_pooled, t_ids)
+                ).astype(mx.float32)
+            noise_pred_two_pass = eps_neg + cfg_value * (eps_pos - eps_neg)
+            if nan_diagnostics:
+                warn_if_nonfinite_mx_array("UNet noise prediction", noise_pred_two_pass)
+                warn_if_nonfinite_mx_array("CFG noise prediction", noise_pred_two_pass)
+            return noise_pred_two_pass
         if step_denoiser is not None and not step_has_control:
             return step_denoiser(latents_in, timestep, context, pooled, t_ids, cfg_value)
 
@@ -7652,7 +7865,7 @@ def sample_latents(
                 warn_if_nonfinite_mx_array(f"step {global_step} noise prediction", noise_pred)
 
             denoised_latents = None
-            if mask is not None or preview or sampler_name == "dpmpp_2m":
+            if mask is not None or preview or sampler_name in ("dpmpp_2m", "dpmpp_2m_sde"):
                 denoised_latents = denoised_latents_estimate(latents, noise_pred, step_scale, step_sigma)
             if mask is not None:
                 denoised_latents = denoised_latents * step_mask + initial_latents * (1.0 - step_mask)
@@ -7675,6 +7888,17 @@ def sample_latents(
                 latents = heun_sampler_step(latents, noise_pred, step_sigma, next_sigma, denoise_next)
             elif sampler_name == "dpmpp_2m":
                 latents = dpmpp_2m_sampler_step(
+                    latents,
+                    denoised_latents,
+                    old_dpmpp_denoised,
+                    step_sigma,
+                    next_sigma,
+                    old_dpmpp_sigma,
+                )
+                old_dpmpp_denoised = denoised_latents
+                old_dpmpp_sigma = mx_scalar_float(step_sigma)
+            elif sampler_name == "dpmpp_2m_sde":
+                latents = dpmpp_2m_sde_sampler_step(
                     latents,
                     denoised_latents,
                     old_dpmpp_denoised,
@@ -10432,27 +10656,43 @@ class SDMLX_CLIPTextEncode:
         if conditioning_key in CONDITIONING_CACHE:
             cached = CONDITIONING_CACHE[conditioning_key]
             log_timing("SDMLX: CLIP conditioning loaded from RAM cache.")
+            if SDMLX_EMPHASIS_DIAGNOSTICS:
+                print(f"SDMLX Emphasis Diagnostics [cache]: HIT (text len={len(text)})")
             if isinstance(cached, dict):
                 return ({**cached, "model_family": "sdxl"},)
             cond, pooled = cached
             return ({"cond": cond, "pooled": pooled, "text": text, "model_family": "sdxl"},)
+        if SDMLX_EMPHASIS_DIAGNOSTICS:
+            print(f"SDMLX Emphasis Diagnostics [cache]: MISS, computing fresh (text len={len(text)})")
 
         def run_clip(data, is_g=False):
             if not data: return None
 
             clip = get_clip_model(mlx_clip["cache_key"], data, is_g=is_g)
             tokenizer = get_clip_g_tokenizer() if is_g else get_clip_l_tokenizer()
-            tokens = mx.array(tokenizer(text, padding="max_length", max_length=77, truncation=True, return_tensors="np")["input_ids"])
-            output = clip(tokens)
-            if output.hidden_states and len(output.hidden_states) >= 2:
-                output.last_hidden_state = output.hidden_states[-2]
-            return output
+            empty = get_empty_conditioning_hidden(mlx_clip["cache_key"], clip, tokenizer, is_g=is_g, use_last_layer=False)
+            label = "single/clip_g" if is_g else "single/clip_l"
 
-        res_l = run_clip(mlx_clip["clip_l"], is_g=False)
-        res_g = run_clip(mlx_clip["clip_g"], is_g=True)
-        
-        cond = mx.concatenate([res_l.last_hidden_state, res_g.last_hidden_state], axis=2)
-        pooled = res_g.pooled_output if hasattr(res_g, "pooled_output") else mx.zeros((1, 1280))
+            # Prompts longer than one 77-token CLIP window are split into multiple windows
+            # here (matching ComfyUI's own handling of long prompts) rather than silently
+            # truncated; each window is encoded separately and concatenated afterward.
+            hidden_chunks = []
+            pooled = None
+            for i, (ids, token_weights) in enumerate(tokenize_with_weights_chunks(tokenizer, text)):
+                output = clip(mx.array([ids]))
+                hidden = _select_conditioning_layer(output, use_last_layer=False)
+                # Emphasis syntax -- (text:weight)/(text)/[text] -- see get_empty_conditioning_hidden.
+                hidden_chunks.append(_blend_toward_empty(hidden, [token_weights], empty, label=f"{label}/chunk{i}"))
+                if i == 0:
+                    # ComfyUI parity: pooled (SDXL vector) embedding comes from the first chunk only.
+                    pooled = output.pooled_output if hasattr(output, "pooled_output") else None
+            return mx.concatenate(hidden_chunks, axis=1), pooled
+
+        hidden_l, _pooled_l = run_clip(mlx_clip["clip_l"], is_g=False)
+        hidden_g, pooled_g = run_clip(mlx_clip["clip_g"], is_g=True)
+
+        cond = mx.concatenate([hidden_l, hidden_g], axis=2)
+        pooled = pooled_g if pooled_g is not None else mx.zeros((1, 1280))
         mx.eval(cond, pooled)
         conditioning = {"cond": cond, "pooled": pooled, "text": text, "model_family": "sdxl"}
         CONDITIONING_CACHE[conditioning_key] = conditioning
