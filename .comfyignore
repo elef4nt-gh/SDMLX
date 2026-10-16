@@ -20,3 +20,9 @@ huggingface_sdmlx_acceleration_patches/
 # Local editor/project metadata
 .vscode/
 .idea/
+
+# Local backups and install bookkeeping (never publish)
+*.bak-*
+*.before-*
+*.pre-*20[0-9][0-9]*
+.tracking
